@@ -12,6 +12,10 @@ This manual documents the alpha `codex-foreman` service: a control-plane that ru
 - project-scoped prompts, event callbacks, hooks, and compaction policy
 
 Agents and project foremen are backed by active Codex thread IDs.
+`codex-foreman` does not infer or create tasks automatically.
+It only spawns and tracks workers for tasks that are explicitly defined by the caller.
+Your integration should be treated as an explicit orchestration contract:
+you define every worker prompt, then the foreman runs those workers.
 
 ## 2) Run and Validate
 
@@ -409,6 +413,10 @@ Project management is the new alpha control-plane layer.
 - `POST /projects/:id/compact` → force a compaction handoff
 - `POST /projects/:id/jobs` → create a labeled job with multiple workers
 
+Explicit orchestration rule: foreman only executes work that is directly passed in.
+Use `/projects/{id}/workers` for single explicit tasks and `/projects/{id}/jobs` for explicit multi-worker batches.
+Foreman will not split a broad goal into sub-workers by itself.
+
 #### 4.4.1 Create project
 
 Request:
@@ -471,6 +479,17 @@ POST /projects/3f02.../compact
 ```
 
 `compact` is designed to be a bounded “handoff” action to the project foreman.
+
+### 4.4.x Delegation contract for workers
+
+`POST /projects/{id}/jobs` must contain a `workers` array of explicit prompts.
+The service will:
+
+- create one worker per array entry,
+- pass each worker exactly the provided prompt,
+- track each worker and include results in the job response.
+
+When you need deterministic behavior, avoid generic handoff prompts and send direct worker instructions in the payload.
 
 ### 4.5 Jobs API
 

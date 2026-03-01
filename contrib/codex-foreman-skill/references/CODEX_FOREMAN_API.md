@@ -17,9 +17,14 @@
 - `GET /projects/:id`
 - `DELETE /projects/:id`
 - `POST /projects/:id/workers`
+- `POST /projects/:id/jobs`
 - `POST /projects/:id/foreman/send`
 - `POST /projects/:id/foreman/steer`
 - `POST /projects/:id/compact`
+
+Explicit delegation rule:
+`POST /projects/:id/jobs` is an explicit batch contract. Foreman does not derive worker tasks on its own.
+You must send every intended worker job in the `workers` array, and each item will be executed as-is.
 
 ## Common request examples
 
@@ -40,6 +45,19 @@ Spawn worker:
 curl -s -X POST http://127.0.0.1:8787/projects/PROJECT_ID/workers \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Investigate open issue and summarize."}'
+```
+
+Create explicit worker batch:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/projects/PROJECT_ID/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workers":[
+      {"prompt":"Check code quality and report high-signal fixes.","labels":{"category":"code-quality"}},
+      {"prompt":"Check test coverage gaps and suggest priorities.","labels":{"category":"test-coverage"}}
+    ]
+  }'
 ```
 
 Foreman send:
@@ -76,4 +94,3 @@ curl -s -X POST http://127.0.0.1:8787/projects/PROJECT_ID/compact \
   - callback-only send
   - optional prompt prefix injection (`callback_prompt_prefix`)
   - per-request callback overrides in agent/project send/steer inputs
-

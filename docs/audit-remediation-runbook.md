@@ -6,7 +6,7 @@ This runbook documents a repeatable end-to-end exercise for testing
 The goal is to:
 1. start `codex-foreman`,
 2. spawn a project from the local `.project` directory,
-3. run parallel audit-remediation workers (security, robustness, code quality, technical debt, test coverage),
+3. define explicit parallel audit-remediation worker prompts (security, robustness, code quality, technical debt, test coverage),
 4. capture worker outputs in one wait/result call, and
 5. cleanly tear everything down.
 
@@ -43,6 +43,7 @@ The script performs:
    - `POST /projects` with `{"path":"<repo>/.project"}`.
 3. Start one job with one worker per audit category:
    - `POST /projects/{project_id}/jobs` with a `workers` array.
+   - Foreman only executes the explicit worker prompts you include in this array.
 4. Wait for completion:
    - `GET /jobs/{job_id}/wait?include_workers=true&timeout_ms=120000`.
 5. Validate:
@@ -63,6 +64,7 @@ Key behavior:
 - Builds workers from audit templates in `.audit/*`.
 - Adds a per-worker label `{ "category": "<name>" }`.
 - Uses the job API so workers execute in parallel.
+- Foreman is the executor of explicit worker prompts, not a planner that invents worker tasks.
 - Supports configurable timeout/poll values via env vars.
 - Captures full job result and saves it to `stdout` for copy/paste review.
 

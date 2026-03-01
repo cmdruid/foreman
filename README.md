@@ -114,10 +114,13 @@ In restricted environments, request one-time process privilege before startup if
 - `POST /projects/:id/foreman/steer` → steer project foreman
 - `POST /projects/:id/compact` → force project compaction handoff
 - `POST /projects/:id/jobs` → create a batch job for a project
+  - `workers` is explicit and complete: each item defines one worker prompt to execute.
 - `GET /jobs` → list project jobs
 - `GET /jobs/:id` → get job state
 - `GET /jobs/:id/result` → get per-worker result summary
 - `GET /jobs/:id/wait` → wait for job terminal state (`timeout_ms`, `poll_ms`, `include_workers`)
+
+For deterministic orchestration, send explicit worker prompts in `jobs` payloads and avoid free-form “figure this out” instructions.
 
 See [`docs/manual.md`](docs/manual.md) for full endpoint schemas and usage examples.
 

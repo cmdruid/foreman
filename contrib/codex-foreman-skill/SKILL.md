@@ -14,6 +14,8 @@ Use this skill when you need to start, monitor, steer, and complete workflows th
 - `codex-foreman` runs a long-lived foreman service.
 - A **foreman** agent orchestrates one project and can spawn **worker** agents.
 - Workers and the foreman are controlled via HTTP endpoints and callback hooks.
+- Delegation is explicit: foreman executes worker tasks only when specified in request payloads.
+- Use `jobs` for explicit multi-worker batches and `workers` for single-worker dispatch.
 - Projects are filesystem-based and use files in the project folder:
   - `project.toml`
   - `FOREMAN.md`
@@ -70,6 +72,8 @@ curl -s -X POST http://127.0.0.1:8787/projects \
 ## Worker operations
 
 - `POST /projects/:id/workers` to spawn a worker.
+- `POST /projects/:id/jobs` for explicit multi-worker delegation (`workers` array).
+- `POST /projects/:id/jobs` is not a planner endpoint; you provide each worker prompt explicitly.
 - `POST /projects/:id/foreman/send` to add a foreman prompt.
 - `POST /projects/:id/foreman/steer` to steer foreman direction.
 - `POST /projects/:id/compact` to compact foreman context.
@@ -116,4 +120,3 @@ prompt_prefix = "OpenClaw event received. Handle the following completion payloa
 
 - Any prompt requiring foreman orchestration, multi-agent delegation, callback handling, or project-specific handoff/compaction loops.
 - Any task that requires reliable guidance for project file layout and event-driven callback behavior.
-

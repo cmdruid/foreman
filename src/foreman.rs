@@ -1623,6 +1623,12 @@ impl Foreman {
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     if let Ok(mut result) = result {
+                        if is_job_terminal_status(&result.status) {
+                            return Ok(crate::models::JobWaitResponse {
+                                result,
+                                timed_out: false,
+                            });
+                        }
                         if !include_workers {
                             result.workers = Vec::new();
                         }
