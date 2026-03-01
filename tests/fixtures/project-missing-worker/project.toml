@@ -1,0 +1,7 @@
+name = "missing-worker-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "MISSING_WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"

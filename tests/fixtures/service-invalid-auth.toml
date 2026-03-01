@@ -1,0 +1,11 @@
+[security.auth]
+enabled = true
+
+[callbacks]
+default_profile = "openclaw"
+
+[callbacks.profiles.openclaw]
+type = "webhook"
+url = "https://example.local/webhook"
+events = ["turn/completed"]
+

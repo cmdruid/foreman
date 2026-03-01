@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-workflows:
+    name: Validate workflow hardening
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify pinned action SHAs
+        run: ./scripts/verify_action_shas.sh
+
+  test:
+    needs: [validate-workflows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Check lockfile
+        run: cargo check --locked
+
+      - name: Full test suite
+        run: cargo test --all -- --nocapture
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build check
+        run: cargo build --locked --all-targets

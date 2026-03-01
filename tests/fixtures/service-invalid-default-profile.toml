@@ -1,0 +1,8 @@
+[callbacks]
+default_profile = "missing"
+
+[callbacks.profiles.openclaw]
+type = "webhook"
+url = "https://example.local/webhook"
+events = ["turn/completed"]
+

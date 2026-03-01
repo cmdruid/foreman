@@ -1,0 +1,11 @@
+[app_server]
+initialize_timeout_ms = 5_000
+request_timeout_ms = 30_000
+
+[callbacks]
+default_profile = "openclaw"
+
+[callbacks.profiles.openclaw]
+type = "webhook"
+url = "https://example.local/webhook"
+events = ["turn/completed"]

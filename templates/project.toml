@@ -1,0 +1,22 @@
+# Project configuration for codex-foreman
+name = "my-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.worker]
+# Optional: callback_profile = "openclaw"
+
+[callbacks.foreman]
+# Optional: callback_profile = "openclaw"
+
+[callbacks.bubble_up]
+# Optional: callback_profile = "openclaw"
+# Optional: callback_events = ["turn/completed", "turn/aborted"]
+
+[policy]
+compact_after_turns = 10
+bubble_up_events = ["turn/completed", "turn/aborted"]

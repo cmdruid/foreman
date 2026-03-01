@@ -1,0 +1,3 @@
+name = "invalid-project"
+[prompts
+foreman_file = "FOREMAN.md"

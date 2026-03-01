@@ -1,0 +1,30 @@
+name = "valid-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.worker]
+callback_profile = "record_cmd"
+callback_events = ["turn/completed", "turn/aborted"]
+
+[callbacks.foreman]
+callback_profile = "record_webhook"
+callback_events = ["turn/completed"]
+
+[callbacks.bubble_up]
+callback_profile = "record_webhook"
+callback_events = ["turn/completed"]
+
+[hooks]
+on_project_start = "echo project started ${project_id} > ${project_path}/.project_hook_started"
+on_worker_completed = "echo worker completed ${project_id} ${agent_id} ${event_id} > ${project_path}/.project_worker_complete"
+on_worker_aborted = "echo worker aborted ${project_id} ${agent_id} > ${project_path}/.project_worker_aborted"
+on_project_compaction = "echo compaction ${project_id} > ${project_path}/.project_compaction"
+on_project_stop = "echo project stop ${project_id} > ${project_path}/.project_stop"
+
+[policy]
+compact_after_turns = 1
+bubble_up_events = ["turn/completed", "turn/aborted"]
