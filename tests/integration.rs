@@ -990,6 +990,105 @@ async fn test_worker_monitoring_restarts_stalled_worker() {
 }
 
 #[tokio::test]
+async fn test_worker_monitoring_failures_when_restart_budget_exhausted() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let service_config_contents =
+        service_config_template_worker_monitoring(1_000, 0, 250);
+    common::write_service_config(&service_config, service_config_contents.as_str())
+        .expect("write service config");
+
+    let bind = format!("127.0.0.1:{}", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness = common::start_foreman(&bind, &service_config, &state_path, &fake_codex).await;
+    let client = reqwest::Client::new();
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "restart budget exhausted baseline",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "STALL_ONCE_THEN_COMPLETE will exhaust worker monitoring budget"
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+    let worker_data = worker_response
+        .json::<Value>()
+        .await
+        .expect("worker response");
+    let worker_id = worker_data["id"].as_str().expect("worker id");
+
+    let wait = client
+        .get(format!(
+            "{}/agents/{}/wait?timeout_ms=12000&poll_ms=50&include_events=true",
+            harness.base_url, worker_id
+        ))
+        .send()
+        .await
+        .expect("wait for worker result");
+    assert_eq!(wait.status(), StatusCode::OK);
+    let wait_payload = wait.json::<Value>().await.expect("wait payload");
+    assert_eq!(wait_payload["timed_out"].as_bool(), Some(false));
+    assert_eq!(wait_payload["status"].as_str(), Some("aborted"));
+    assert_eq!(
+        wait_payload["completion_method"].as_str(),
+        Some("turn/aborted")
+    );
+    let error = wait_payload["error"]
+        .as_str()
+        .expect("worker error text");
+    assert!(error.contains("stalled"));
+
+    let events = client
+        .get(format!("{}/agents/{}/events", harness.base_url, worker_id))
+        .send()
+        .await
+        .expect("worker events");
+    assert_eq!(events.status(), StatusCode::OK);
+    let events = events.json::<Value>().await.expect("worker events payload");
+    let events = events
+        .as_array()
+        .expect("worker events as array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"].as_str() == Some("turn/started")),
+        "failed worker should include a started event"
+    );
+
+    let project_delete = client
+        .delete(format!("{}/projects/{project_id}", harness.base_url))
+        .send()
+        .await
+        .expect("close project");
+    assert_eq!(project_delete.status(), StatusCode::NO_CONTENT);
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
 async fn test_job_wait_endpoint() {
     let (_temp_project, project_path) =
         common::temporary_project("project-valid").expect("fixture copy");
