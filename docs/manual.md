@@ -207,6 +207,21 @@ expected_codex_version = "0.9.2"
 ```
 
 ```toml
+[worker_monitoring]
+enabled = false
+inactivity_timeout_ms = 3_000
+max_restarts = 1
+watch_interval_ms = 750
+```
+
+`worker_monitoring` helps keep long-running workers healthy:
+
+- `enabled`: turn the watchdog on or off.
+- `inactivity_timeout_ms`: restart any running worker with no events in this many milliseconds.
+- `max_restarts`: number of automatic restart attempts before marking the worker failed (`0` means never restart).
+- `watch_interval_ms`: polling interval between watchdog scans.
+
+```toml
 [callbacks]
 default_profile = "openclaw"
 

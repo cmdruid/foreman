@@ -106,6 +106,10 @@ pub struct PersistedAgentRecord {
     pub id: String,
     pub thread_id: String,
     pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub restart_attempts: u32,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,

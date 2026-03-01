@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WORKER_MONITORING_ENABLED: bool = false;
+const DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS: u64 = 3_000;
+const DEFAULT_WORKER_MONITORING_MAX_RESTARTS: u32 = 1;
+const DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS: u64 = 750;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -15,7 +19,48 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub callbacks: CallbackRegistry,
     #[serde(default)]
+    pub worker_monitoring: WorkerMonitoringConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerMonitoringConfig {
+    #[serde(default = "default_worker_monitoring_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_worker_monitoring_inactivity_timeout_ms")]
+    pub inactivity_timeout_ms: u64,
+    #[serde(default = "default_worker_monitoring_max_restarts")]
+    pub max_restarts: u32,
+    #[serde(default = "default_worker_monitoring_watch_interval_ms")]
+    pub watch_interval_ms: u64,
+}
+
+impl Default for WorkerMonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worker_monitoring_enabled(),
+            inactivity_timeout_ms: default_worker_monitoring_inactivity_timeout_ms(),
+            max_restarts: default_worker_monitoring_max_restarts(),
+            watch_interval_ms: default_worker_monitoring_watch_interval_ms(),
+        }
+    }
+}
+
+fn default_worker_monitoring_enabled() -> bool {
+    DEFAULT_WORKER_MONITORING_ENABLED
+}
+
+fn default_worker_monitoring_inactivity_timeout_ms() -> u64 {
+    DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS
+}
+
+fn default_worker_monitoring_max_restarts() -> u32 {
+    DEFAULT_WORKER_MONITORING_MAX_RESTARTS
+}
+
+fn default_worker_monitoring_watch_interval_ms() -> u64 {
+    DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -157,6 +202,27 @@ impl ServiceConfig {
             ));
         }
 
+        if self.worker_monitoring.enabled {
+            if self.worker_monitoring.inactivity_timeout_ms == 0 {
+                return Err(anyhow!(
+                    "worker_monitoring.inactivity_timeout_ms must be greater than 0"
+                ));
+            }
+
+            if self.worker_monitoring.watch_interval_ms == 0 {
+                return Err(anyhow!(
+                    "worker_monitoring.watch_interval_ms must be greater than 0"
+                ));
+            }
+
+            if self.worker_monitoring.max_restarts == 0 {
+                warnings.push(
+                    "worker_monitoring.max_restarts is 0 (workers will fail after timeout)"
+                        .to_string(),
+                );
+            }
+        }
+
         if let Some(default_profile) = &self.callbacks.default_profile
             && !self.callbacks.profiles.contains_key(default_profile)
         {
@@ -277,6 +343,7 @@ mod tests {
     use super::{
         AppServerConfig, AuthConfig, DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS,
         DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS, SecurityConfig, ServiceConfig,
+        WorkerMonitoringConfig,
     };
     use std::{env, path::Path};
 
@@ -295,6 +362,7 @@ mod tests {
         assert!(config.callbacks.profiles.is_empty());
         assert!(config.security.auth.is_none());
         assert!(config.protocol.expected_codex_version.is_none());
+        assert!(!config.worker_monitoring.enabled);
     }
 
     #[test]
@@ -308,6 +376,50 @@ mod tests {
             config.app_server.request_timeout_ms,
             DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
         );
+        assert!(!config.worker_monitoring.enabled);
+        assert_eq!(config.worker_monitoring.inactivity_timeout_ms, 3_000);
+        assert_eq!(config.worker_monitoring.max_restarts, 1);
+        assert_eq!(config.worker_monitoring.watch_interval_ms, 750);
+    }
+
+    #[test]
+    fn worker_monitoring_defaults_validate() {
+        let config = ServiceConfig {
+            worker_monitoring: WorkerMonitoringConfig::default(),
+            ..ServiceConfig::default()
+        };
+        assert!(!config.worker_monitoring.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_worker_monitoring_timeout_is_rejected() {
+        let config = ServiceConfig {
+            worker_monitoring: WorkerMonitoringConfig {
+                enabled: true,
+                inactivity_timeout_ms: 0,
+                max_restarts: 1,
+                watch_interval_ms: 500,
+            },
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_restart_limits_are_allowed_with_warning_when_enabled() {
+        let config = ServiceConfig {
+            worker_monitoring: WorkerMonitoringConfig {
+                enabled: true,
+                inactivity_timeout_ms: 2_000,
+                max_restarts: 0,
+                watch_interval_ms: 500,
+            },
+            ..ServiceConfig::default()
+        };
+        let warnings = config.validate().expect("validation should pass");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("workers will fail after timeout"));
     }
 
     #[test]

@@ -70,7 +70,7 @@ enum WorkerCallback {
     Profile(WorkerProfileCallback),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum AgentRole {
     Foreman,
     Worker,
@@ -102,6 +102,8 @@ struct AgentRecord {
     id: Uuid,
     thread_id: String,
     active_turn_id: Option<String>,
+    prompt: Option<String>,
+    restart_attempts: u32,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -196,6 +198,7 @@ impl Foreman {
         });
 
         Self::spawn_event_loop(Arc::clone(&foreman), event_rx);
+        Self::spawn_worker_monitor(Arc::clone(&foreman));
         foreman
     }
 
@@ -251,6 +254,230 @@ impl Foreman {
         Ok(())
     }
 
+    async fn enforce_worker_monitoring(
+        self: &Arc<Self>,
+        inactivity_timeout_ms: u64,
+        max_restarts: u32,
+    ) -> Result<()> {
+        let now = now_ts();
+        let stale_workers = {
+            let agents = self.agents.read().await;
+            let mut stale = Vec::new();
+            for agent in agents.values() {
+                if agent.role != AgentRole::Worker {
+                    continue;
+                }
+
+                if agent.status != "running" {
+                    continue;
+                }
+
+                if agent.prompt.is_none() {
+                    continue;
+                }
+
+                let elapsed_ms = now.saturating_sub(agent.updated_at).saturating_mul(1000);
+                if elapsed_ms < inactivity_timeout_ms {
+                    continue;
+                }
+
+                if agent.active_turn_id.is_none() {
+                    continue;
+                }
+
+                stale.push(agent.id);
+            }
+            stale
+        };
+
+        for agent_id in stale_workers {
+            self.restart_stalled_worker(agent_id, inactivity_timeout_ms, max_restarts)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn restart_stalled_worker(
+        self: &Arc<Self>,
+        agent_id: Uuid,
+        inactivity_timeout_ms: u64,
+        max_restarts: u32,
+    ) -> Result<()> {
+        #[derive(Debug)]
+        struct Candidate {
+            project_id: Option<Uuid>,
+            job_id: Option<Uuid>,
+            thread_id: String,
+            prompt: String,
+            active_turn_id: Option<String>,
+            should_restart: bool,
+        }
+
+        let candidate = {
+            let mut agents = self.agents.write().await;
+            let agent = match agents.get_mut(&agent_id) {
+                Some(agent) => agent,
+                None => return Ok(()),
+            };
+
+            if agent.status != "running" {
+                return Ok(());
+            }
+
+            let prompt = agent.prompt.clone().filter(|prompt| !prompt.is_empty());
+            if prompt.is_none() {
+                return Ok(());
+            }
+
+            if agent.restart_attempts >= max_restarts {
+                let result = Some(AgentResult {
+                    agent_id,
+                    status: "aborted".to_string(),
+                    completion_method: Some(TURN_ABORTED_EVENT.to_string()),
+                    turn_id: agent.active_turn_id.clone(),
+                    final_text: None,
+                    summary: Some("worker stalled and exceeded restart budget".to_string()),
+                    references: None,
+                    completed_at: Some(now_ts()),
+                    event_id: None,
+                    error: Some(format!(
+                        "worker stalled for {} ms without progress",
+                        inactivity_timeout_ms
+                    )),
+                });
+
+                agent.status = "failed".to_string();
+                agent.updated_at = now_ts();
+                agent.result = result;
+                agent.error = Some("worker monitoring restart budget exceeded".to_string());
+                agent.restart_attempts = agent.restart_attempts.saturating_add(0);
+
+                Some(Candidate {
+                    project_id: agent.project_id,
+                    job_id: agent.job_id,
+                    thread_id: agent.thread_id.clone(),
+                    prompt: prompt.unwrap_or_default(),
+                    active_turn_id: agent.active_turn_id.clone(),
+                    should_restart: false,
+                })
+            } else {
+                agent.status = "restarting".to_string();
+                agent.updated_at = now_ts();
+                agent.restart_attempts = agent.restart_attempts.saturating_add(1);
+                agent.error = None;
+
+                Some(Candidate {
+                    project_id: agent.project_id,
+                    job_id: agent.job_id,
+                    thread_id: agent.thread_id.clone(),
+                    prompt: prompt.expect("prompt must exist for restart"),
+                    active_turn_id: agent.active_turn_id.clone(),
+                    should_restart: true,
+                })
+            }
+        };
+
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+
+        if !candidate.should_restart {
+            if let Some(project_id) = candidate.project_id {
+                let _ = self.update_project_after_worker_event(project_id).await;
+            }
+            if let Some(job_id) = candidate.job_id {
+                let agents = self.agents.read().await;
+                if let Some(agent) = agents.get(&agent_id) {
+                    let _ = self
+                        .update_job_after_worker_event(job_id, agent.result.as_ref())
+                        .await;
+                }
+            }
+            self.schedule_state_persist();
+            return Ok(());
+        }
+
+        let thread_id = candidate.thread_id;
+        let prompt = candidate.prompt;
+
+        if let Some(current_turn_id) = candidate.active_turn_id.as_deref() {
+            let _ = self
+                .client
+                .turn_interrupt(&TurnInterruptRequest {
+                    thread_id: thread_id.clone(),
+                    turn_id: current_turn_id.to_string(),
+                })
+                .await;
+        }
+
+        let request = TurnStartRequest {
+            thread_id: thread_id.clone(),
+            input: vec![TextPayload::text(prompt)],
+        };
+        let response = self.client.turn_start(&request).await;
+
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(&agent_id) else {
+            return Ok(());
+        };
+
+        match response {
+            Ok(response) => {
+                let current_turn_id = response.turn_id.clone();
+                agent.active_turn_id = Some(current_turn_id.clone());
+                let should_reset_result =
+                    matches!(agent.status.as_str(), "restarting") 
+                        || agent
+                            .result
+                            .as_ref()
+                            .filter(
+                                |result| matches!(result.completion_method.as_deref(), Some(TURN_ABORTED_EVENT))
+                                    && result.turn_id == candidate.active_turn_id
+                            )
+                            .is_some();
+
+                if should_reset_result {
+                    agent.result = None;
+                    agent.error = None;
+                }
+                if matches!(agent.status.as_str(), "restarting") {
+                    agent.status = "running".to_string();
+                }
+                agent.updated_at = now_ts();
+                self.schedule_state_persist();
+            }
+            Err(err) => {
+                agent.status = "failed".to_string();
+                agent.error = Some(format!("worker restart failed: {err}"));
+                agent.result = Some(AgentResult {
+                    agent_id,
+                    status: "aborted".to_string(),
+                    completion_method: Some(TURN_ABORTED_EVENT.to_string()),
+                    turn_id: agent.active_turn_id.clone(),
+                    final_text: None,
+                    summary: Some("worker restart failed".to_string()),
+                    references: None,
+                    completed_at: Some(now_ts()),
+                    event_id: None,
+                    error: Some(format!("worker restart failed: {err}")),
+                });
+                agent.updated_at = now_ts();
+                self.schedule_state_persist();
+            }
+        }
+
+        if let Some(project_id) = candidate.project_id {
+            let _ = self.update_project_after_worker_event(project_id).await;
+        }
+        if let Some(job_id) = candidate.job_id {
+            let _ = self
+                .update_job_after_worker_event(job_id, agent.result.as_ref())
+                .await;
+        }
+        Ok(())
+    }
+
     fn spawn_event_loop(this: Arc<Self>, mut event_rx: broadcast::Receiver<RawNotification>) {
         tokio::spawn(async move {
             loop {
@@ -260,6 +487,29 @@ impl Foreman {
                         warn!(%err, "event channel closed");
                         break;
                     }
+                }
+            }
+        });
+    }
+
+    fn spawn_worker_monitor(this: Arc<Self>) {
+        let worker_monitoring = this.config.worker_monitoring.clone();
+        if !worker_monitoring.enabled {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let interval = time::Duration::from_millis(worker_monitoring.watch_interval_ms.max(50));
+            loop {
+                time::sleep(interval).await;
+                if let Err(err) = this
+                    .enforce_worker_monitoring(
+                        worker_monitoring.inactivity_timeout_ms,
+                        worker_monitoring.max_restarts,
+                    )
+                    .await
+                {
+                    warn!(%err, "worker monitoring cycle failed");
                 }
             }
         });
@@ -1930,6 +2180,10 @@ impl Foreman {
         {
             let mut agents = self.agents.write().await;
             if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.prompt = input.prompt.clone().filter(|value| !value.is_empty());
+                if has_turn_prompt {
+                    agent.restart_attempts = 0;
+                }
                 agent.updated_at = now_ts();
                 if has_turn_prompt {
                     agent.status = "running".into();
@@ -2340,11 +2594,18 @@ impl Foreman {
         let id = Uuid::new_v4();
         let ts = now_ts();
         let role_name = role.as_str().to_string();
+        let prompt = if request.prompt.trim().is_empty() {
+            None
+        } else {
+            Some(request.prompt.clone())
+        };
         {
             let agent = AgentRecord {
                 id,
                 thread_id: thread_id.clone(),
                 active_turn_id: None,
+                prompt,
+                restart_attempts: 0,
                 status: "idle".into(),
                 callback,
                 role: role.clone(),
@@ -2978,6 +3239,8 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
     let thread_id = record.thread_id;
     let active_turn_id = record.active_turn_id;
     let status = record.status;
+    let prompt = record.prompt;
+    let restart_attempts = record.restart_attempts;
     let project_id = if let Some(project_id) = record.project_id {
         Some(Uuid::parse_str(&project_id).context("invalid persisted project id")?)
     } else {
@@ -3001,6 +3264,8 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         id,
         thread_id,
         active_turn_id,
+        prompt,
+        restart_attempts,
         status,
         callback,
         role,
@@ -3087,6 +3352,8 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         id: agent.id.to_string(),
         thread_id: agent.thread_id.clone(),
         active_turn_id: agent.active_turn_id.clone(),
+        prompt: agent.prompt.clone(),
+        restart_attempts: agent.restart_attempts,
         status: agent.status.clone(),
         callback,
         role,
@@ -3463,6 +3730,8 @@ mod tests {
             id: agent_id,
             thread_id: "thread-1".to_string(),
             active_turn_id: None,
+            prompt: None,
+            restart_attempts: 0,
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -3525,6 +3794,8 @@ mod tests {
                 id: Uuid::new_v4().to_string(),
                 thread_id: "thread-recovery".to_string(),
                 active_turn_id: Some("turn-0".to_string()),
+                prompt: Some("recovery prompt".to_string()),
+                restart_attempts: 0,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),

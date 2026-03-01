@@ -141,6 +141,20 @@ request_timeout_ms = 30_000
 expected_codex_version = "0.9.2"
 ```
 
+```toml
+[worker_monitoring]
+enabled = false
+inactivity_timeout_ms = 3_000
+max_restarts = 1
+watch_interval_ms = 750
+```
+
+`worker_monitoring` is optional:
+
+- set `enabled = true` to automatically detect stalled workers (no events for more than `inactivity_timeout_ms`)
+- `max_restarts` limits automatic worker restart attempts while stalled
+- `watch_interval_ms` controls how often Foreman checks for stale workers
+
 Service security is optional but recommended for shared environments:
 
 ```toml

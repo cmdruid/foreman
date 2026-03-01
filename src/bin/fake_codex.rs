@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,6 +25,7 @@ fn run_stub_server() {
 
     let thread_counter = AtomicU64::new(0);
     let turn_counter = AtomicU64::new(0);
+    let mut thread_stall_state = HashMap::new();
 
     for line_result in stdin.lines() {
         let line = match line_result {
@@ -75,6 +79,15 @@ fn run_stub_server() {
                 let thread_id = parse_string_param(&params, "thread")
                     .or_else(|| parse_nested_id(&params, "thread"))
                     .unwrap_or_else(|| "thread-unknown".to_string());
+                let input = params.get("input").cloned().unwrap_or_else(|| json!([]));
+                let text = extract_prompt_text_from_input(&input);
+                let should_stall = if has_stall_marker(&text) && !thread_stall_state.contains_key(&thread_id)
+                {
+                    thread_stall_state.insert(thread_id.clone(), true);
+                    true
+                } else {
+                    false
+                };
 
                 send_response(
                     &mut stdout,
@@ -96,11 +109,13 @@ fn run_stub_server() {
                     json!({"thread_id": thread_id, "turn_id": turn_id}),
                 );
 
-                send_notification(
-                    &mut stdout,
-                    "turn/completed",
-                    json!({"thread_id": thread_id, "turn_id": turn_id}),
-                );
+                if !should_stall {
+                    send_notification(
+                        &mut stdout,
+                        "turn/completed",
+                        json!({"thread_id": thread_id, "turn_id": turn_id}),
+                    );
+                }
             }
             "turn/steer" => {
                 let thread_id = parse_string_param(&params, "thread")
@@ -237,4 +252,29 @@ fn parse_nested_id(params: &Value, stem: &str) -> Option<String> {
             .or_else(|| value.get(snake))
             .and_then(parse_id_value)
     })
+}
+
+fn extract_prompt_text_from_input(input: &Value) -> String {
+    let mut parts = Vec::new();
+    let Some(values) = input.as_array() else {
+        return String::new();
+    };
+
+    for value in values {
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        } else if let Some(content) = value.get("content").and_then(Value::as_array) {
+            for segment in content {
+                if let Some(text) = segment.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn has_stall_marker(text: &str) -> bool {
+    text.contains("STALL_ONCE_THEN_COMPLETE")
 }
