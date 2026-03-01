@@ -72,16 +72,9 @@ fn run_stub_server() {
             }
             "turn/start" => {
                 let turn_id = format!("turn-{}", turn_counter.fetch_add(1, Ordering::SeqCst));
-                let thread_id = params
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        params
-                            .get("thread")
-                            .and_then(|value| value.get("id"))
-                            .and_then(Value::as_str)
-                    })
-                    .unwrap_or("thread-unknown");
+                let thread_id = parse_string_param(&params, "thread")
+                    .or_else(|| parse_nested_id(&params, "thread"))
+                    .unwrap_or_else(|| "thread-unknown".to_string());
 
                 send_response(
                     &mut stdout,
@@ -110,14 +103,12 @@ fn run_stub_server() {
                 );
             }
             "turn/steer" => {
-                let thread_id = params
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("thread-unknown");
-                let expected_turn_id = params
-                    .get("expected_turn_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("turn-unknown");
+                let thread_id = parse_string_param(&params, "thread")
+                    .or_else(|| parse_nested_id(&params, "thread"))
+                    .unwrap_or_else(|| "thread-unknown".to_string());
+                let expected_turn_id = parse_string_param(&params, "expected_turn")
+                    .or_else(|| parse_nested_id(&params, "expected_turn"))
+                    .unwrap_or_else(|| "turn-unknown".to_string());
                 let turn_id = format!("turn-{}", turn_counter.fetch_add(1, Ordering::SeqCst));
 
                 send_response(
@@ -139,14 +130,10 @@ fn run_stub_server() {
                 );
             }
             "turn/interrupt" => {
-                let thread_id = params
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("thread-unknown");
-                let turn_id = params
-                    .get("turn_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("turn-unknown");
+                let thread_id = parse_string_param(&params, "thread")
+                    .unwrap_or_else(|| "thread-unknown".to_string());
+                let turn_id = parse_string_param(&params, "turn")
+                    .unwrap_or_else(|| "turn-unknown".to_string());
 
                 send_response(&mut stdout, &id, json!({}));
                 send_notification(
@@ -212,4 +199,42 @@ fn send_message(stdout: &mut dyn Write, payload: Value) {
         return;
     }
     let _ = stdout.flush();
+}
+
+fn parse_id_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_string_param(params: &Value, stem: &str) -> Option<String> {
+    let (camel, snake) = match stem {
+        "thread" => ("threadId", "thread_id"),
+        "turn" => ("turnId", "turn_id"),
+        "expected_turn" => ("expectedTurnId", "expected_turn_id"),
+        _ => (stem, stem),
+    };
+
+    params
+        .get(camel)
+        .or_else(|| params.get(snake))
+        .and_then(parse_id_value)
+}
+
+fn parse_nested_id(params: &Value, stem: &str) -> Option<String> {
+    let (camel, snake) = match stem {
+        "thread" => ("threadId", "thread_id"),
+        "turn" => ("turnId", "turn_id"),
+        "expected_turn" => ("expectedTurnId", "expected_turn_id"),
+        _ => (stem, stem),
+    };
+    params.get(stem).and_then(|value| {
+        value
+            .get("id")
+            .or_else(|| value.get(camel))
+            .or_else(|| value.get(snake))
+            .and_then(parse_id_value)
+    })
 }

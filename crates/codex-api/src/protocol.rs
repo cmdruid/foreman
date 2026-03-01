@@ -72,11 +72,39 @@ fn extract_id(value: &serde_json::Value) -> Option<String> {
 }
 
 pub fn parse_thread_id(params: &serde_json::Value) -> Option<String> {
-    params.get("thread_id").and_then(extract_id)
+    params
+        .get("threadId")
+        .and_then(extract_id)
+        .or_else(|| params.get("thread_id").and_then(extract_id))
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| {
+                    thread
+                        .get("id")
+                        .or_else(|| thread.get("threadId"))
+                        .or_else(|| thread.get("thread_id"))
+                })
+                .and_then(extract_id)
+        })
 }
 
 pub fn parse_turn_id(params: &serde_json::Value) -> Option<String> {
-    params.get("turn_id").and_then(extract_id)
+    params
+        .get("turnId")
+        .and_then(extract_id)
+        .or_else(|| params.get("turn_id").and_then(extract_id))
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| {
+                    turn
+                        .get("id")
+                        .or_else(|| turn.get("turnId"))
+                        .or_else(|| turn.get("turn_id"))
+                })
+                .and_then(extract_id)
+        })
 }
 
 #[cfg(test)]
@@ -91,10 +119,17 @@ mod tests {
             Some("0192".into())
         );
         assert_eq!(
+            parse_thread_id(&json!({"threadId": "0193"})),
+            Some("0193".into())
+        );
+        assert_eq!(
             parse_thread_id(&json!({"thread_id": 42})),
             Some("42".into())
         );
-        assert!(parse_thread_id(&json!({"thread": {"id": "legacy"}})).is_none());
+        assert_eq!(
+            parse_thread_id(&json!({"thread": {"id": "legacy"}})),
+            Some("legacy".into())
+        );
         assert!(parse_thread_id(&json!({"thread-id": "legacy"})).is_none());
         assert!(parse_thread_id(&json!({"msg": {"thread_id": "legacy"}})).is_none());
     }
@@ -105,8 +140,15 @@ mod tests {
             parse_turn_id(&json!({"turn_id": "turn-1"})),
             Some("turn-1".into())
         );
+        assert_eq!(
+            parse_turn_id(&json!({"turnId": "turn-2"})),
+            Some("turn-2".into())
+        );
         assert_eq!(parse_turn_id(&json!({"turn_id": 99})), Some("99".into()));
-        assert!(parse_turn_id(&json!({"turn": {"id": "legacy"}})).is_none());
+        assert_eq!(
+            parse_turn_id(&json!({"turn": {"id": "turn-legacy"}})),
+            Some("turn-legacy".into())
+        );
         assert!(parse_turn_id(&json!({"turn-id": "legacy"})).is_none());
         assert!(parse_turn_id(&json!({"msg": {"turn_id": "legacy"}})).is_none());
     }

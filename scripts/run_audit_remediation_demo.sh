@@ -140,7 +140,7 @@ for report in \
 done
 
 workers_payload=$(cat "$WORKERS_FILE")
-jobs_payload=$(jq -c --argjson workers "$workers_payload" '{workers:$workers}')
+jobs_payload=$(jq -cn --argjson workers "$workers_payload" '{workers:$workers}')
 
 job_response=$(curl -sS -X POST "http://$BIND/projects/$project_id/jobs" \
   -H 'Content-Type: application/json' \
@@ -183,7 +183,7 @@ jobs_result=$(curl -sS "http://$BIND/jobs/$job_id/result")
 echo "final job result:"
 echo "$jobs_result" | jq '.'
 
-if [[ -n "${CLEANUP_PROJECT:-true}" && "${CLEANUP_PROJECT,,}" == "true" ]]; then
+if [[ "${CLEANUP_PROJECT:-true}" == "true" ]]; then
   echo "tearing down project $project_id"
   curl -sS -X DELETE "http://$BIND/projects/$project_id" >/dev/null
 fi

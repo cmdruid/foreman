@@ -20,8 +20,8 @@ fn write_fake_app_server_script(path: &std::path::Path, contents: &str) {
             .expect("script metadata")
             .permissions();
         perm.set_mode(0o755);
-        std::fs::set_permissions(path, perm).expect("make script executable");
-    }
+    std::fs::set_permissions(path, perm).expect("make script executable");
+}
 }
 
 fn assert_json_roundtrip<T>(value: &T)
@@ -32,6 +32,10 @@ where
     let decoded: T = serde_json::from_value(encoded.clone()).expect("deserialize");
     let reparsed = serde_json::to_value(decoded).expect("reserialize");
     assert_eq!(encoded, reparsed);
+}
+
+fn get_param_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
 fn request_id_text(entry: &Value) -> Option<String> {
@@ -410,7 +414,10 @@ done
         .expect("thread/start request");
     assert_eq!(thread_request["params"]["cwd"], "/tmp");
     assert_eq!(thread_request["params"]["model"], "gpt-4o");
-    assert_eq!(thread_request["params"]["model_provider"], "openai");
+    assert_eq!(
+        get_param_string(&thread_request["params"], &["model_provider", "modelProvider"]),
+        Some("openai")
+    );
     assert_eq!(thread_request["params"]["sandbox"], "default");
 
     let turn_request = requests
@@ -426,16 +433,153 @@ done
         .iter()
         .find(|line| line.get("method") == Some(&Value::String("turn/steer".into())))
         .expect("turn/steer request");
-    assert_eq!(steer_request["params"]["thread_id"], "thread-1");
-    assert_eq!(steer_request["params"]["expected_turn_id"], "turn-1");
+    assert_eq!(get_param_string(&steer_request["params"], &["thread_id", "threadId"]), Some("thread-1"));
+    assert_eq!(get_param_string(&steer_request["params"], &["expected_turn_id", "expectedTurnId"]), Some("turn-1"));
     assert_eq!(steer_request["params"]["input"][0]["text"], "steer prompt");
 
     let interrupt_request = requests
         .iter()
         .find(|line| line.get("method") == Some(&Value::String("turn/interrupt".into())))
         .expect("turn/interrupt request");
-    assert_eq!(interrupt_request["params"]["thread_id"], "thread-1");
-    assert_eq!(interrupt_request["params"]["turn_id"], "turn-2");
+    assert_eq!(get_param_string(&interrupt_request["params"], &["thread_id", "threadId"]), Some("thread-1"));
+    assert_eq!(get_param_string(&interrupt_request["params"], &["turn_id", "turnId"]), Some("turn-2"));
+}
+
+#[tokio::test]
+async fn client_uses_app_server_compatible_request_casing_and_response_shapes() {
+    let temp_dir = tempdir().expect("tempdir");
+    let request_log = temp_dir.path().join("requests.log");
+    let script_path = temp_dir.path().join("fake_app_server_compat.sh");
+    let script = r#"#!/usr/bin/env sh
+if [ "$1" != "app-server" ]; then
+  exit 1
+fi
+
+touch "__REQUEST_LOG__"
+
+extract_method() {
+  echo "$1" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p'
+}
+extract_id() {
+  echo "$1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}
+
+while read -r line; do
+  [ -z "$line" ] && continue
+  echo "$line" >> "__REQUEST_LOG__"
+
+  method="$(extract_method "$line")"
+  id="$(extract_id "$line")"
+  [ -z "$id" ] && continue
+
+  case "$method" in
+    initialize)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
+      ;;
+    "thread/start")
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"thread\":{\"id\":\"thread-1\"}}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"thread/status/changed\",\"params\":{\"thread_id\":\"thread-1\",\"status\":\"running\"}}"
+      ;;
+    "turn/start")
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn\":{\"id\":\"turn-1\"}}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"thread_id\":\"thread-1\",\"turn_id\":\"turn-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"thread_id\":\"thread-1\",\"turn_id\":\"turn-1\"}}"
+      ;;
+    "turn/steer")
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn\":{\"id\":\"turn-2\",\"expected_turn_id\":\"turn-1\"}}}"
+      ;;
+    "turn/interrupt")
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
+      ;;
+    *)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"error\":{\"code\":-32601,\"message\":\"unsupported method $method\"}}"
+      ;;
+  esac
+done
+"#
+    .replace("__REQUEST_LOG__", &request_log.to_string_lossy());
+    write_fake_app_server_script(&script_path, &script);
+
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let client = AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
+        .await
+        .expect("connect fake app-server");
+
+    let thread = client
+        .thread_start(&ThreadStartRequest {
+            model: Some("gpt-4o".into()),
+            model_provider: Some("openai".into()),
+            cwd: Some("/tmp".into()),
+            sandbox: Some("default".into()),
+        })
+        .await
+        .expect("thread start");
+    assert_eq!(thread.thread_id, "thread-1");
+
+    let turn = client
+        .turn_start(&TurnStartRequest {
+            thread_id: thread.thread_id.clone(),
+            input: vec![TextPayload::text("compat test")],
+        })
+        .await
+        .expect("turn start");
+    assert_eq!(turn.turn_id, "turn-1");
+
+    let steer = client
+        .turn_steer(&TurnSteerRequest {
+            thread_id: thread.thread_id.clone(),
+            expected_turn_id: "turn-1".into(),
+            input: vec![TextPayload::text("compat steer")],
+        })
+        .await
+        .expect("turn steer");
+    assert_eq!(steer.turn_id, "turn-2");
+    assert_eq!(steer.expected_turn_id, Some("turn-1".into()));
+
+    client
+        .turn_interrupt(&TurnInterruptRequest {
+            thread_id: thread.thread_id,
+            turn_id: "turn-2".into(),
+        })
+        .await
+        .expect("turn interrupt");
+
+    let _completed = timeout(Duration::from_millis(500), async {
+        loop {
+            let event = event_rx.recv().await.expect("event");
+            if event.method == "turn/completed" {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("turn completed");
+
+    let requests: Vec<Value> = std::fs::read_to_string(&request_log)
+        .expect("read request log")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+
+    let turn_start = requests
+        .iter()
+        .find(|line| line.get("method") == Some(&Value::String("turn/start".into())))
+        .expect("turn/start request");
+    assert!(get_param_string(&turn_start["params"], &["threadId", "thread_id"]).is_some_and(|value| value == "thread-1"));
+
+    let steer_request = requests
+        .iter()
+        .find(|line| line.get("method") == Some(&Value::String("turn/steer".into())))
+        .expect("turn/steer request");
+    assert_eq!(get_param_string(&steer_request["params"], &["threadId", "thread_id"]), Some("thread-1"));
+    assert_eq!(get_param_string(&steer_request["params"], &["expectedTurnId", "expected_turn_id"]), Some("turn-1"));
+
+    let interrupt_request = requests
+        .iter()
+        .find(|line| line.get("method") == Some(&Value::String("turn/interrupt".into())))
+        .expect("turn/interrupt request");
+    assert_eq!(get_param_string(&interrupt_request["params"], &["threadId", "thread_id"]), Some("thread-1"));
+    assert_eq!(get_param_string(&interrupt_request["params"], &["turnId", "turn_id"]), Some("turn-2"));
 }
 
 #[tokio::test]

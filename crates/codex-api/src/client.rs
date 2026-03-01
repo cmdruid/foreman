@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::protocol::{
     JSONRPCError, JSONRPCErrorError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest,
-    JSONRPCResponse, RequestId, parse_thread_id,
+    JSONRPCResponse, RequestId, parse_thread_id, parse_turn_id,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +37,7 @@ impl TextPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadStartRequest {
     pub model: Option<String>,
     pub model_provider: Option<String>,
@@ -44,37 +45,97 @@ pub struct ThreadStartRequest {
     pub sandbox: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadStartResponse {
     pub thread_id: String,
 }
 
+impl<'de> serde::Deserialize<'de> for ThreadStartResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_thread_id(&value)
+            .map(|thread_id| Self { thread_id })
+            .ok_or_else(|| serde::de::Error::custom("missing thread_id in thread/start response"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnStartRequest {
     pub thread_id: String,
     pub input: Vec<TextPayload>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnStartResponse {
     pub turn_id: String,
 }
 
+impl<'de> serde::Deserialize<'de> for TurnStartResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_turn_id(&value)
+            .map(|turn_id| Self { turn_id })
+            .ok_or_else(|| serde::de::Error::custom("missing turn_id in turn/start response"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnSteerRequest {
     pub thread_id: String,
     pub expected_turn_id: String,
     pub input: Vec<TextPayload>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnSteerResponse {
     pub turn_id: String,
     #[serde(default)]
     pub expected_turn_id: Option<String>,
 }
 
+impl<'de> serde::Deserialize<'de> for TurnSteerResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let turn_id = parse_turn_id(&value)
+            .ok_or_else(|| serde::de::Error::custom("missing turn_id in turn/steer response"))?;
+        let expected_turn_id = parse_expected_turn_id_field(&value)
+            .or_else(|| parse_expected_turn_id_field(value.get("turn")?));
+
+        Ok(Self {
+            turn_id,
+            expected_turn_id,
+        })
+    }
+}
+
+fn parse_expected_turn_id_field(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("expectedTurnId")
+        .and_then(extract_text_field)
+        .or_else(|| params.get("expected_turn_id").and_then(extract_text_field))
+}
+
+fn extract_text_field(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(num) => Some(num.to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnInterruptRequest {
     pub thread_id: String,
     pub turn_id: String,
