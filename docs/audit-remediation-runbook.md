@@ -1,14 +1,16 @@
-# Audit Remediation Runbook
+# Audit Plan Runbook
 
 This runbook documents a repeatable end-to-end exercise for testing
-`codex-foreman` against existing audit artifacts.
+`codex-foreman` by running a fresh audit workflow with explicit worker assignments
+and collecting generated audit reports.
 
 The goal is to:
 1. start `codex-foreman`,
 2. spawn a project from the local `.project` directory,
-3. define explicit parallel audit-remediation worker prompts (security, robustness, code quality, technical debt, test coverage),
+3. define explicit parallel audit worker prompts (security, robustness, code quality, technical debt, test coverage),
 4. capture worker outputs in one wait/result call, and
-5. cleanly tear everything down.
+5. write each worker report to disk,
+6. cleanly tear everything down.
 
 ## Prerequisites
 
@@ -30,8 +32,10 @@ The script performs:
 - foreman startup,
 - health check,
 - project bootstrap from `.project`,
-- job dispatch from `.audit/security.md`, `.audit/robustness.md`, `.audit/code-quality.md`, `.audit/technical-debt.md`, `.audit/test-coverage.md`,
-- job wait with worker results,
+- job dispatch from `.audit/security.md`, `.audit/robustness.md`, `.audit/code-quality.md`, `.audit/technical-debt.md`, `.audit/test-coverage.md` as audit instruction templates,
+- worker-run fresh audits that generate reports,
+- report collection to `AUDIT_OUTPUT_DIR`,
+- optional foreman consolidation, and
 - optional project deletion and foreman shutdown.
 
 ## Manual Execution (Equivalent Steps)
@@ -44,11 +48,13 @@ The script performs:
 3. Start one job with one worker per audit category:
    - `POST /projects/{project_id}/jobs` with a `workers` array.
    - Foreman only executes the explicit worker prompts you include in this array.
+   - The worker prompts are audit-first and ask each agent to generate a report.
 4. Wait for completion:
    - `GET /jobs/{job_id}/wait?include_workers=true&timeout_ms=120000`.
 5. Validate:
    - Job result has one worker entry per category.
-   - Worker texts are present in `workers[].final_text`/`summary`.
+   - Worker audits are present in `workers[].final_text`/`summary`.
+   - Optionally save each report to files under `AUDIT_OUTPUT_DIR`.
 6. Ask foreman for consolidation (optional):
    - `POST /projects/{project_id}/foreman/send` with a consolidation prompt.
 7. Delete the project to exercise teardown:
@@ -77,6 +83,7 @@ Key behavior:
 - `SERVICE_CONFIG_PATH` (default: `/tmp/cf-audit-remediation-service.toml`)
 - `PROJECT_PATH` (default: `$(pwd)/.project`)
 - `REPORT_DIR` (default: `$(pwd)/.audit`)
+- `AUDIT_OUTPUT_DIR` (default: `$(pwd)/.audit/generated-reports`)
 - `JOB_TIMEOUT_MS` (default: `180000`)
 - `JOB_POLL_MS` (default: `250`)
 - `WAIT_FOREMAN_SECONDS` (default: `30`)
@@ -84,11 +91,11 @@ Key behavior:
 ## Interpretation of Outputs
 
 - `project_id`: identifies the running project scope.
-- `job_id`: identifies the audit-remediation job.
+- `job_id`: identifies the fresh audit job.
 - `job.wait` response:
   - `status`: terminal status (`completed`/`partial`/`failed`).
   - `workers`: one result per audit category.
-  - `workers[].summary` and/or `workers[].final_text`: your remediation recommendations.
+  - `workers[].summary` and/or `workers[].final_text`: generated audit reports.
 - If `timed_out` is `true`, increase timeout and rerun.
 
 ## Failure Recovery

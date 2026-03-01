@@ -24,6 +24,7 @@ fi
 BIND="${BIND:-127.0.0.1:$PORT}"
 PROJECT_PATH="${PROJECT_PATH:-$REPO_ROOT/.project}"
 REPORT_DIR="${REPORT_DIR:-$REPO_ROOT/.audit}"
+AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-$REPO_ROOT/.audit/generated-reports}"
 FOREMAN_STATE_PATH="${FOREMAN_STATE_PATH:-/tmp/cf-audit-remediation-state.json}"
 SERVICE_CONFIG_PATH="${SERVICE_CONFIG_PATH:-/tmp/cf-audit-remediation-service.toml}"
 FOREMAN_LOG_PATH="${FOREMAN_LOG_PATH:-/tmp/cf-audit-remediation-foreman.log}"
@@ -52,6 +53,7 @@ if [[ ! -d "$REPORT_DIR" ]]; then
   echo "missing reports directory: $REPORT_DIR" >&2
   exit 1
 fi
+mkdir -p "$AUDIT_OUTPUT_DIR"
 
 cat >"$SERVICE_CONFIG_PATH" <<EOF
 [app_server]
@@ -129,7 +131,7 @@ for report in \
   fi
   category="$(basename "$report" .md)"
   report_text="$(cat "$report")"
-  prompt="You are a codex-foreman worker.\n\nReview this audit report and draft a concrete remediation plan for codex-foreman.\n\nReport source: $category\n\n---\n${report_text}\n---\n\nReturn: a concise plan with file targets, command validation, and risk notes."
+  prompt="You are a codex-foreman audit worker.\n\nRun a fresh audit for category '$category' against the repository and generate an actionable audit report.\n\nAudit instructions (use as scoring criteria):\n---\n${report_text}\n---\n\nReturn in markdown with:\n- Findings ranked by severity\n- File targets and line references\n- Recommended remediations per finding\n- Validation commands or checks to verify fixes\n- Risk and effort notes\n"
   worker=$(jq -cn \
     --arg p "$prompt" \
     --arg category "$category" \
@@ -163,11 +165,28 @@ job_timed_out=$(jq -r '.timed_out // true' <<<"$job_wait_response")
 echo "job status: $job_status, timed_out=$job_timed_out"
 echo "$job_wait_response" | jq '.'
 
+echo "writing audit reports to: $AUDIT_OUTPUT_DIR"
+echo "$job_wait_response" | jq -c '.workers[]' | while read -r worker; do
+  worker_category="$(jq -r '.labels.category // "worker"' <<<"$worker")"
+  report_body="$(jq -r '.final_text // .summary // ""' <<<"$worker")"
+  safe_category="$(printf '%s' "$worker_category" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9._/-')"
+  if [[ -z "$safe_category" || "$safe_category" == "." ]]; then
+    safe_category="worker"
+  fi
+  report_path="$AUDIT_OUTPUT_DIR/${safe_category}-audit-report.md"
+  {
+    echo "# Audit report: $worker_category"
+    echo
+    echo "$report_body"
+  } > "$report_path"
+  echo "  - $worker_category => $report_path"
+done
+
 project_state=$(curl -sS "http://$BIND/projects/$project_id")
 foreman_id=$(jq -r '.foreman_agent_id // empty' <<<"$project_state")
 
 if [[ -n "$foreman_id" && "$foreman_id" != "null" ]]; then
-  foreman_prompt="Consolidate the worker outputs into one prioritized remediation plan. Provide an actionable sequencing plan: quick fixes, risk-reducing fixes, and optional hardening follow-ups. Include explicit code path references."
+  foreman_prompt="Consolidate the worker audit reports into one prioritized remediation plan. Provide an actionable sequencing plan: quick fixes, risk-reducing fixes, and optional hardening follow-ups. Include explicit code path references and confidence levels."
   foreman_send=$(jq -cn --arg p "$foreman_prompt" '{prompt:$p}')
   curl -sS -X POST "http://$BIND/projects/$project_id/foreman/send" \
     -H 'Content-Type: application/json' \
