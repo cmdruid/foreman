@@ -248,6 +248,12 @@ Success criteria:
   - `contrib/mock/.audit/reports/`
 - non-fatal warnings only (e.g. empty `final_text` for `turn/completed`)
 
+Run the full release gate script when preparing a release:
+
+```bash
+./scripts/release_gate.sh
+```
+
 ## Test Assets
 
 ### Mocks

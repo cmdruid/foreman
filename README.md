@@ -244,4 +244,5 @@ See full release/testing instructions:
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Testing: [`TESTING.md`](TESTING.md)
 - Releases: [`RELEASES.md`](RELEASES.md)
+- Release checklist: [`RELEASE.md`](RELEASE.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)

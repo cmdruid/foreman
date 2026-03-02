@@ -4,6 +4,28 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_ROOT="$REPO_ROOT"
 
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage: scripts/release_gate.sh
+
+Run release-readiness checks for codex-foreman:
+- workflow action pinning verification
+- release metadata/version check
+- documentation anchor checks
+- optional live mixed mock smoke
+
+Environment:
+- RUN_LIVE_MOCK_SMOKE=true (default: false)
+- CODEX_BIN (required when live smoke enabled)
+- FOREMAN_BIN (defaults to target/release/codex-foreman)
+- JOB_TIMEOUT_MS (default: 300000)
+- JOB_POLL_MS (default: 500)
+- WORKTREE_CLEANUP (default: true)
+- RUN_MOCK_DEMO_MODE (default: mixed)
+EOF
+  exit 0
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found" >&2
   exit 1
@@ -58,6 +80,9 @@ if [[ "${RUN_LIVE_MOCK_SMOKE:-false}" == "true" ]]; then
     echo "live mock demo failed" >&2
     exit 1
   fi
+elif [[ "${RUN_LIVE_MOCK_SMOKE:-false}" != "false" ]]; then
+  echo "RUN_LIVE_MOCK_SMOKE must be true or false" >&2
+  exit 1
 else
   echo "[release-gate] RUN_LIVE_MOCK_SMOKE=false; skipping live demo."
 fi

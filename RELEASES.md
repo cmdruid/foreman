@@ -147,6 +147,12 @@ Before tagging, run the release gate commands in `TESTING.md` and verify:
 - mixed-mode mock demo ends in `result: success`
 - release metadata test passes (package version, changelog, and releases entries)
 
+For a consolidated checklist, run:
+
+```bash
+cat RELEASE.md
+```
+
 ## v0.1.0
 
 - Initial MVP with:
