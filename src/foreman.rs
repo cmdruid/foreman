@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +17,7 @@ use reqwest::Client as HttpClient;
 use serde_json::Value;
 use tokio::{
     process::Command,
-    sync::{RwLock, broadcast},
+    sync::{broadcast, Mutex, RwLock},
     time,
 };
 use tracing::{debug, warn};
@@ -31,7 +31,7 @@ use crate::{
         CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, JobResult,
         JobState, ProjectState, SendAgentInput, SpawnAgentRequest, SpawnAgentResponse,
         SpawnProjectRequest, SpawnProjectWorkerRequest, SpawnProjectWorkerResponse,
-        SteerAgentInput,
+        SteerAgentInput, WorkerWorktreeSpec,
     },
     project::{CallbackSpec, ProjectConfig, ProjectRuntimeFiles},
     state::{
@@ -170,6 +170,7 @@ pub struct Foreman {
     thread_map: RwLock<HashMap<String, Uuid>>,
     projects: RwLock<HashMap<Uuid, ProjectRecord>>,
     jobs: RwLock<HashMap<Uuid, JobRecord>>,
+    worktree_lock: Mutex<()>,
     started_at: u64,
     state_path: PathBuf,
     recovery_state: RwLock<PersistedState>,
@@ -192,6 +193,7 @@ impl Foreman {
             thread_map: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
+            worktree_lock: Mutex::new(()),
             started_at: now_ts(),
             state_path,
             recovery_state: RwLock::new(persisted_state),
@@ -680,7 +682,7 @@ impl Foreman {
                 }
                 if method == "item/agentMessage"
                     || method == "item/agentMessage/delta"
-                    || (method == "item/completed" && params.get("item").is_some())
+                    || (method == "item/completed" && is_agent_item_completion_payload(&params))
                 {
                     agent.result = Some(update_agent_result_text(
                         agent.result.clone(),
@@ -1568,16 +1570,16 @@ impl Foreman {
             "{}\n\nTASK\n{}\n",
             project.runtime.worker_prompt, request.prompt
         );
+        let project_path = project.runtime.path.to_string_lossy().to_string();
+        let worker_cwd = self
+            .resolve_worker_cwd(&project_path, request.cwd, request.worktree.as_ref())
+            .await?;
 
         let spawn_request = SpawnAgentRequest {
             prompt: worker_prompt,
             model: request.model,
             model_provider: request.model_provider,
-            cwd: Some(
-                request
-                    .cwd
-                    .unwrap_or_else(|| project.runtime.path.to_string_lossy().to_string()),
-            ),
+            cwd: Some(worker_cwd),
             sandbox: request.sandbox,
             callback_profile: None,
             callback_prompt_prefix: None,
@@ -1653,15 +1655,16 @@ impl Foreman {
                 "{}\n\nTASK\n{}\n",
                 project.runtime.worker_prompt, spec.prompt
             );
+            let project_path = project.runtime.path.to_string_lossy().to_string();
+            let worker_cwd = self
+                .resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
+                .await?;
 
             let spawn_request = SpawnAgentRequest {
                 prompt: worker_prompt,
                 model: spec.model,
                 model_provider: spec.model_provider,
-                cwd: Some(
-                    spec.cwd
-                        .unwrap_or_else(|| project.runtime.path.to_string_lossy().to_string()),
-                ),
+                cwd: Some(worker_cwd),
                 sandbox: spec.sandbox,
                 callback_profile: None,
                 callback_prompt_prefix: None,
@@ -1721,6 +1724,85 @@ impl Foreman {
             worker_count: worker_ids.len(),
             labels: job_labels,
         })
+    }
+
+    async fn resolve_worker_cwd(
+        &self,
+        project_path: &str,
+        requested_cwd: Option<String>,
+        worktree: Option<&WorkerWorktreeSpec>,
+    ) -> Result<String> {
+        let Some(worktree) = worktree else {
+            return Ok(requested_cwd.unwrap_or_else(|| project_path.to_string()));
+        };
+
+        let worktree_path = {
+            let configured = Path::new(&worktree.path);
+            if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                Path::new(project_path).join(configured)
+            }
+        };
+
+        let worktree_path = worktree_path
+            .to_str()
+            .context("invalid worktree path")?
+            .to_string();
+
+        if worktree.create {
+            self.create_worktree(
+                project_path,
+                &worktree_path,
+                worktree.base_ref.as_deref(),
+            )
+            .await?;
+            return Ok(worktree_path);
+        }
+
+        if !Path::new(&worktree_path).exists() {
+            return Err(anyhow!(
+                "requested worktree path does not exist: {worktree_path}"
+            ));
+        }
+        if !Path::new(&worktree_path).is_dir() {
+            return Err(anyhow!(
+                "requested worktree path is not a directory: {worktree_path}"
+            ));
+        }
+
+        Ok(worktree_path)
+    }
+
+    async fn create_worktree(
+        &self,
+        project_path: &str,
+        worktree_path: &str,
+        base_ref: Option<&str>,
+    ) -> Result<()> {
+        let _lock = self.worktree_lock.lock().await;
+        let base_ref = base_ref.unwrap_or("HEAD");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_path)
+            .arg("worktree")
+            .arg("add")
+            .arg("--detach")
+            .arg(worktree_path)
+            .arg(base_ref)
+            .output()
+            .await
+            .with_context(|| format!("failed to run git worktree add for {worktree_path}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Err(anyhow!(
+                "failed to create worker worktree at {worktree_path}: {stderr} {stdout}"
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn list_jobs(&self) -> Vec<JobState> {
@@ -2954,16 +3036,65 @@ fn json_pretty_value(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn extract_item_payload<'a>(params: &'a Value) -> Option<&'a Value> {
+    params
+        .get("item")
+        .or_else(|| params.get("msg").and_then(|msg| msg.get("item")))
+}
+
+fn is_agent_item_completion(item: &Value) -> bool {
+    let role = item.get("role").and_then(Value::as_str);
+    let item_type = item.get("type").and_then(Value::as_str);
+
+    let Some(role) = role else {
+        return match item_type {
+            Some(item_type) if item_type.eq_ignore_ascii_case("usermessage") => false,
+            Some(item_type) if item_type == "user_message" => false,
+            _ => true,
+        };
+    };
+
+    if role.eq_ignore_ascii_case("user") {
+        return false;
+    }
+
+    match item_type {
+        Some(item_type) if item_type.eq_ignore_ascii_case("usermessage") => false,
+        Some(item_type) if item_type == "user_message" => false,
+        _ => true,
+    }
+}
+
+fn is_agent_item_completion_payload(params: &Value) -> bool {
+    extract_item_payload(params)
+        .map_or(false, is_agent_item_completion)
+}
+
 fn extract_agent_result_text(method: &str, params: &Value) -> Option<String> {
     match method {
-        "turn/completed" => extract_text_from_turn(params.get("turn")?)
-            .or_else(|| extract_text_from_params(params, &["last_agent_message", "text", "result"]))
-            .or_else(|| params.get("item").and_then(extract_text_from_item)),
+        "turn/completed" => extract_text_from_turn(
+            params
+                .get("turn")
+                .or_else(|| params.get("msg").and_then(|msg| msg.get("turn")))?,
+        )
+        .or_else(|| extract_text_from_params(params, &["last_agent_message", "text", "result"]))
+        .or_else(|| {
+            params
+                .get("item")
+                .or_else(|| params.get("msg").and_then(|msg| msg.get("item")))
+                .and_then(extract_text_from_item)
+        }),
         "item/agentMessage" | "item/agentMessage/delta" => {
-            extract_text_from_params(params, &["text", "message", "delta", "snippet"])
+            extract_text_from_params(params, &["text", "message", "delta", "snippet"]).or_else(
+                || {
+                    extract_text_from_params(
+                        params.get("msg")?,
+                        &["text", "message", "delta", "snippet"],
+                    )
+                },
+            )
         }
-        "item/completed" => params
-            .get("item")
+        "item/completed" => extract_item_payload(params)
             .and_then(extract_text_from_item)
             .or_else(|| {
                 params
@@ -3127,6 +3258,7 @@ fn extract_result_summary(params: &Value) -> Option<String> {
     params
         .get("summary")
         .or_else(|| params.get("item").and_then(|item| item.get("summary")))
+        .or_else(|| extract_item_payload(params).and_then(|item| item.get("summary")))
         .or_else(|| {
             params
                 .get("result")
@@ -3140,6 +3272,9 @@ fn extract_result_references(params: &Value) -> Option<Vec<String>> {
     parse_references_value(params.get("references"))
         .or_else(|| {
             parse_references_value(params.get("item").and_then(|item| item.get("references")))
+        })
+        .or_else(|| {
+            parse_references_value(extract_item_payload(params).and_then(|item| item.get("references")))
         })
         .or_else(|| {
             parse_references_value(

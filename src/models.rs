@@ -3,6 +3,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerWorktreeSpec {
+    pub path: String,
+    #[serde(default)]
+    pub create: bool,
+    pub base_ref: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SpawnAgentRequest {
     pub prompt: String,
@@ -74,6 +82,7 @@ pub struct SpawnProjectWorkerRequest {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub cwd: Option<String>,
+    pub worktree: Option<WorkerWorktreeSpec>,
     #[serde(default)]
     pub sandbox: Option<String>,
 }
@@ -88,6 +97,7 @@ pub struct ProjectJobWorkerSpec {
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub cwd: Option<String>,
+    pub worktree: Option<WorkerWorktreeSpec>,
     #[serde(default)]
     pub sandbox: Option<String>,
 }
@@ -290,5 +300,27 @@ mod tests {
             request.callback_events,
             Some(vec!["turn/completed".to_string()])
         );
+    }
+
+    #[test]
+    fn spawn_project_worker_request_supports_optional_worktree_spec() {
+        let raw = json!({
+            "prompt": "worktree action",
+            "worktree": {
+                "path": ".cf-test-worktree",
+                "create": true,
+                "base_ref": "HEAD"
+            }
+        });
+
+        let request: SpawnProjectWorkerRequest =
+            serde_json::from_value(raw).expect("deserialize spawn project worker with worktree");
+        let worktree = request.worktree.expect("worktree spec");
+
+        assert_eq!(
+            worktree.path,
+            ".cf-test-worktree"
+        );
+        assert!(worktree.create);
     }
 }

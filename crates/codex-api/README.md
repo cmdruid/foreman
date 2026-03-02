@@ -61,3 +61,20 @@ let thread = client.request::<_, serde_json::Value>(
     &serde_json::json!({ "cwd": null, "model": null, "model_provider": null, "sandbox": null })
 ).await?;
 ```
+
+## Smoke test
+
+Run the live app-server smoke test from this crate:
+
+```bash
+CODEX_BIN=/usr/local/bin/codex \\
+CODEX_API_SMOKE_TEST=1 \\
+cargo test -p codex-api --test smoke -- --ignored codex_api_smoke_app_server_creates_real_file
+```
+
+Expected result:
+
+- App-server launches successfully
+- `thread/start` then `turn/start` are exercised
+- the temporary workspace receives `.audit-generated/smoke-app-server.txt` with test content
+- command/turn completion events are observed

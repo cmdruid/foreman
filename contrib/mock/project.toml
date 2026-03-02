@@ -1,0 +1,12 @@
+name = "mock-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[policy]
+compact_after_turns = 6
+heartbeat_interval_ms = 30000
+bubble_up_events = ["turn/completed", "turn/aborted"]

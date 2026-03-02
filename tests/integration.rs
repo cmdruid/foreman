@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod common;
 
@@ -905,6 +905,325 @@ async fn test_project_job_creation_and_result() {
     webhook.stop().await;
 }
 
+fn write_fake_codex_deliverable_server_script(path: &Path) {
+    let state_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("fake_codex_state");
+    let state_dir = state_dir.to_string_lossy().to_string();
+    let script = r##"#!/usr/bin/env sh
+if [ "$1" != "app-server" ]; then
+  exit 1
+fi
+
+STATE_DIR="__STATE_DIR__"
+mkdir -p "$STATE_DIR"
+rm -f "$STATE_DIR"/*.cwd 2>/dev/null || true
+
+thread_counter=0
+turn_counter=0
+
+extract_id() {
+  echo "$1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}
+
+extract_method() {
+  echo "$1" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p'
+}
+
+extract_field() {
+  echo "$1" | sed -n "s/.*\"$2\":\"\\([^\\\"]*\\)\".*/\\1/p"
+}
+
+send_line() {
+  echo "$1"
+}
+
+send_response() {
+  send_line "{\"jsonrpc\":\"2.0\",\"id\":\"$1\",\"result\":$2}"
+}
+
+send_notification() {
+  send_line "{\"jsonrpc\":\"2.0\",\"method\":\"$1\",\"params\":$2}"
+}
+
+send_error() {
+  send_line "{\"jsonrpc\":\"2.0\",\"id\":\"$1\",\"error\":{\"code\":$2,\"message\":\"$3\"}}"
+}
+
+prompt_from_line() {
+  echo "$1" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p'
+}
+
+extract_marker() {
+  echo "$1" | sed -n "s/.*$2=\\([^ ]*\\).*/\\1/p"
+}
+
+extract_worktree_path() {
+  echo "$1" | sed -n 's/.*WORKTREE_PATH=\([^ ]*\).*/\1/p'
+}
+
+mock_write_deliverable() {
+  thread_id="$1"
+  turn_id="$2"
+  category="$3"
+  worktree_path="$4"
+
+  [ -z "$worktree_path" ] && worktree_path="/tmp/fake-worktree-${thread_id}-${turn_id}-${category}"
+
+  mkdir -p "$worktree_path/.audit-generated"
+  printf '%s\n' "# Worker Deliverable" > "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
+  printf '%s\n' "Category: $category" >> "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
+  printf '%s\n' "Thread: $thread_id" >> "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
+  printf '%s\n' "Turn: $turn_id" >> "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
+  printf '%s\n' "Worktree: $worktree_path" >> "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
+  send_notification "codex/event/task_started" "{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\",\"category\":\"$category\",\"worktreePath\":\"$worktree_path\"}"
+  send_notification "codex/event/exec_command_begin" "{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\",\"command\":\"write worker deliverable\"}"
+  send_notification "codex/event/exec_command_end" "{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\",\"status\":\"success\"}"
+  send_notification "codex/event/task_complete" "{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\",\"category\":\"$category\"}"
+}
+
+while read -r line; do
+  [ -z "$line" ] && continue
+
+  method="$(extract_method "$line")"
+  id="$(extract_id "$line")"
+  [ -z "$id" ] && continue
+
+  case "$method" in
+    initialize)
+      send_response "$id" "{}"
+      ;;
+    "thread/start")
+      thread_id="thread-$thread_counter"
+      thread_counter=$((thread_counter + 1))
+      cwd="$(extract_field "$line" "cwd")"
+      [ -z "$cwd" ] && cwd="/tmp"
+      printf '%s' "$cwd" > "$STATE_DIR/${thread_id}.cwd"
+      send_response "$id" "{\"thread\":{\"id\":\"$thread_id\"}}"
+      ;;
+    "turn/start")
+      thread_id="$(extract_field "$line" "threadId")"
+      [ -z "$thread_id" ] && thread_id="$(extract_field "$line" "thread_id")"
+      turn_id="turn-$turn_counter"
+      turn_counter=$((turn_counter + 1))
+
+      prompt="$(prompt_from_line "$line")"
+      category="$(extract_marker "$prompt" "CATEGORY")"
+      [ -z "$category" ] && category="worker"
+      worktree_path="$(extract_worktree_path "$prompt")"
+
+      send_response "$id" "{\"turn\":{\"id\":\"$turn_id\"}}"
+      send_notification "thread/status/changed" "{\"threadId\":\"$thread_id\",\"status\":\"running\"}"
+      send_notification "turn/started" "{\"threadId\":\"$thread_id\",\"turn\":{\"id\":\"$turn_id\",\"status\":\"running\",\"items\":[]}}"
+      mock_write_deliverable "$thread_id" "$turn_id" "$category" "$worktree_path"
+      send_notification "turn/completed" "{\"threadId\":\"$thread_id\",\"turn\":{\"id\":\"$turn_id\",\"status\":\"completed\",\"items\":[{\"type\":\"assistantMessage\",\"role\":\"assistant\",\"text\":\"WROTE ${worktree_path}/.audit-generated/${category}-worker-deliverable.md\"}]}}"
+      ;;
+    "turn/steer")
+      thread_id="$(extract_field "$line" "threadId")"
+      [ -z "$thread_id" ] && thread_id="$(extract_field "$line" "thread_id")"
+      turn_id="turn-$turn_counter"
+      turn_counter=$((turn_counter + 1))
+      expected_turn_id="$(extract_field "$line" "expectedTurnId")"
+      [ -z "$expected_turn_id" ] && expected_turn_id="$(extract_field "$line" "expected_turn_id")"
+      send_response "$id" "{\"turn\":{\"id\":\"$turn_id\"},\"expectedTurnId\":\"$expected_turn_id\"}"
+      send_notification "turn/started" "{\"threadId\":\"$thread_id\",\"turn\":{\"id\":\"$turn_id\",\"status\":\"running\",\"items\":[]}}"
+      send_notification "turn/completed" "{\"threadId\":\"$thread_id\",\"turn\":{\"id\":\"$turn_id\",\"status\":\"completed\",\"items\":[{\"type\":\"text\",\"text\":\"steered\"}]}}"
+      ;;
+    "turn/interrupt")
+      thread_id="$(extract_field "$line" "threadId")"
+      [ -z "$thread_id" ] && thread_id="$(extract_field "$line" "thread_id")"
+      turn_id="$(extract_field "$line" "turnId")"
+      [ -z "$turn_id" ] && turn_id="$(extract_field "$line" "turn_id")"
+      send_response "$id" "{}"
+      send_notification "turn/aborted" "{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\"}"
+      ;;
+    *)
+      send_error "$id" -32601 "unsupported method $method"
+      ;;
+  esac
+done
+"##
+    .replace("__STATE_DIR__", &state_dir);
+    std::fs::write(path, script).expect("write fake app-server script");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .expect("fake app-server metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("make fake app-server executable");
+    }
+}
+
+#[tokio::test]
+async fn test_project_job_dispatches_workers_with_fake_app_server() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-generic-worktree").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let fake_codex = temp.path().join("fake_codex_worktree");
+
+    write_fake_codex_deliverable_server_script(&fake_codex);
+    let service_config_contents = "[callbacks]\n";
+    common::write_service_config(&service_config, service_config_contents)
+        .expect("write service config");
+
+    let bind = format!("127.0.0.1:{}", common::random_port());
+    let harness = common::start_foreman(
+        &bind,
+        &service_config,
+        &state_path,
+        fake_codex.to_str().expect("fake app-server path"),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "run generic project worker plan"
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project id");
+
+    let work_items = [
+        ("security", "identify and fix auth or permission issues"),
+        ("robustness", "identify and fix error-path gaps"),
+        ("code-quality", "identify and fix one quality regression"),
+    ];
+    let worktree_base = temp.path().join("mock-trees");
+    fs::create_dir_all(&worktree_base).expect("create mock worktree base");
+
+    let mut workers = Vec::new();
+    for (category, task) in work_items.iter() {
+        let worktree_path = worktree_base.join(category);
+        let prompt = format!(
+            "Run mock work for category {category}: {task}\n\
+            CATEGORY={category}\
+            \n\
+            WORKTREE_PATH={}",
+            worktree_path.display()
+        );
+        workers.push(json!({
+            "prompt": prompt,
+            "labels": {
+                "category": category,
+                "worktree_path": worktree_path.to_string_lossy().to_string(),
+            }
+        }));
+    }
+
+    let create_jobs = client
+        .post(format!("{}/projects/{}/jobs", harness.base_url, project_id))
+        .json(&json!({ "workers": workers }))
+        .send()
+        .await
+        .expect("spawn project jobs");
+    assert_eq!(create_jobs.status(), StatusCode::CREATED);
+    let job_data = create_jobs.json::<Value>().await.expect("job response");
+    let job_id = job_data["job_id"].as_str().expect("job id");
+
+    let wait = client
+        .get(format!(
+            "{}/jobs/{}/wait?timeout_ms=10000&poll_ms=50&include_workers=true",
+            harness.base_url, job_id
+        ))
+        .send()
+        .await
+        .expect("wait for job");
+    assert_eq!(wait.status(), StatusCode::OK);
+
+    let result = wait.json::<Value>().await.expect("job wait payload");
+    assert_eq!(result["timed_out"].as_bool(), Some(false));
+    let status = result["status"].as_str().expect("job status");
+    assert!(matches!(status, "completed" | "partial" | "failed"));
+    let workers_result = result["workers"]
+        .as_array()
+        .expect("job workers array");
+    assert_eq!(workers_result.len(), work_items.len());
+    assert_eq!(
+        result["total_workers"].as_u64().expect("total workers"),
+        work_items.len() as u64
+    );
+
+    for (idx, worker) in workers_result.iter().enumerate() {
+        let final_text = worker["final_text"].as_str().expect("worker final_text");
+        assert!(final_text.starts_with("WROTE"));
+        assert!(final_text.contains(".audit-generated"));
+
+        let worker_id = worker["agent_id"]
+            .as_str()
+            .expect("worker has agent_id");
+        let labels = &worker["labels"];
+        let category = label_value_to_string(labels, "category")
+            .unwrap_or_else(|| work_items[idx].0.to_string());
+        let fallback_path = worktree_base.join(&category);
+        let fallback_worktree = fallback_path.to_string_lossy().to_string();
+        let worktree_path = label_value_to_string(labels, "worktree_path")
+            .unwrap_or(fallback_worktree);
+
+        let worker_events = client
+            .get(format!("{}/agents/{}/events", harness.base_url, worker_id))
+            .send()
+            .await
+            .expect("worker events")
+            .json::<Value>()
+            .await
+            .expect("worker events payload");
+        let events = worker_events
+            .as_array()
+            .expect("worker events as array");
+
+        let has_command_event = events.iter().any(|event| {
+            is_command_like_event(event["method"].as_str().unwrap_or(""))
+        });
+        assert!(
+            has_command_event,
+            "worker {worker_id} should emit command-like event stream"
+        );
+
+        let deliverable = extract_written_path(final_text)
+            .or_else(|| {
+                Some(
+                    PathBuf::from(worktree_path)
+                        .join(".audit-generated")
+                    .join(format!("{category}-worker-deliverable.md"))
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            })
+            .map(PathBuf::from)
+            .expect("deliverable path");
+        assert!(deliverable.exists(), "missing worker deliverable at {deliverable:?}");
+        let contents = fs::read_to_string(&deliverable).expect("read worker deliverable");
+        assert!(
+            !contents.trim().is_empty(),
+            "worker deliverable should be non-empty: {deliverable:?}"
+        );
+    }
+
+    let project_delete = client
+        .delete(format!("{}/projects/{project_id}", harness.base_url))
+        .send()
+        .await
+        .expect("close project");
+    assert_eq!(project_delete.status(), StatusCode::NO_CONTENT);
+
+    harness.terminate().await;
+}
+
 #[tokio::test]
 async fn test_worker_monitoring_restarts_stalled_worker() {
     let (_temp_project, project_path) =
@@ -1504,4 +1823,30 @@ async fn wait_for_path_absence(path: &PathBuf, timeout: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn is_command_like_event(method: &str) -> bool {
+    method.contains("exec_command")
+        || method.contains("command")
+        || method.contains("file")
+        || method == "codex/event/task_started"
+        || method == "codex/event/task_complete"
+}
+
+fn label_value_to_string(labels: &Value, key: &str) -> Option<String> {
+    match labels.get(key)? {
+        Value::String(value) => Some(value.to_string()),
+        Value::Array(values) => values
+            .first()
+            .and_then(Value::as_str)
+            .map(std::string::ToString::to_string),
+        _ => None,
+    }
+}
+
+fn extract_written_path(final_text: &str) -> Option<String> {
+    final_text
+        .splitn(2, "WROTE ")
+        .nth(1)
+        .map(|path| path.split_whitespace().next().unwrap_or(path).trim().to_string())
 }

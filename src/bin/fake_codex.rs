@@ -9,8 +9,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // Real usage in foreman: `<binary> app-server ...`
-    // The test shim accepts any invocation that includes `app-server` and
-    // ignores all subsequent flags.
+    // The test shim requires the invocation to be `app-server` and ignores flags after it.
     if args.len() < 2 || args[1] != "app-server" {
         eprintln!("fake_codex expected to be invoked as `app-server`");
         std::process::exit(1);
@@ -70,14 +69,16 @@ fn run_stub_server() {
                     &mut stdout,
                     &id,
                     json!({
-                        "thread_id": thread_id,
+                        "thread": {
+                            "id": thread_id,
+                            "status": "running",
+                        },
                     }),
                 );
             }
             "turn/start" => {
                 let turn_id = format!("turn-{}", turn_counter.fetch_add(1, Ordering::SeqCst));
                 let thread_id = parse_string_param(&params, "thread")
-                    .or_else(|| parse_nested_id(&params, "thread"))
                     .unwrap_or_else(|| "thread-unknown".to_string());
                 let input = params.get("input").cloned().unwrap_or_else(|| json!([]));
                 let text = extract_prompt_text_from_input(&input);
@@ -93,55 +94,56 @@ fn run_stub_server() {
                     &mut stdout,
                     &id,
                     json!({
-                        "turn_id": turn_id,
+                        "turn": {
+                            "id": turn_id,
+                            "items": [],
+                        },
                     }),
                 );
 
                 send_notification(
                     &mut stdout,
                     "thread/status/changed",
-                    json!({"thread_id": thread_id, "status": "running"}),
+                    json!({"threadId": thread_id, "status": "running"}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/started",
-                    json!({"thread_id": thread_id, "turn_id": turn_id}),
+                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "running", "items": []}}),
                 );
 
                 if !should_stall {
                     send_notification(
                         &mut stdout,
                         "turn/completed",
-                        json!({"thread_id": thread_id, "turn_id": turn_id}),
+                        json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "items": [{"type": "text", "text": "worker complete"}]}}),
                     );
                 }
             }
             "turn/steer" => {
                 let thread_id = parse_string_param(&params, "thread")
-                    .or_else(|| parse_nested_id(&params, "thread"))
                     .unwrap_or_else(|| "thread-unknown".to_string());
                 let expected_turn_id = parse_string_param(&params, "expected_turn")
-                    .or_else(|| parse_nested_id(&params, "expected_turn"))
                     .unwrap_or_else(|| "turn-unknown".to_string());
                 let turn_id = format!("turn-{}", turn_counter.fetch_add(1, Ordering::SeqCst));
 
                 send_response(
                     &mut stdout,
                     &id,
-                    json!({"turn_id": turn_id, "expected_turn_id": expected_turn_id}),
+                    json!({"turn": {"id": turn_id}, "expectedTurnId": expected_turn_id}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/started",
-                    json!({"thread_id": thread_id, "turn_id": turn_id}),
+                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "running", "items": []}}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/completed",
-                    json!({"thread_id": thread_id, "turn_id": turn_id}),
+                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "items": [{"type": "text", "text": "steered"}]}}),
                 );
             }
             "turn/interrupt" => {
@@ -154,7 +156,7 @@ fn run_stub_server() {
                 send_notification(
                     &mut stdout,
                     "turn/aborted",
-                    json!({"thread_id": thread_id, "turn_id": turn_id}),
+                    json!({"threadId": thread_id, "turnId": turn_id}),
                 );
             }
             _ => {
@@ -225,33 +227,16 @@ fn parse_id_value(value: &Value) -> Option<String> {
 }
 
 fn parse_string_param(params: &Value, stem: &str) -> Option<String> {
-    let (camel, snake) = match stem {
-        "thread" => ("threadId", "thread_id"),
-        "turn" => ("turnId", "turn_id"),
-        "expected_turn" => ("expectedTurnId", "expected_turn_id"),
-        _ => (stem, stem),
+    let field = match stem {
+        "thread" => "threadId",
+        "turn" => "turnId",
+        "expected_turn" => "expectedTurnId",
+        _ => stem,
     };
 
     params
-        .get(camel)
-        .or_else(|| params.get(snake))
+        .get(field)
         .and_then(parse_id_value)
-}
-
-fn parse_nested_id(params: &Value, stem: &str) -> Option<String> {
-    let (camel, snake) = match stem {
-        "thread" => ("threadId", "thread_id"),
-        "turn" => ("turnId", "turn_id"),
-        "expected_turn" => ("expectedTurnId", "expected_turn_id"),
-        _ => (stem, stem),
-    };
-    params.get(stem).and_then(|value| {
-        value
-            .get("id")
-            .or_else(|| value.get(camel))
-            .or_else(|| value.get(snake))
-            .and_then(parse_id_value)
-    })
 }
 
 fn extract_prompt_text_from_input(input: &Value) -> String {

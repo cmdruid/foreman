@@ -71,39 +71,128 @@ fn extract_id(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-pub fn parse_thread_id(params: &serde_json::Value) -> Option<String> {
-    params
-        .get("threadId")
-        .and_then(extract_id)
-        .or_else(|| params.get("thread_id").and_then(extract_id))
+fn parse_id_field(value: &serde_json::Value, candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find_map(|candidate| value.get(*candidate).and_then(extract_id))
+}
+
+fn parse_thread_id_from_message(value: &serde_json::Value) -> Option<String> {
+    parse_id_field(
+        value,
+        &["threadId", "thread_id", "conversationId", "conversation_id"],
+    )
+    .or_else(|| {
+        value
+            .get("thread")
+            .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+    })
+    .or_else(|| {
+        value.get("conversation").and_then(|conversation| {
+            parse_id_field(
+                conversation,
+                &[
+                    "threadId",
+                    "thread_id",
+                    "id",
+                    "conversationId",
+                    "conversation_id",
+                ],
+            )
+            .or_else(|| {
+                conversation
+                    .get("thread")
+                    .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+            })
+        })
+    })
+}
+
+fn parse_turn_id_from_message(value: &serde_json::Value) -> Option<String> {
+    parse_id_field(value, &["turnId", "turn_id"])
         .or_else(|| {
-            params
-                .get("thread")
-                .and_then(|thread| {
-                    thread
-                        .get("id")
-                        .or_else(|| thread.get("threadId"))
-                        .or_else(|| thread.get("thread_id"))
+            value
+                .get("turn")
+                .and_then(|turn| parse_id_field(turn, &["id", "turnId", "turn_id"]))
+        })
+        .or_else(|| {
+            value.get("conversation").and_then(|conversation| {
+                parse_id_field(conversation, &["turnId", "turn_id"]).or_else(|| {
+                    conversation
+                        .get("turn")
+                        .and_then(|turn| parse_id_field(turn, &["id", "turnId", "turn_id"]))
                 })
-                .and_then(extract_id)
+            })
         })
 }
 
+pub fn parse_thread_id(params: &serde_json::Value) -> Option<String> {
+    parse_id_field(
+        params,
+        &["threadId", "thread_id", "conversationId", "conversation_id"],
+    )
+    .or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+    })
+    .or_else(|| {
+        params.get("conversation").and_then(|conversation| {
+            parse_id_field(
+                conversation,
+                &[
+                    "threadId",
+                    "thread_id",
+                    "id",
+                    "conversationId",
+                    "conversation_id",
+                ],
+            )
+            .or_else(|| {
+                conversation
+                    .get("thread")
+                    .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+            })
+        })
+    })
+    .or_else(|| params.get("msg").and_then(parse_thread_id_from_message))
+    .or_else(|| params.get("result").and_then(parse_thread_id_from_message))
+}
+
 pub fn parse_turn_id(params: &serde_json::Value) -> Option<String> {
-    params
-        .get("turnId")
-        .and_then(extract_id)
-        .or_else(|| params.get("turn_id").and_then(extract_id))
+    parse_id_field(params, &["turnId", "turn_id"])
+        .or_else(|| params.get("turn").and_then(parse_turn_id_from_message))
+        .or_else(|| parse_turn_id_from_message(params))
+        .or_else(|| params.get("result").and_then(parse_turn_id_from_message))
         .or_else(|| {
             params
-                .get("turn")
-                .and_then(|turn| {
-                    turn
-                        .get("id")
-                        .or_else(|| turn.get("turnId"))
-                        .or_else(|| turn.get("turn_id"))
+                .get("msg")
+                .and_then(parse_turn_id_from_message)
+                .or_else(|| {
+                    params.get("thread").and_then(|thread| {
+                        parse_id_field(thread, &["turnId", "turn_id"]).or_else(|| {
+                            parse_turn_id_from_message(
+                                thread.get("msg").unwrap_or(&serde_json::json!(null)),
+                            )
+                        })
+                    })
                 })
-                .and_then(extract_id)
+        })
+        .or_else(|| {
+            params.get("conversation").and_then(|conversation| {
+                parse_id_field(conversation, &["turnId", "turn_id"]).or_else(|| {
+                    parse_turn_id_from_message(
+                        conversation.get("turn").unwrap_or(&serde_json::json!(null)),
+                    )
+                    .or_else(|| {
+                        parse_turn_id_from_message(
+                            conversation
+                                .get("msg")
+                                .unwrap_or(&serde_json::json!(null)),
+                        )
+                    })
+                })
+            })
         })
 }
 
@@ -113,43 +202,75 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_thread_id_supports_current_thread_id_field() {
+    fn parse_thread_id_supports_strict_response_field() {
         assert_eq!(
-            parse_thread_id(&json!({"thread_id": "0192"})),
+            parse_thread_id(&json!({"threadId": "thread-0192"})),
+            Some("thread-0192".into())
+        );
+        assert_eq!(
+            parse_thread_id(&json!({"thread": {"id": "0192"}})),
             Some("0192".into())
         );
         assert_eq!(
-            parse_thread_id(&json!({"threadId": "0193"})),
-            Some("0193".into())
+            parse_thread_id(&json!({"thread_id": "0192"})),
+            Some("0192".into())
         );
         assert_eq!(
             parse_thread_id(&json!({"thread_id": 42})),
             Some("42".into())
         );
         assert_eq!(
-            parse_thread_id(&json!({"thread": {"id": "legacy"}})),
-            Some("legacy".into())
+            parse_thread_id(&json!({"conversationId":"conv-1"})),
+            Some("conv-1".into())
         );
-        assert!(parse_thread_id(&json!({"thread-id": "legacy"})).is_none());
-        assert!(parse_thread_id(&json!({"msg": {"thread_id": "legacy"}})).is_none());
+        assert_eq!(
+            parse_thread_id(&json!({"msg":{"threadId":"thread-001"}})),
+            Some("thread-001".into())
+        );
+        assert_eq!(
+            parse_thread_id(&json!({"msg":{"thread":{"id":"thread-002"}}})),
+            Some("thread-002".into())
+        );
+        assert_eq!(
+            parse_thread_id(&json!({"msg":{"conversationId":"conv-3","thread":{"id":"thread-003"}}})),
+            Some("thread-003".into())
+        );
+        assert_eq!(
+            parse_thread_id(&json!({"result":{"thread":{"id":"thread-004"}}})),
+            Some("thread-004".into())
+        );
     }
 
     #[test]
-    fn parse_turn_id_supports_current_turn_id_field() {
+    fn parse_turn_id_supports_strict_response_field() {
+        assert_eq!(
+            parse_turn_id(&json!({"turnId": "turn-1"})),
+            Some("turn-1".into())
+        );
+        assert_eq!(
+            parse_turn_id(&json!({"turn": {"id": "turn-3"}})),
+            Some("turn-3".into())
+        );
         assert_eq!(
             parse_turn_id(&json!({"turn_id": "turn-1"})),
             Some("turn-1".into())
         );
-        assert_eq!(
-            parse_turn_id(&json!({"turnId": "turn-2"})),
-            Some("turn-2".into())
-        );
         assert_eq!(parse_turn_id(&json!({"turn_id": 99})), Some("99".into()));
         assert_eq!(
-            parse_turn_id(&json!({"turn": {"id": "turn-legacy"}})),
-            Some("turn-legacy".into())
+            parse_turn_id(&json!({"msg":{"turnId":"turn-msg-1"}})),
+            Some("turn-msg-1".into())
         );
-        assert!(parse_turn_id(&json!({"turn-id": "legacy"})).is_none());
-        assert!(parse_turn_id(&json!({"msg": {"turn_id": "legacy"}})).is_none());
+        assert_eq!(
+            parse_turn_id(&json!({"msg":{"turn":{"id":"turn-msg-2"}}})),
+            Some("turn-msg-2".into())
+        );
+        assert_eq!(
+            parse_turn_id(&json!({"msg":{"conversation":{"turn_id":"turn-msg-3"}}})),
+            Some("turn-msg-3".into())
+        );
+        assert_eq!(
+            parse_turn_id(&json!({"result":{"turn":{"id":"turn-result-1"}}})),
+            Some("turn-result-1".into())
+        );
     }
 }

@@ -2,3 +2,11 @@
 /target/
 Cargo.lock
 /crates/codex-api/target/
+/tmp-schema/
+/.audit/generated-reports/
+/.audit/mock-trees/
+/.audit/manual-mock-trees*/
+/.audit/worker-worktrees/
+/.audit/remediation-output/
+/.audit/mock-reports/
+/contrib/mock/.audit-generated/

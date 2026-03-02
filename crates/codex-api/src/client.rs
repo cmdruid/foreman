@@ -58,7 +58,7 @@ impl<'de> serde::Deserialize<'de> for ThreadStartResponse {
         let value = serde_json::Value::deserialize(deserializer)?;
         parse_thread_id(&value)
             .map(|thread_id| Self { thread_id })
-            .ok_or_else(|| serde::de::Error::custom("missing thread_id in thread/start response"))
+            .ok_or_else(|| serde::de::Error::custom("missing thread.id in thread/start response"))
     }
 }
 
@@ -82,7 +82,7 @@ impl<'de> serde::Deserialize<'de> for TurnStartResponse {
         let value = serde_json::Value::deserialize(deserializer)?;
         parse_turn_id(&value)
             .map(|turn_id| Self { turn_id })
-            .ok_or_else(|| serde::de::Error::custom("missing turn_id in turn/start response"))
+            .ok_or_else(|| serde::de::Error::custom("missing turn.id in turn/start response"))
     }
 }
 
@@ -108,9 +108,8 @@ impl<'de> serde::Deserialize<'de> for TurnSteerResponse {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         let turn_id = parse_turn_id(&value)
-            .ok_or_else(|| serde::de::Error::custom("missing turn_id in turn/steer response"))?;
-        let expected_turn_id = parse_expected_turn_id_field(&value)
-            .or_else(|| parse_expected_turn_id_field(value.get("turn")?));
+            .ok_or_else(|| serde::de::Error::custom("missing turn.id in turn/steer response"))?;
+        let expected_turn_id = parse_expected_turn_id_field(&value);
 
         Ok(Self {
             turn_id,
@@ -124,6 +123,15 @@ fn parse_expected_turn_id_field(params: &serde_json::Value) -> Option<String> {
         .get("expectedTurnId")
         .and_then(extract_text_field)
         .or_else(|| params.get("expected_turn_id").and_then(extract_text_field))
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| {
+                    turn.get("expected_turn_id")
+                        .or_else(|| turn.get("expectedTurnId"))
+                })
+                .and_then(extract_text_field)
+        })
 }
 
 fn extract_text_field(value: &serde_json::Value) -> Option<String> {
@@ -481,7 +489,7 @@ impl AppServerClient {
 
         let data = serde_json::json!({
             "method": request.method,
-            "thread_id": parse_thread_id(&request.params.unwrap_or(serde_json::Value::Null))
+            "threadId": parse_thread_id(&request.params.unwrap_or(serde_json::Value::Null))
                 .unwrap_or_default(),
             "status": "unhandled",
         });
@@ -537,7 +545,7 @@ mod tests {
         let script_path = temp_dir.path().join("fake_app_server_no_initialize.sh");
         write_fake_app_server_script(
             &script_path,
-            r#"#!/usr/bin/env sh
+r#"#!/usr/bin/env sh
 if [ "$1" != "app-server" ]; then
   exit 1
 fi
@@ -764,13 +772,13 @@ while read -r line; do
 
   case "$method" in
     thread/start)
-      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"thread_id\":\"thread-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"thread\":{\"id\":\"thread-1\"}}}"
       ;;
     turn/start)
-      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn_id\":\"turn-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn\":{\"id\":\"turn-1\"}}}"
       ;;
     turn/steer)
-      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn_id\":\"turn-2\",\"expected_turn_id\":\"turn-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn\":{\"id\":\"turn-2\"},\"expectedTurnId\":\"turn-1\"}}"
       ;;
     turn/interrupt)
       printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
@@ -803,26 +811,26 @@ done
             )
             .await
             .expect("thread start");
-        assert_eq!(thread_result, serde_json::json!({"thread_id": "thread-1"}));
+        assert_eq!(thread_result, serde_json::json!({"thread":{"id":"thread-1"}}));
 
         let turn_result = client
             .request::<_, serde_json::Value>(
                 "turn/start",
                 &serde_json::json!({
-                    "thread_id": "thread-1",
+                    "threadId": "thread-1",
                     "input": []
                 }),
             )
             .await
             .expect("turn start");
-        assert_eq!(turn_result, serde_json::json!({"turn_id": "turn-1"}));
+        assert_eq!(turn_result, serde_json::json!({"turn": {"id": "turn-1"}}));
 
         let steer_result = client
             .request::<_, serde_json::Value>(
                 "turn/steer",
                 &serde_json::json!({
-                    "thread_id": "thread-1",
-                    "expected_turn_id": "turn-1",
+                    "threadId": "thread-1",
+                    "expectedTurnId": "turn-1",
                     "input": []
                 }),
             )
@@ -830,15 +838,15 @@ done
             .expect("turn steer");
         assert_eq!(
             steer_result,
-            serde_json::json!({"turn_id": "turn-2", "expected_turn_id": "turn-1"})
+            serde_json::json!({"turn":{"id":"turn-2"},"expectedTurnId":"turn-1"})
         );
 
         let interrupt_result = client
             .request::<_, serde_json::Value>(
                 "turn/interrupt",
                 &serde_json::json!({
-                    "thread_id": "thread-1",
-                    "turn_id": "turn-1"
+                    "threadId": "thread-1",
+                    "turnId": "turn-1"
                 }),
             )
             .await

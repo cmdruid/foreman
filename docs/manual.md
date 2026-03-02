@@ -90,30 +90,27 @@ cargo test -p codex-api --tests -- --nocapture
 cargo test --tests
 ```
 
-### Audit Remediation Runbook
+### Mock Project Demo (Live)
 
-For a full exercise of parallel review + consolidation using this repository’s `.audit` templates:
+For a live generic mock project exercise using real workers, use one of the scripts in
+`contrib`:
 
 ```bash
-./scripts/run_audit_remediation_demo.sh
+./contrib/run_mock_demo.sh
+./contrib/run_mock_mixed_demo.sh
 ```
 
-Output includes:
-- project id
-- job id
-- per-category worker results
-- foreman wait output
-- final job payload
+Use cases:
+
+- `run_mock_demo.sh`: all workers receive worktree-backed tasks and emit per-category reports.
+- `run_mock_mixed_demo.sh`: mixed workers with/without worktrees in one `create_project_jobs` call.
 
 You can tune timing by setting:
 
 - `PORT`
 - `JOB_TIMEOUT_MS`
 - `JOB_POLL_MS`
-- `WAIT_FOREMAN_SECONDS`
-- `CLEANUP_PROJECT=false` (preserve state for manual follow-up)
-
-See [audit remediation runbook](/home/cmd/repos/codex-foreman/docs/audit-remediation-runbook.md) for the full step-by-step manual and troubleshooting notes.
+- `WORKTREE_BASE`
 
 ### Real-Backend Smoke Test
 

@@ -1,0 +1,4 @@
+- Completed: all worker assignments were handed to real codex workers.
+- Verification: each worker should report completion and emit `.audit-generated/<category>-worker-deliverable.md` inside its assigned worktree.
+- Risks: none unless a worker fails to create required deliverable.
+- Next action: review each worktree deliverable and merge approved fixes.
