@@ -10,3 +10,5 @@ Cargo.lock
 /.audit/remediation-output/
 /.audit/mock-reports/
 /contrib/mock/.audit-generated/
+/contrib/mock/.audit-worktrees/
+/contrib/mock/.audit/

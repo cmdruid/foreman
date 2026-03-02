@@ -63,18 +63,17 @@ SERVICE_CONFIG_PATH="${SERVICE_CONFIG_PATH:-/tmp/cf-mock-service.toml}"
 FOREMAN_LOG_PATH="${FOREMAN_LOG_PATH:-/tmp/cf-mock-foreman.log}"
 JOB_TIMEOUT_MS="${JOB_TIMEOUT_MS:-180000}"
 JOB_POLL_MS="${JOB_POLL_MS:-250}"
-WORKTREE_BASE="${WORKTREE_BASE:-/tmp/cf-mock/worktrees}"
-REPORT_DIR="${REPORT_DIR:-/tmp/cf-mock/reports}"
+WORKTREE_BASE="${WORKTREE_BASE:-$PROJECT_PATH/.audit-worktrees}"
+REPORT_DIR="${REPORT_DIR:-$PROJECT_PATH/.audit/reports}"
 WORKER_SANDBOX="${WORKER_SANDBOX:-workspace-write}"
+STRICT_EXECUTION_CHECKS="${STRICT_EXECUTION_CHECKS:-false}"
+RUN_MOCK_DEMO_MODE="${RUN_MOCK_DEMO_MODE:-worktree}"
+WORKTREE_CLEANUP="${WORKTREE_CLEANUP:-true}"
 FOREMAN_MANAGED_WORKTREES="${FOREMAN_MANAGED_WORKTREES:-true}"
 BASE_BRANCH="$(git -C "$PROJECT_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 
 prepare_worktree() {
   local worktree_path="$1"
-
-  if [[ -e "$worktree_path" ]]; then
-    rm -rf "$worktree_path"
-  fi
 
   if ! git -C "$PROJECT_PATH" worktree add --detach "$worktree_path" "$BASE_BRANCH"; then
     return 1
@@ -119,29 +118,24 @@ looks_like_prompt_payload() {
   return 1
 }
 
-extract_label_value() {
-  local labels_json="$1"
-  local key="$2"
-  local index="$3"
-  jq -r --arg key "$key" --argjson index "$index" '
-    (.[$key] // empty)
-    | if type == "array" then .[$index] // empty else . end
-  ' <<<"$labels_json"
+select_worker_label() {
+  local worker_json="$1"
+  local label_path="$2"
+
+  jq -r "
+    .labels[\"$label_path\"] // \"\" |
+    if type == \"array\" then
+      .[0]
+    else
+      .
+    end
+  " <<<"$worker_json"
 }
 
-extract_prompt_field() {
-  local body="$1"
-  local field="$2"
-  case "$field" in
-    category)
-      grep -m1 '^You are a codex-foreman mock worker for category: ' <<<"$body" \
-        | sed 's/^You are a codex-foreman mock worker for category: //'
-      ;;
-    worktree_path)
-      grep -m1 'Use this exact worktree path for all filesystem operations:' <<<"$body" \
-        | sed 's/.*operations: //'
-      ;;
-  esac
+fetch_worker_events() {
+  local worker_id="$1"
+  local tail_count="${2:-200}"
+  curl -sS "http://$BIND/agents/$worker_id/events?tail=$tail_count"
 }
 
 cat >"$SERVICE_CONFIG_PATH" <<EOF_CFG
@@ -158,6 +152,13 @@ echo "project path : $PROJECT_PATH"
 
 cleanup() {
   set +e
+  if [[ "$WORKTREE_CLEANUP" == "true" ]]; then
+    for path in "${WORKTREE_PATHS[@]:-}"; do
+      if [[ -n "$path" && -d "$path" ]]; then
+        git -C "$PROJECT_PATH" worktree remove --force "$path" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
   if [[ -n "${FOREMAN_PID:-}" ]] && kill -0 "$FOREMAN_PID" 2>/dev/null; then
     echo "stopping codex-foreman (pid $FOREMAN_PID)"
     kill "$FOREMAN_PID"
@@ -204,69 +205,123 @@ echo "created project: $project_id"
 WORKERS_FILE="$(mktemp)"
 echo "[]" >"$WORKERS_FILE"
 declare -a WORKER_CATEGORIES=()
+declare -a WORKTREE_PATHS=()
 
-for category in security robustness code-quality; do
+if [[ "$RUN_MOCK_DEMO_MODE" == "mixed" || "$RUN_MOCK_DEMO_MODE" == "mixed-no-worktree" ]]; then
+  WORKER_CATEGORIES_TO_RUN=(security robustness code-quality notes)
+else
+  WORKER_CATEGORIES_TO_RUN=(security robustness code-quality)
+fi
+
+for category in "${WORKER_CATEGORIES_TO_RUN[@]}"; do
   safe_category="$(safe_slug "$category")"
-  worker_worktree_path="$WORKTREE_BASE/${safe_category}-$(date +%s%3N)-$RANDOM"
-  worker_worktree_branch="foreman-${safe_category}-$(date +%s%3N)-$RANDOM"
-  task_file="$PROJECT_PATH/tasks/$category.md"
-  deliverable_path=".audit-generated/${safe_category}-worker-deliverable.md"
-  worker_cwd="$worker_worktree_path"
-  if [[ "$FOREMAN_MANAGED_WORKTREES" == "true" ]]; then
-    mkdir -p "$(dirname "$worker_worktree_path")"
+  requires_worktree="false"
+  requires_command="true"
+
+  if [[ "$category" == "notes" ]]; then
+    task_file="$PROJECT_PATH/README.md"
+    deliverable_path="$PROJECT_PATH/.audit-generated/${safe_category}-worker-deliverable.md"
+    worker_cwd="$PROJECT_PATH"
   else
-    if ! prepare_worktree "$worker_worktree_path"; then
-      echo "warning: failed to prepare worktree for category $category at $worker_worktree_path" >&2
-      FAILED=true
-      WORKER_CATEGORIES+=("$category")
-      continue
+    requires_worktree="true"
+    worker_worktree_path="$WORKTREE_BASE/${safe_category}-$(date +%s%3N)-$RANDOM"
+    deliverable_path="$worker_worktree_path/.audit-generated/${safe_category}-worker-deliverable.md"
+    worker_cwd="$worker_worktree_path"
+    WORKTREE_PATHS+=("$worker_worktree_path")
+
+    if [[ "$FOREMAN_MANAGED_WORKTREES" == "true" ]]; then
+      mkdir -p "$(dirname "$worker_worktree_path")"
+    else
+      if ! prepare_worktree "$worker_worktree_path"; then
+        echo "warning: failed to prepare worktree for category $category at $worker_worktree_path" >&2
+        FAILED=true
+        WORKER_CATEGORIES+=("$category")
+        continue
+      fi
     fi
+    task_file="$PROJECT_PATH/tasks/$category.md"
   fi
-  prompt="$(cat <<EOF
+
+  if [[ "$requires_worktree" == "true" ]]; then
+    prompt="$(cat <<EOF
 You are a codex-foreman mock worker for category: $category.
 Worktree instruction:
 - Use this exact worktree path for all filesystem operations: $worker_worktree_path
 - Execute all filesystem commands from this current working directory: $worker_worktree_path
 - Read the assignment source: $task_file
-- Create and write "$worker_worktree_path/$deliverable_path" with actual content.
-- Execute this shell command to guarantee the deliverable exists:
-  mkdir -p "$worker_worktree_path/.audit-generated"
-  cat > "$worker_worktree_path/$deliverable_path" <<'EOF_DELIVERABLE'
-# Remediation Deliverable: $category
+- IMPORTANT: execute the shell command block exactly as written and return only after it succeeds.
+- Execute this shell command block to guarantee the deliverable exists:
+  cd "$worker_worktree_path"
+  mkdir -p ".audit-generated"
+  cat > "$deliverable_path" <<'EOF_DELIVERABLE'
+# Mock Deliverable: $category
 
 - Source: $task_file
   - Summary: replace with concrete issue and fix details.
-- Impacted files:
-  - TODO: add modified files
-- Verification:
-  - TODO: add a concrete command that proves completion
+  - Impacted files:
+    - TODO: add modified files
+  - Verification:
+    - TODO: add a concrete command that proves completion
 EOF_DELIVERABLE
-  - Include actionable fix tasks and explicit verification command.
+- Run this verification command before returning:
+  if ! test -f "$deliverable_path"; then
+    echo "WORKER_DELIVERY_MISSING:$deliverable_path"
+    exit 1
+  fi
+  ls -l "$deliverable_path"
+  echo "WORKER_DELIVERY_OK:$deliverable_path"
+- Include actionable fix tasks and explicit verification command.
 - Return a concise completion summary.
 EOF
 )"
-  if [[ "$FOREMAN_MANAGED_WORKTREES" == "true" ]]; then
+  else
+    prompt="$(cat <<EOF
+You are a codex-foreman mock worker for category: $category.
+Work without a dedicated worktree and keep all edits in the shared project.
+Read the assignment source: $task_file
+- IMPORTANT: execute the shell command block exactly as written and return only after it succeeds.
+- Execute this shell command block to guarantee the deliverable exists:
+  cd "$PROJECT_PATH"
+  mkdir -p ".audit-generated"
+  cat > "$deliverable_path" <<'EOF_DELIVERABLE'
+# Mock Deliverable: $category
+
+- Source: $task_file
+- Notes: complete the assignment and log findings in this report.
+EOF_DELIVERABLE
+  ls -l "$deliverable_path"
+  echo "WORKER_DELIVERY_OK:$deliverable_path"
+- Include a concise completion summary.
+EOF
+)"
+  fi
+
+  if [[ "$requires_worktree" == "true" ]]; then
     worker=$(jq -cn \
       --arg p "$prompt" \
       --arg category "$category" \
       --arg safe_category "$safe_category" \
       --arg worktree_path "$worker_worktree_path" \
-      --arg worktree_branch "$worker_worktree_branch" \
       --arg cwd "$worker_cwd" \
       --arg sandbox "$WORKER_SANDBOX" \
       --arg base_ref "$BASE_BRANCH" \
-      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, worktree:{path:$worktree_path, create:true, base_ref:$base_ref}, labels:{"category":$category,"safe_category":$safe_category,"worktree_path":$worktree_path,"worktree_branch":$worktree_branch}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
+      --arg artifact_path "$deliverable_path" \
+      --arg requires_worktree "$requires_worktree" \
+      --arg requires_command "$requires_command" \
+      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, worktree:{path:$worktree_path, create:true, base_ref:$base_ref}, labels:{"category":$category,"safe_category":$safe_category,"worktree_path":$worktree_path,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
   else
     worker=$(jq -cn \
       --arg p "$prompt" \
       --arg category "$category" \
       --arg safe_category "$safe_category" \
-      --arg worktree_path "$worker_worktree_path" \
-      --arg worktree_branch "$worker_worktree_branch" \
       --arg cwd "$worker_cwd" \
       --arg sandbox "$WORKER_SANDBOX" \
-      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, labels:{"category":$category,"safe_category":$safe_category,"worktree_path":$worktree_path,"worktree_branch":$worktree_branch}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
+      --arg artifact_path "$deliverable_path" \
+      --arg requires_worktree "$requires_worktree" \
+      --arg requires_command "$requires_command" \
+      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, labels:{"category":$category,"safe_category":$safe_category,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
   fi
+
   workers_file_tmp="$(mktemp)"
   jq -c --argjson w "$worker" '. += [$w]' "$WORKERS_FILE" > "$workers_file_tmp"
   mv "$workers_file_tmp" "$WORKERS_FILE"
@@ -303,27 +358,44 @@ else
   for i in "${!job_workers[@]}"; do
     worker="${job_workers[$i]}"
     worker_id="$(jq -r '.agent_id // empty' <<<"$worker")"
-    category="$(jq -r '(.labels.category // empty) | if type == "array" then .[0] else . end' <<<"$worker")"
+    category="$(select_worker_label "$worker" "category")"
+    worktree_path="$(select_worker_label "$worker" "worktree_path")"
+    deliverable_path="$(select_worker_label "$worker" "artifact_path")"
+    requires_worktree="$(select_worker_label "$worker" "requires_worktree")"
+    requires_command="$(select_worker_label "$worker" "requires_command")"
+
     if [[ "$category" == "null" || "$category" == "" ]]; then
       category="${WORKER_CATEGORIES[$i]:-worker-$((i+1))}"
     fi
+    if [[ "$requires_worktree" == "null" || "$requires_worktree" == "" ]]; then
+      requires_worktree="false"
+    fi
+    if [[ "$requires_command" == "null" || "$requires_command" == "" ]]; then
+      requires_command="false"
+    fi
+
     safe_category="$(safe_slug "$category")"
     report_body="$(jq -r '.final_text // .summary // ""' <<<"$worker")"
     if looks_like_prompt_payload "$report_body" && [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
       report_body="$(jq -r '.final_text // .summary // ""' <<<"$(fetch_worker_result "$worker_id")")"
     fi
-    if [[ "$category" == "null" || "$category" == "" ]]; then
-      category="$(extract_prompt_field "$report_body" "category")"
+
+    if [[ -z "$deliverable_path" || "$deliverable_path" == "null" ]]; then
+      if [[ "$requires_worktree" == "true" ]]; then
+        deliverable_path="$worktree_path/.audit-generated/${safe_category}-worker-deliverable.md"
+      else
+        deliverable_path="$PROJECT_PATH/.audit-generated/${safe_category}-worker-deliverable.md"
+      fi
     fi
-    if [[ "$category" == "null" || "$category" == "" ]]; then
-      category="worker-$((i+1))"
+
+    if [[ "$requires_worktree" == "true" ]]; then
+      if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+        worktree_path="${WORKTREE_BASE}/${safe_category}-fallback-$(date +%s%3N)-$RANDOM"
+      fi
+      worktree_probe_path="$worktree_path"
+    else
+      worktree_probe_path="$PROJECT_PATH"
     fi
-    safe_category="$(safe_slug "$category")"
-    worker_worktree_path="$(extract_prompt_field "$report_body" "worktree_path")"
-    if [[ "$worker_worktree_path" == "null" || "$worker_worktree_path" == "" ]]; then
-      worker_worktree_path="${WORKTREE_BASE}/${safe_category}-fallback-$(date +%s%3N)-$RANDOM"
-    fi
-    deliverable_path="$worker_worktree_path/.audit-generated/${safe_category}-worker-deliverable.md"
 
     if [[ -z "$worker_id" || "$worker_id" == "null" ]]; then
       echo "warning: worker $i had missing agent_id"
@@ -334,9 +406,24 @@ else
       FAILED=true
     fi
     if [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
-      agent_events=$(curl -sS "http://$BIND/agents/$worker_id/events?tail=200")
+      agent_events="$(fetch_worker_events "$worker_id" 200)"
       if ! jq -e 'any(.[]; .method == "item/assistantMessage" or .method == "item/assistantMessage/delta" or .method == "item/agentMessage" or .method == "item/agentMessage/delta")' <<<"$agent_events" >/dev/null; then
         echo "warning: worker $worker_id had no assistant events; likely prompt-echo completion"
+        if [[ "$STRICT_EXECUTION_CHECKS" == "true" ]]; then
+          FAILED=true
+        fi
+      fi
+      if [[ "$requires_command" == "true" ]] && ! jq -e 'any(.[]; .method == "codex/event/exec_command_begin" or .method == "codex/event/exec_command_end")' <<<"$agent_events" >/dev/null; then
+        echo "warning: worker $worker_id did not emit command events for a requires_command=true work item"
+        if [[ "$STRICT_EXECUTION_CHECKS" == "true" ]]; then
+          FAILED=true
+        fi
+      fi
+    fi
+
+    if [[ "$requires_worktree" == "true" ]]; then
+      if [[ ! -d "$worktree_probe_path" ]]; then
+        echo "warning: worktree missing for worker $worker_id at $worktree_probe_path"
         FAILED=true
       fi
     fi

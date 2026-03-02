@@ -2,7 +2,7 @@
 
 1. Read the worker assignment from the provided prompt.
 2. Confirm an explicit `WORKTREE_PATH=<path>` is present. If missing, create:
-   - `<project-root>/.audit/mock-trees/<category>-<timestamp>`
+   - `<project-root>/.audit-worktrees/<category>-<timestamp>`
 3. Create the worker worktree:
    - `git -C "<project-root>" worktree add -b "<worker-branch>" "$WORKTREE_PATH" "<base-branch>"`
 4. Read the target issue prompt file at:

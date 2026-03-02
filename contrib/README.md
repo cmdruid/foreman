@@ -9,7 +9,7 @@ This folder contains optional assets for tooling integrations.
   - Self-contained mock project with explicit worktree-based worker instructions.
 - `run_mock_demo.sh`
   - End-to-end executable script that dispatches real worker jobs and verifies real
-    deliverables in worktrees.
+    deliverables in worktrees by default.
 - `run_mock_mixed_demo.sh`
-  - End-to-end executable script that dispatches a mixed job list (worktree-backed
-    and non-worktree workers) in a single `create_project_jobs` call.
+  - Compatibility wrapper around `run_mock_demo.sh` that enables `RUN_MOCK_DEMO_MODE=mixed`
+    for one non-worktree + worktree mixed job batch.

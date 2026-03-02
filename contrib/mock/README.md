@@ -5,9 +5,9 @@ This fixture is a lightweight, deterministic scenario for exercising
 
 - Foreman and worker prompts are explicit.
 - Workers are assigned clear categories and target paths.
-- Deliverables are concrete files written in each worker's worktree.
+- Deliverables are concrete files written in each worker's output path.
 
 Use with:
 
-- `contrib/run_mock_demo.sh` (added in this commit)
+- `contrib/run_mock_demo.sh` (all workers with worktrees)
 - `contrib/run_mock_mixed_demo.sh` (mixed worktree and non-worktree worker contracts)

@@ -64,16 +64,19 @@ fn run_stub_server() {
                 send_response(&mut stdout, &id, json!({}));
             }
             "thread/start" => {
-                let thread_id = format!("thread-{}", thread_counter.fetch_add(1, Ordering::SeqCst));
+                let thread_id = parse_string_param(&params, "thread")
+                    .unwrap_or_else(|| format!("thread-{}", thread_counter.fetch_add(1, Ordering::SeqCst)));
                 send_response(
                     &mut stdout,
                     &id,
                     json!({
-                        "thread": {
-                            "id": thread_id,
-                            "status": "running",
-                        },
+                        "thread_id": thread_id,
                     }),
+                );
+                send_notification(
+                    &mut stdout,
+                    "thread/status/changed",
+                    json!({"thread_id": thread_id, "status": "running"}),
                 );
             }
             "turn/start" => {
@@ -90,34 +93,25 @@ fn run_stub_server() {
                     false
                 };
 
-                send_response(
-                    &mut stdout,
-                    &id,
-                    json!({
-                        "turn": {
-                            "id": turn_id,
-                            "items": [],
-                        },
-                    }),
-                );
+                send_response(&mut stdout, &id, json!({"turn_id": turn_id}));
 
                 send_notification(
                     &mut stdout,
                     "thread/status/changed",
-                    json!({"threadId": thread_id, "status": "running"}),
+                    json!({"thread_id": thread_id, "status": "running"}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/started",
-                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "running", "items": []}}),
+                    json!({"thread_id": thread_id, "turn_id": turn_id, "status": "running"}),
                 );
 
                 if !should_stall {
                     send_notification(
                         &mut stdout,
                         "turn/completed",
-                        json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "items": [{"type": "text", "text": "worker complete"}]}}),
+                        json!({"thread_id": thread_id, "turn_id": turn_id, "status": "completed", "items": [{"type": "text", "text": "worker complete"}]}),
                     );
                 }
             }
@@ -125,25 +119,26 @@ fn run_stub_server() {
                 let thread_id = parse_string_param(&params, "thread")
                     .unwrap_or_else(|| "thread-unknown".to_string());
                 let expected_turn_id = parse_string_param(&params, "expected_turn")
+                    .or_else(|| parse_string_param(&params, "expectedTurnId"))
                     .unwrap_or_else(|| "turn-unknown".to_string());
                 let turn_id = format!("turn-{}", turn_counter.fetch_add(1, Ordering::SeqCst));
 
                 send_response(
                     &mut stdout,
                     &id,
-                    json!({"turn": {"id": turn_id}, "expectedTurnId": expected_turn_id}),
+                    json!({"turn_id": turn_id, "expected_turn_id": expected_turn_id}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/started",
-                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "running", "items": []}}),
+                    json!({"thread_id": thread_id, "turn_id": turn_id, "status": "running"}),
                 );
 
                 send_notification(
                     &mut stdout,
                     "turn/completed",
-                    json!({"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "items": [{"type": "text", "text": "steered"}]}}),
+                    json!({"thread_id": thread_id, "turn_id": turn_id, "status": "completed", "items": [{"type": "text", "text": "steered"}]}),
                 );
             }
             "turn/interrupt" => {
@@ -156,7 +151,7 @@ fn run_stub_server() {
                 send_notification(
                     &mut stdout,
                     "turn/aborted",
-                    json!({"threadId": thread_id, "turnId": turn_id}),
+                    json!({"thread_id": thread_id, "turn_id": turn_id}),
                 );
             }
             _ => {
@@ -227,16 +222,21 @@ fn parse_id_value(value: &Value) -> Option<String> {
 }
 
 fn parse_string_param(params: &Value, stem: &str) -> Option<String> {
-    let field = match stem {
-        "thread" => "threadId",
-        "turn" => "turnId",
-        "expected_turn" => "expectedTurnId",
-        _ => stem,
+    let candidates: &[&str] = match stem {
+        "thread" | "thread_id" => &["threadId", "thread_id"],
+        "turn" | "turn_id" => &["turnId", "turn_id"],
+        "expected_turn" => &["expectedTurnId", "expected_turn_id", "expectedTurn", "expected_turn"],
+        "expectedTurnId" => &["expectedTurnId", "expected_turn_id", "expectedTurn", "expected_turn"],
+        _ => &[stem],
     };
 
-    params
-        .get(field)
-        .and_then(parse_id_value)
+    for field in candidates {
+        if let Some(value) = params.get(*field).and_then(parse_id_value) {
+            return Some(value);
+        }
+    }
+
+    None
 }
 
 fn extract_prompt_text_from_input(input: &Value) -> String {
