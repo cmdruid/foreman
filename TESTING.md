@@ -225,6 +225,29 @@ yq eval '.' .github/workflows/release.yml
 yq eval '.' .github/workflows/ci.yml
 ```
 
+### Live mock demo (release gate)
+
+After endpoint-level tests pass, run a real mixed orchestration smoke:
+
+```bash
+CODEX_BIN=/home/cmd/.npm-global/bin/codex \
+FOREMAN_BIN=target/release/codex-foreman \
+JOB_TIMEOUT_MS=300000 \
+JOB_POLL_MS=500 \
+WORKTREE_CLEANUP=true \
+RUN_MOCK_DEMO_MODE=mixed \
+./contrib/run_mock_demo.sh
+```
+
+Success criteria:
+
+- exit code `0`
+- `result: success`
+- exactly four workers complete for mixed mode
+- all deliverable snapshots are created under:
+  - `contrib/mock/.audit/reports/`
+- non-fatal warnings only (e.g. empty `final_text` for `turn/completed`)
+
 ## Test Assets
 
 ### Mocks

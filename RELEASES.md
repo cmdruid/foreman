@@ -141,6 +141,12 @@ git tag -a v0.2.0 -m "Release v0.2.0"
 git push origin v0.2.0
 ```
 
+Before tagging, run the release gate commands in `TESTING.md` and verify:
+
+- all unit/integration/e2e tests pass in CI
+- mixed-mode mock demo ends in `result: success`
+- release metadata test passes (package version, changelog, and releases entries)
+
 ## v0.1.0
 
 - Initial MVP with:
