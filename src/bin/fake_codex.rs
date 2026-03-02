@@ -63,6 +63,17 @@ fn run_stub_server() {
             "initialize" => {
                 send_response(&mut stdout, &id, json!({}));
             }
+            "model/list" => {
+                send_response(
+                    &mut stdout,
+                    &id,
+                    json!({
+                        "data": [
+                            {"model": "gpt-5.3-codex-spark", "provider": "mock"},
+                        ]
+                    }),
+                );
+            }
             "thread/start" => {
                 let thread_id = parse_string_param(&params, "thread")
                     .unwrap_or_else(|| format!("thread-{}", thread_counter.fetch_add(1, Ordering::SeqCst)));
@@ -107,7 +118,49 @@ fn run_stub_server() {
                     json!({"thread_id": thread_id, "turn_id": turn_id, "status": "running"}),
                 );
 
+                send_notification(
+                    &mut stdout,
+                    "item/assistantMessage",
+                    json!({
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "text": "Worker acknowledged instructions",
+                        "type": "agentMessage"
+                    }),
+                );
+
                 if !should_stall {
+                    send_notification(
+                        &mut stdout,
+                        "codex/event/exec_command_begin",
+                        json!({"thread_id": thread_id, "turn_id": turn_id, "command": "mock-cmd"}),
+                    );
+                    send_notification(
+                        &mut stdout,
+                        "item/commandExecution",
+                        json!({
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "status": "start",
+                            "command": "mock-cmd",
+                            "type": "commandExecution",
+                        }),
+                    );
+                    send_notification(
+                        &mut stdout,
+                        "item/assistantMessage/delta",
+                        json!({
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "text": "Mock command executed",
+                            "type": "agentMessage"
+                        }),
+                    );
+                    send_notification(
+                        &mut stdout,
+                        "codex/event/exec_command_end",
+                        json!({"thread_id": thread_id, "turn_id": turn_id, "command": "mock-cmd"}),
+                    );
                     send_notification(
                         &mut stdout,
                         "turn/completed",
@@ -137,6 +190,16 @@ fn run_stub_server() {
 
                 send_notification(
                     &mut stdout,
+                    "item/agentMessage",
+                    json!({
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "text": "Steering request accepted",
+                        "type": "agentMessage"
+                    }),
+                );
+                send_notification(
+                    &mut stdout,
                     "turn/completed",
                     json!({"thread_id": thread_id, "turn_id": turn_id, "status": "completed", "items": [{"type": "text", "text": "steered"}]}),
                 );
@@ -146,6 +209,7 @@ fn run_stub_server() {
                     .unwrap_or_else(|| "thread-unknown".to_string());
                 let turn_id = parse_string_param(&params, "turn")
                     .unwrap_or_else(|| "turn-unknown".to_string());
+                thread_stall_state.remove(&thread_id);
 
                 send_response(&mut stdout, &id, json!({}));
                 send_notification(

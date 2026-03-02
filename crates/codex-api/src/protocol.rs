@@ -80,13 +80,14 @@ fn parse_id_field(value: &serde_json::Value, candidates: &[&str]) -> Option<Stri
 fn parse_thread_id_from_message(value: &serde_json::Value) -> Option<String> {
     parse_id_field(
         value,
-        &["threadId", "thread_id", "conversationId", "conversation_id"],
+        &["threadId", "thread_id"],
     )
     .or_else(|| {
         value
             .get("thread")
             .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
     })
+    .or_else(|| parse_id_field(value, &["conversationId", "conversation_id"]))
     .or_else(|| {
         value.get("conversation").and_then(|conversation| {
             parse_id_field(

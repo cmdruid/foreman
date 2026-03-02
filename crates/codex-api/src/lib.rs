@@ -6,6 +6,8 @@
 //! The supported runtime methods are intentionally narrow:
 //! - `initialize`
 //! - `thread/start`
+//! - `thread/interrupt`
+//! - `model/list`
 //! - `turn/start`
 //! - `turn/steer`
 //! - `turn/interrupt`
@@ -24,8 +26,8 @@ pub mod protocol;
 
 pub use client::{
     AppServerClient, EmptyResponse, RawNotification, TextPayload, ThreadStartRequest,
-    ThreadStartResponse, TurnInterruptRequest, TurnStartRequest, TurnStartResponse,
-    TurnSteerRequest, TurnSteerResponse,
+    ModelListEntry, ModelListRequest, ModelListResponse, ThreadInterruptRequest, ThreadStartResponse,
+    TurnInterruptRequest, TurnStartRequest, TurnStartResponse, TurnSteerRequest, TurnSteerResponse,
 };
 pub use protocol::{
     JSONRPCError, JSONRPCErrorError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest,

@@ -111,6 +111,39 @@ You can tune timing by setting:
 - `JOB_TIMEOUT_MS`
 - `JOB_POLL_MS`
 - `WORKTREE_BASE`
+- `MODEL_ID`
+- `WORKER_MONITORING_ENABLED`
+- `WORKER_MONITORING_INACTIVITY_TIMEOUT_MS`
+- `WORKER_MONITORING_MAX_RESTARTS`
+- `WORKER_MONITORING_WATCH_INTERVAL_MS`
+
+Try both modes:
+
+```bash
+./contrib/run_mock_demo.sh
+./contrib/run_mock_mixed_demo.sh
+```
+
+Quick run recipe (mixed mode):
+
+```bash
+PORT=8899 \
+RUN_MOCK_DEMO_MODE=mixed \
+JOB_TIMEOUT_MS=300000 \
+JOB_POLL_MS=500 \
+WORKTREE_CLEANUP=false \
+./contrib/run_mock_demo.sh
+```
+
+Success criteria:
+
+- All workers should reach `status=completed` in `/jobs/:id/wait` output.
+- Required deliverable files should exist in their expected worker paths.
+- A mixed run will produce both worktree and non-worktree deliverables.
+
+Expected warning behavior:
+
+- Workers may emit `turn/completed` with empty `final_text`; this is not a failure by itself if the deliverable file exists.
 
 ### Real-Backend Smoke Test
 

@@ -80,6 +80,17 @@ Validate config:
 cargo run -- --service-config /etc/codex-foreman/config.toml --validate-config
 ```
 
+### Live mock demo (contrib)
+
+Run a real codex-agent orchestration smoke using the local repository fixture:
+
+```bash
+./contrib/run_mock_demo.sh
+./contrib/run_mock_mixed_demo.sh
+```
+
+See [`docs/manual.md`](docs/manual.md#mock-project-demo-live) for timing knobs and success criteria.
+
 ### Permissions for Codex Agent Project Runs
 
 Running `codex-foreman` to execute projects in a codex-agent context requires:

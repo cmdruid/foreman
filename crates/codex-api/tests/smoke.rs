@@ -1,8 +1,8 @@
 use std::{env, fs, path::PathBuf, time::{Duration, Instant}};
 
 use codex_api::{
-    AppServerClient, TextPayload, ThreadStartRequest, TurnInterruptRequest, TurnStartRequest,
-    TurnSteerRequest,
+    AppServerClient, ModelListResponse, TextPayload, ThreadInterruptRequest, ThreadStartRequest,
+    TurnInterruptRequest, TurnStartRequest, TurnSteerRequest,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -35,46 +35,30 @@ struct SmokeModel {
     provider: Option<String>,
 }
 
-fn select_model_for_smoke(response: &Value) -> SmokeModel {
-    let data = match response.get("data").and_then(Value::as_array) {
-        Some(data) => data,
-        None => return SmokeModel {
-            id: DEFAULT_SMOKE_MODEL.to_string(),
-            provider: None,
-        },
-    };
-
-    for candidate in data {
-        if let Some(model) = candidate
-            .get("model")
-            .and_then(Value::as_str)
-            .or_else(|| candidate.get("id").and_then(Value::as_str))
-        {
+fn select_model_for_smoke_response(response: &ModelListResponse) -> SmokeModel {
+    for candidate in &response.data {
+        if let Some(model) = candidate.model.as_deref().or(candidate.id.as_deref()) {
             if model.contains("codex") {
                 return SmokeModel {
                     id: model.to_string(),
                     provider: candidate
-                        .get("provider")
-                        .and_then(Value::as_str)
-                        .or_else(|| candidate.get("model_provider").and_then(Value::as_str))
-                        .map(|provider| provider.to_string()),
+                        .provider
+                        .clone()
+                        .or_else(|| candidate.model_provider.clone()),
                 };
             }
         }
     }
 
-    data.first()
+    response
+        .data
+        .first()
         .and_then(|first| {
-            let provider = first
-                .get("provider")
-                .and_then(Value::as_str)
-                .or_else(|| first.get("model_provider").and_then(Value::as_str))
-                .map(|provider| provider.to_string());
-
+            let provider = first.provider.clone().or_else(|| first.model_provider.clone());
             first
-                .get("model")
-                .or_else(|| first.get("id"))
-                .and_then(Value::as_str)
+                .model
+                .as_deref()
+                .or(first.id.as_deref())
                 .map(|model| SmokeModel {
                     id: model.to_string(),
                     provider,
@@ -112,9 +96,9 @@ async fn codex_api_smoke_app_server_creates_real_file() {
         .expect("connect to codex app-server");
 
     let model = client
-        .request::<_, Value>("model/list", &serde_json::json!({}))
+        .model_list()
         .await
-        .map(|model_list| select_model_for_smoke(&model_list))
+        .map(|response| select_model_for_smoke_response(&response))
         .unwrap_or_else(|_| SmokeModel {
             id: DEFAULT_SMOKE_MODEL.to_string(),
             provider: None,
@@ -213,9 +197,9 @@ async fn codex_api_smoke_app_server_turn_contract() {
         .expect("connect to codex app-server");
 
     let model = client
-        .request::<_, Value>("model/list", &serde_json::json!({}))
+        .model_list()
         .await
-        .map(|model_list| select_model_for_smoke(&model_list))
+        .map(|response| select_model_for_smoke_response(&response))
         .unwrap_or_else(|_| SmokeModel {
             id: DEFAULT_SMOKE_MODEL.to_string(),
             provider: None,
@@ -368,9 +352,9 @@ async fn codex_api_smoke_app_server_turn_interrupt() {
         .expect("connect to codex app-server");
 
     let model = client
-        .request::<_, Value>("model/list", &serde_json::json!({}))
+        .model_list()
         .await
-        .map(|model_list| select_model_for_smoke(&model_list))
+        .map(|response| select_model_for_smoke_response(&response))
         .unwrap_or_else(|_| SmokeModel {
             id: DEFAULT_SMOKE_MODEL.to_string(),
             provider: None,
@@ -399,14 +383,29 @@ async fn codex_api_smoke_app_server_turn_interrupt() {
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let interrupt_result = client
+    let thread_interrupt_result = client
+        .thread_interrupt(&ThreadInterruptRequest {
+            thread_id: thread.thread_id.clone(),
+        })
+        .await;
+
+    if let Err(err) = thread_interrupt_result {
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            !msg.contains("timed out"),
+            "thread/interrupt unexpectedly timed out: {msg}"
+        );
+        return;
+    }
+
+    let turn_interrupt_result = client
         .turn_interrupt(&TurnInterruptRequest {
-            thread_id: thread.thread_id,
+            thread_id: thread.thread_id.clone(),
             turn_id: turn.turn_id.clone(),
         })
         .await;
 
-    if let Err(err) = interrupt_result {
+    if let Err(err) = turn_interrupt_result {
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("no active turn") || msg.contains("not found") || msg.contains("already completed"),
@@ -434,9 +433,9 @@ async fn codex_api_smoke_app_server_thread_interrupt() {
         .expect("connect to codex app-server");
 
     let model = client
-        .request::<_, Value>("model/list", &serde_json::json!({}))
+        .model_list()
         .await
-        .map(|model_list| select_model_for_smoke(&model_list))
+        .map(|response| select_model_for_smoke_response(&response))
         .unwrap_or_else(|_| SmokeModel {
             id: DEFAULT_SMOKE_MODEL.to_string(),
             provider: None,

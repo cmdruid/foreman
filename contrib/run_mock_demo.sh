@@ -23,6 +23,13 @@ FOREMAN_BIN="${FOREMAN_BIN:-$REPO_ROOT/target/debug/codex-foreman}"
 FOREMAN_PID=""
 WORKERS_FILE=""
 FAILED=false
+MODEL_ID="${MODEL_ID:-gpt-5.3-codex-spark}"
+MODEL_PROVIDER="${MODEL_PROVIDER:-}"
+
+WORKER_MONITORING_ENABLED="${WORKER_MONITORING_ENABLED:-false}"
+WORKER_MONITORING_INACTIVITY_TIMEOUT_MS="${WORKER_MONITORING_INACTIVITY_TIMEOUT_MS:-3000}"
+WORKER_MONITORING_MAX_RESTARTS="${WORKER_MONITORING_MAX_RESTARTS:-1}"
+WORKER_MONITORING_WATCH_INTERVAL_MS="${WORKER_MONITORING_WATCH_INTERVAL_MS:-750}"
 
 for command in jq curl git; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -118,6 +125,79 @@ looks_like_prompt_payload() {
   return 1
 }
 
+wait_for_job_completion() {
+  local bind="$1"
+  local job_id="$2"
+  local timeout_ms="$3"
+  local poll_ms="$4"
+  local start_ms
+  local elapsed_ms
+  local remaining_ms
+  local response
+  local status
+  local timed_out
+  local running_workers
+  local completed_workers
+  local job_snapshot
+  local response_json
+
+  start_ms=$(date +%s%3N)
+
+  while true; do
+    elapsed_ms=$(( $(date +%s%3N) - start_ms ))
+    remaining_ms=$(( timeout_ms - elapsed_ms ))
+    if (( remaining_ms <= 0 )); then
+      echo "job timed out while waiting" >&2
+      return 1
+    fi
+
+    response=$(curl -sS "http://$bind/jobs/$job_id/wait?timeout_ms=$poll_ms&poll_ms=$poll_ms&include_workers=true") || {
+      echo "job wait request failed for $job_id" >&2
+      return 1
+    }
+
+    response_json=$(printf '%s' "$response" | jq -ce '.' 2>/dev/null | sed -n '1p')
+    if [[ -z "$response_json" ]]; then
+      echo "non-json wait response for job $job_id: $response" >&2
+      sleep 0
+      continue
+    else
+      :
+    fi
+
+    status=$(jq -r '.status // "unknown"' <<<"$response_json")
+    case "$status" in
+      completed|partial|failed)
+        echo "$response" > /tmp/cf-job-${job_id}-result.json
+        echo "$response"
+        return 0
+        ;;
+      *)
+        ;;
+    esac
+
+    timed_out=$(jq -r '.timed_out // false' <<<"$response_json")
+    if [[ "$timed_out" == "true" ]]; then
+      # keep polling, but provide a compact status summary each timeout slice
+      running_workers=$(jq -r '.running_workers // 0' <<<"$response_json")
+      completed_workers=$(jq -r '.completed_workers // 0' <<<"$response_json")
+      echo "status=$status complete=$completed_workers running=$running_workers timed_out=true remaining_ms=$remaining_ms" >&2
+    fi
+
+    # Poll progress details without requiring completion.
+    job_snapshot="$(curl -sS "http://$bind/jobs/$job_id" || true)"
+    if [[ -n "$job_snapshot" ]]; then
+      snapshot_json=$(printf '%s' "$job_snapshot" | jq -ce '{status,id: .id,completed_workers,worker_count,running_workers,failed_workers}' 2>/dev/null | sed -n '1p')
+      if [[ -n "$snapshot_json" ]]; then
+        echo "snapshot: $snapshot_json" >&2
+      else
+        echo "snapshot: <non-json response from /jobs/$job_id> $job_snapshot" >&2
+      fi
+    fi
+
+  done
+}
+
 select_worker_label() {
   local worker_json="$1"
   local label_path="$2"
@@ -142,6 +222,12 @@ cat >"$SERVICE_CONFIG_PATH" <<EOF_CFG
 [app_server]
 initialize_timeout_ms = 10000
 request_timeout_ms = 60000
+
+[worker_monitoring]
+enabled = $WORKER_MONITORING_ENABLED
+inactivity_timeout_ms = $WORKER_MONITORING_INACTIVITY_TIMEOUT_MS
+max_restarts = $WORKER_MONITORING_MAX_RESTARTS
+watch_interval_ms = $WORKER_MONITORING_WATCH_INTERVAL_MS
 EOF_CFG
 
 echo "using foreman : $FOREMAN_BIN"
@@ -191,7 +277,15 @@ if ! curl -sS "http://$BIND/health" >/dev/null 2>&1; then
 fi
 echo "foreman ready"
 
-create_project_payload=$(jq -cn --arg p "$PROJECT_PATH" '{path:$p}')
+create_project_payload=$(jq -cn \
+  --arg p "$PROJECT_PATH" \
+  --arg model "$MODEL_ID" \
+  --arg provider "$MODEL_PROVIDER" \
+  '{
+    path: $p,
+    model: $model,
+    model_provider: (if $provider != "" then $provider else null end)
+  }')
 project_response=$(curl -sS -X POST "http://$BIND/projects" \
   -H 'Content-Type: application/json' \
   -d "$create_project_payload")
@@ -206,6 +300,15 @@ WORKERS_FILE="$(mktemp)"
 echo "[]" >"$WORKERS_FILE"
 declare -a WORKER_CATEGORIES=()
 declare -a WORKTREE_PATHS=()
+declare -a WORKER_ARTIFACT_PATHS=()
+declare -a WORKER_WORKTREES=()
+declare -a WORKER_REQUIRES_WORKTREE=()
+declare -a WORKER_REQUIRES_COMMAND=()
+declare -A WORKER_CATEGORY_BY_ID=()
+declare -A WORKER_ARTIFACT_BY_ID=()
+declare -A WORKER_WORKTREE_BY_ID=()
+declare -A WORKER_REQUIRES_WORKTREE_BY_ID=()
+declare -A WORKER_REQUIRES_COMMAND_BY_ID=()
 
 if [[ "$RUN_MOCK_DEMO_MODE" == "mixed" || "$RUN_MOCK_DEMO_MODE" == "mixed-no-worktree" ]]; then
   WORKER_CATEGORIES_TO_RUN=(security robustness code-quality notes)
@@ -217,6 +320,7 @@ for category in "${WORKER_CATEGORIES_TO_RUN[@]}"; do
   safe_category="$(safe_slug "$category")"
   requires_worktree="false"
   requires_command="true"
+  create_worktree="true"
 
   if [[ "$category" == "notes" ]]; then
     task_file="$PROJECT_PATH/README.md"
@@ -235,9 +339,9 @@ for category in "${WORKER_CATEGORIES_TO_RUN[@]}"; do
       if ! prepare_worktree "$worker_worktree_path"; then
         echo "warning: failed to prepare worktree for category $category at $worker_worktree_path" >&2
         FAILED=true
-        WORKER_CATEGORIES+=("$category")
         continue
       fi
+      create_worktree="false"
     fi
     task_file="$PROJECT_PATH/tasks/$category.md"
   fi
@@ -249,7 +353,6 @@ Worktree instruction:
 - Use this exact worktree path for all filesystem operations: $worker_worktree_path
 - Execute all filesystem commands from this current working directory: $worker_worktree_path
 - Read the assignment source: $task_file
-- IMPORTANT: execute the shell command block exactly as written and return only after it succeeds.
 - Execute this shell command block to guarantee the deliverable exists:
   cd "$worker_worktree_path"
   mkdir -p ".audit-generated"
@@ -257,11 +360,12 @@ Worktree instruction:
 # Mock Deliverable: $category
 
 - Source: $task_file
-  - Summary: replace with concrete issue and fix details.
-  - Impacted files:
-    - TODO: add modified files
-  - Verification:
-    - TODO: add a concrete command that proves completion
+- Summary: concrete actions taken for this work tree.
+- Impacted files:
+  - .audit-generated/${safe_category}-worker-deliverable.md
+  - (and any other files modified for the task)
+- Verification:
+  - `git status --short`
 EOF_DELIVERABLE
 - Run this verification command before returning:
   if ! test -f "$deliverable_path"; then
@@ -270,8 +374,8 @@ EOF_DELIVERABLE
   fi
   ls -l "$deliverable_path"
   echo "WORKER_DELIVERY_OK:$deliverable_path"
-- Include actionable fix tasks and explicit verification command.
-- Return a concise completion summary.
+- Keep modifications scoped to that worktree.
+- Include a concise completion summary in your final response.
 EOF
 )"
   else
@@ -305,10 +409,13 @@ EOF
       --arg cwd "$worker_cwd" \
       --arg sandbox "$WORKER_SANDBOX" \
       --arg base_ref "$BASE_BRANCH" \
+      --arg model "$MODEL_ID" \
+      --arg provider "$MODEL_PROVIDER" \
       --arg artifact_path "$deliverable_path" \
       --arg requires_worktree "$requires_worktree" \
       --arg requires_command "$requires_command" \
-      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, worktree:{path:$worktree_path, create:true, base_ref:$base_ref}, labels:{"category":$category,"safe_category":$safe_category,"worktree_path":$worktree_path,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
+      --arg create_worktree "$create_worktree" \
+      '{prompt:$p, model:$model, model_provider:(if $provider != "" then $provider else null end), cwd:$cwd, sandbox:$sandbox, worktree:{path:$worktree_path, create:($create_worktree == "true"), base_ref:$base_ref}, labels:{"category":$category,"safe_category":$safe_category,"worktree_path":$worktree_path,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["*"]}}')
   else
     worker=$(jq -cn \
       --arg p "$prompt" \
@@ -316,16 +423,22 @@ EOF
       --arg safe_category "$safe_category" \
       --arg cwd "$worker_cwd" \
       --arg sandbox "$WORKER_SANDBOX" \
+      --arg model "$MODEL_ID" \
+      --arg provider "$MODEL_PROVIDER" \
       --arg artifact_path "$deliverable_path" \
       --arg requires_worktree "$requires_worktree" \
       --arg requires_command "$requires_command" \
-      '{prompt:$p, cwd:$cwd, sandbox:$sandbox, labels:{"category":$category,"safe_category":$safe_category,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["turn/completed","item/assistantMessage","item/assistantMessage/delta","item/agentMessage","item/agentMessage/delta","codex/event/exec_command_begin","codex/event/exec_command_end"]}}')
+      '{prompt:$p, model:$model, model_provider:(if $provider != "" then $provider else null end), cwd:$cwd, sandbox:$sandbox, labels:{"category":$category,"safe_category":$safe_category,"artifact_path":$artifact_path,"requires_worktree":$requires_worktree,"requires_command":$requires_command}, callback_overrides:{callback_events:["*"]}}')
   fi
 
   workers_file_tmp="$(mktemp)"
   jq -c --argjson w "$worker" '. += [$w]' "$WORKERS_FILE" > "$workers_file_tmp"
   mv "$workers_file_tmp" "$WORKERS_FILE"
   WORKER_CATEGORIES+=("$category")
+  WORKER_ARTIFACT_PATHS+=("$deliverable_path")
+  WORKER_WORKTREES+=("${worker_worktree_path:-$PROJECT_PATH}")
+  WORKER_REQUIRES_WORKTREE+=("$requires_worktree")
+  WORKER_REQUIRES_COMMAND+=("$requires_command")
 done
 
 jobs_payload=$(jq -cn --argjson workers "$(cat "$WORKERS_FILE")" '{workers:$workers}')
@@ -338,10 +451,25 @@ if [[ -z "$job_id" || "$job_id" == "null" ]]; then
   exit 1
 fi
 job_count=$(jq '.workers | length' <<<"$jobs_payload")
+mapfile -t JOB_WORKER_IDS < <(jq -r '.worker_ids // [] | .[]' <<<"$job_response")
+if (( ${#JOB_WORKER_IDS[@]} != ${#WORKER_CATEGORIES[@]} )); then
+  echo "warning: expected ${#WORKER_CATEGORIES[@]} worker ids from API, got ${#JOB_WORKER_IDS[@]}"
+fi
+for idx in "${!JOB_WORKER_IDS[@]}"; do
+  worker_id="${JOB_WORKER_IDS[$idx]}"
+  WORKER_CATEGORY_BY_ID["$worker_id"]="${WORKER_CATEGORIES[$idx]:-worker-$((idx+1))}"
+  WORKER_ARTIFACT_BY_ID["$worker_id"]="${WORKER_ARTIFACT_PATHS[$idx]:-}"
+  WORKER_WORKTREE_BY_ID["$worker_id"]="${WORKER_WORKTREES[$idx]:-}"
+  WORKER_REQUIRES_WORKTREE_BY_ID["$worker_id"]="${WORKER_REQUIRES_WORKTREE[$idx]:-false}"
+  WORKER_REQUIRES_COMMAND_BY_ID["$worker_id"]="${WORKER_REQUIRES_COMMAND[$idx]:-false}"
+done
 echo "job started: $job_id (workers: $job_count)"
 
 echo "waiting for jobs..."
-job_wait_response=$(curl -sS "http://$BIND/jobs/$job_id/wait?timeout_ms=$JOB_TIMEOUT_MS&poll_ms=$JOB_POLL_MS&include_workers=true")
+if ! job_wait_response="$(wait_for_job_completion "$BIND" "$job_id" "$JOB_TIMEOUT_MS" "$JOB_POLL_MS")"; then
+  FAILED=true
+  job_wait_response="$(curl -sS "http://$BIND/jobs/$job_id" || jq -cn '{status:"unknown",timed_out:true,workers:[]}')"
+fi
 echo "$job_wait_response" | jq '.'
 job_status=$(jq -r '.status // "unknown"' <<<"$job_wait_response")
 job_timed_out=$(jq -r '.timed_out // false' <<<"$job_wait_response")
@@ -358,25 +486,60 @@ else
   for i in "${!job_workers[@]}"; do
     worker="${job_workers[$i]}"
     worker_id="$(jq -r '.agent_id // empty' <<<"$worker")"
-    category="$(select_worker_label "$worker" "category")"
-    worktree_path="$(select_worker_label "$worker" "worktree_path")"
-    deliverable_path="$(select_worker_label "$worker" "artifact_path")"
-    requires_worktree="$(select_worker_label "$worker" "requires_worktree")"
-    requires_command="$(select_worker_label "$worker" "requires_command")"
+    if [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
+      category="${WORKER_CATEGORY_BY_ID[$worker_id]:-}"
+      worktree_path="${WORKER_WORKTREE_BY_ID[$worker_id]:-}"
+      deliverable_path="${WORKER_ARTIFACT_BY_ID[$worker_id]:-}"
+      requires_worktree="${WORKER_REQUIRES_WORKTREE_BY_ID[$worker_id]:-}"
+      requires_command="${WORKER_REQUIRES_COMMAND_BY_ID[$worker_id]:-}"
+    else
+      category=""
+      worktree_path=""
+      deliverable_path=""
+      requires_worktree=""
+      requires_command=""
+    fi
 
+    if [[ -z "$category" || "$category" == "null" ]]; then
+      category="$(select_worker_label "$worker" "category")"
+    fi
     if [[ "$category" == "null" || "$category" == "" ]]; then
       category="${WORKER_CATEGORIES[$i]:-worker-$((i+1))}"
     fi
-    if [[ "$requires_worktree" == "null" || "$requires_worktree" == "" ]]; then
-      requires_worktree="false"
-    fi
-    if [[ "$requires_command" == "null" || "$requires_command" == "" ]]; then
-      requires_command="false"
+    safe_category="$(safe_slug "$category")"
+
+    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+      worktree_path="$(select_worker_label "$worker" "worktree_path")"
+      if [[ "$worktree_path" == "null" || "$worktree_path" == "" ]]; then
+        worktree_path="${WORKER_WORKTREES[$i]:-}"
+      fi
     fi
 
-    safe_category="$(safe_slug "$category")"
+    if [[ -z "$deliverable_path" || "$deliverable_path" == "null" ]]; then
+      deliverable_path="$(select_worker_label "$worker" "artifact_path")"
+      if [[ -z "$deliverable_path" || "$deliverable_path" == "null" ]]; then
+        deliverable_path="${WORKER_ARTIFACT_PATHS[$i]:-}"
+      fi
+    fi
+
+    if [[ -z "$requires_worktree" || "$requires_worktree" == "null" ]]; then
+      requires_worktree="$(select_worker_label "$worker" "requires_worktree")"
+      if [[ "$requires_worktree" == "null" || "$requires_worktree" == "" ]]; then
+        requires_worktree="${WORKER_REQUIRES_WORKTREE[$i]:-false}"
+      fi
+    fi
+
+    if [[ -z "$requires_command" || "$requires_command" == "null" ]]; then
+      requires_command="$(select_worker_label "$worker" "requires_command")"
+      if [[ "$requires_command" == "null" || "$requires_command" == "" ]]; then
+        requires_command="${WORKER_REQUIRES_COMMAND[$i]:-false}"
+      fi
+    fi
+
     report_body="$(jq -r '.final_text // .summary // ""' <<<"$worker")"
     if looks_like_prompt_payload "$report_body" && [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
+      report_body="$(jq -r '.final_text // .summary // ""' <<<"$(fetch_worker_result "$worker_id")")"
+    elif [[ -n "$worker_id" && "$worker_id" != "null" && ( -z "$report_body" || "$report_body" == "null" ) ]]; then
       report_body="$(jq -r '.final_text // .summary // ""' <<<"$(fetch_worker_result "$worker_id")")"
     fi
 
@@ -403,7 +566,9 @@ else
     fi
     if [[ -z "$report_body" || "$report_body" == "null" ]]; then
       echo "warning: worker $worker_id returned empty completion text"
-      FAILED=true
+      if [[ "$STRICT_EXECUTION_CHECKS" == "true" ]]; then
+        FAILED=true
+      fi
     fi
     if [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
       agent_events="$(fetch_worker_events "$worker_id" 200)"

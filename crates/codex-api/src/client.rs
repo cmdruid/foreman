@@ -150,6 +150,34 @@ pub struct TurnInterruptRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadInterruptRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListEntry {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListResponse {
+    pub data: Vec<ModelListEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmptyResponse {}
 
 type PendingResponses = HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>;
@@ -387,6 +415,17 @@ impl AppServerClient {
 
     pub async fn turn_interrupt(&self, request: &TurnInterruptRequest) -> Result<EmptyResponse> {
         self.request("turn/interrupt", request).await
+    }
+
+    pub async fn thread_interrupt(
+        &self,
+        request: &ThreadInterruptRequest,
+    ) -> Result<serde_json::Value> {
+        self.request("thread/interrupt", request).await
+    }
+
+    pub async fn model_list(&self) -> Result<ModelListResponse> {
+        self.request("model/list", &ModelListRequest {}).await
     }
 
     async fn fail_all_pending(&self, reason: String) {
@@ -771,6 +810,9 @@ while read -r line; do
   fi
 
   case "$method" in
+    model/list)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"data\":[{\"model\":\"gpt-5.3-codex-spark\",\"provider\":\"mock\"}]}}"
+      ;;
     thread/start)
       printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"thread\":{\"id\":\"thread-1\"}}}"
       ;;
@@ -779,6 +821,9 @@ while read -r line; do
       ;;
     turn/steer)
       printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turn\":{\"id\":\"turn-2\"},\"expectedTurnId\":\"turn-1\"}}"
+      ;;
+    thread/interrupt)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
       ;;
     turn/interrupt)
       printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
@@ -799,59 +844,61 @@ done
             .await
             .expect("connect fake app-server");
 
-        let thread_result = client
-            .request::<_, serde_json::Value>(
-                "thread/start",
-                &serde_json::json!({
-                    "cwd": null,
-                    "model": null,
-                    "model_provider": null,
-                    "sandbox": null
-                }),
-            )
+        let thread = client
+            .thread_start(&super::ThreadStartRequest {
+                model: None,
+                model_provider: None,
+                cwd: None,
+                sandbox: None,
+            })
             .await
             .expect("thread start");
-        assert_eq!(thread_result, serde_json::json!({"thread":{"id":"thread-1"}}));
+        assert_eq!(thread.thread_id, "thread-1");
 
         let turn_result = client
-            .request::<_, serde_json::Value>(
-                "turn/start",
-                &serde_json::json!({
-                    "threadId": "thread-1",
-                    "input": []
-                }),
-            )
+            .turn_start(&super::TurnStartRequest {
+                thread_id: thread.thread_id.clone(),
+                input: Vec::new(),
+            })
             .await
             .expect("turn start");
-        assert_eq!(turn_result, serde_json::json!({"turn": {"id": "turn-1"}}));
+        assert_eq!(turn_result.turn_id, "turn-1");
 
         let steer_result = client
-            .request::<_, serde_json::Value>(
-                "turn/steer",
-                &serde_json::json!({
-                    "threadId": "thread-1",
-                    "expectedTurnId": "turn-1",
-                    "input": []
-                }),
-            )
+            .turn_steer(&super::TurnSteerRequest {
+                thread_id: thread.thread_id.clone(),
+                expected_turn_id: "turn-1".to_string(),
+                input: Vec::new(),
+            })
             .await
             .expect("turn steer");
-        assert_eq!(
-            steer_result,
-            serde_json::json!({"turn":{"id":"turn-2"},"expectedTurnId":"turn-1"})
-        );
+        assert_eq!(steer_result.turn_id, "turn-2");
+        assert_eq!(steer_result.expected_turn_id.as_deref(), Some("turn-1"));
 
-        let interrupt_result = client
-            .request::<_, serde_json::Value>(
-                "turn/interrupt",
-                &serde_json::json!({
-                    "threadId": "thread-1",
-                    "turnId": "turn-1"
-                }),
-            )
+        let _interrupt_result = client
+            .turn_interrupt(&super::TurnInterruptRequest {
+                thread_id: thread.thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+            })
             .await
             .expect("turn interrupt");
-        assert_eq!(interrupt_result, serde_json::json!({}));
+
+        let model_list = client
+            .model_list()
+            .await
+            .expect("model list");
+        assert!(!model_list.data.is_empty(), "model/list should include at least one item");
+
+        let thread_interrupt_result = client
+            .thread_interrupt(&super::ThreadInterruptRequest {
+                thread_id: thread.thread_id,
+            })
+            .await
+            .expect("thread interrupt");
+        assert!(
+            thread_interrupt_result.is_object() || thread_interrupt_result.is_null(),
+            "thread/interrupt should return object payload or null: {thread_interrupt_result}"
+        );
 
         let request_lines = std::fs::read_to_string(&request_log).expect("read request log");
         assert!(request_lines.contains("\"method\":\"initialize\""));
@@ -859,6 +906,8 @@ done
         assert!(request_lines.contains("\"method\":\"turn/start\""));
         assert!(request_lines.contains("\"method\":\"turn/steer\""));
         assert!(request_lines.contains("\"method\":\"turn/interrupt\""));
+        assert!(request_lines.contains("\"method\":\"thread/interrupt\""));
+        assert!(request_lines.contains("\"method\":\"model/list\""));
         assert!(request_lines.contains("\"method\":\"initialized\""));
     }
 }

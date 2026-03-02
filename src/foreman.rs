@@ -1781,6 +1781,30 @@ impl Foreman {
         base_ref: Option<&str>,
     ) -> Result<()> {
         let _lock = self.worktree_lock.lock().await;
+
+        if Path::new(worktree_path).exists() {
+            if Path::new(worktree_path).is_dir() {
+                let verify = Command::new("git")
+                    .arg("-C")
+                    .arg(worktree_path)
+                    .arg("rev-parse")
+                    .arg("--is-inside-work-tree")
+                    .output()
+                    .await
+                    .with_context(|| {
+                        format!("failed to check existing worktree at {worktree_path}")
+                    })?;
+
+                if verify.status.success()
+                    && String::from_utf8_lossy(&verify.stdout).trim() == "true"
+                {
+                    return Ok(());
+                }
+            }
+
+            return Err(anyhow!("worktree path already exists but is not a git worktree: {worktree_path}"));
+        }
+
         let base_ref = base_ref.unwrap_or("HEAD");
         let output = Command::new("git")
             .arg("-C")
