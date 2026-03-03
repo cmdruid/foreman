@@ -87,6 +87,12 @@ foreman --init-project /tmp/example-project
 foreman --init-project /tmp/example-project --with-manual
 # optional: overwrite existing scaffold files
 foreman --init-project /tmp/example-project --init-project-overwrite
+# validate a project config and runtime prompts
+foreman --project /tmp/example-project/project.toml --project-lint
+# run environment diagnostics
+foreman --project /tmp/example-project/project.toml --doctor
+# print merged effective config
+foreman --project /tmp/example-project/project.toml --config-show-resolved
 ```
 
 Template directory defaults to `templates/`. Override when your plant has custom manifests:
@@ -114,6 +120,9 @@ Use these endpoints as your control panels:
 Keep instructions explicit in each worker item. That is how you keep outputs deterministic across runs.
 
 For full endpoint schemas and examples, see [`docs/manual.md`](docs/manual.md).
+
+`--project` is a CLI runtime file path (`/path/to/project.toml`).
+`POST /projects` still expects a project directory path (`/path/to/project-dir`).
 
 ## Live proof run (the acceptance test)
 

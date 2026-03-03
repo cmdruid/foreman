@@ -179,6 +179,9 @@ pub async fn start_foreman(
     let foreman_binary = binary_path("foreman");
     let mut project_path = state_path.to_path_buf();
     project_path.set_file_name("project.toml");
+    if !project_path.exists() {
+        fs::write(&project_path, "name = \"test-harness\"\n").expect("write harness project.toml");
+    }
 
     let child = Command::new(foreman_binary)
         .arg("--socket-path")
@@ -217,6 +220,9 @@ pub async fn start_foreman_with_auth(
     let mut command = Command::new(foreman_binary);
     let mut project_path = state_path.to_path_buf();
     project_path.set_file_name("project.toml");
+    if !project_path.exists() {
+        fs::write(&project_path, "name = \"test-harness\"\n").expect("write harness project.toml");
+    }
 
     command
         .arg("--socket-path")

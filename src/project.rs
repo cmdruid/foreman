@@ -108,6 +108,19 @@ pub struct ProjectRuntimeFiles {
     pub handoff: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectLintIssue {
+    pub code: &'static str,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ProjectLintReport {
+    pub issues: Vec<ProjectLintIssue>,
+    pub fixed: bool,
+}
+
 impl ProjectConfig {
     pub fn load(project_path: &Path) -> Result<Self> {
         let config_path = project_path.join(constants::PROJECT_CONFIG_FILE);
@@ -117,21 +130,35 @@ impl ProjectConfig {
 
         let raw = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read project config {}", config_path.display()))?;
-        let manifest: toml::Value =
-            toml::from_str(&raw).context("invalid project config format")?;
+        let manifest: toml::Value = toml::from_str(&raw).with_context(|| {
+            format!("{} invalid project config format", constants::ERROR_CODE_CFG_PROJECT_PARSE)
+        })?;
         if manifest.get("hooks").is_some() {
             anyhow::bail!(
-                "project config uses unsupported [hooks]; replace with [callbacks.lifecycle]"
+                "{} project config uses unsupported [hooks]; replace with [callbacks.lifecycle]",
+                constants::ERROR_CODE_CFG_PROJECT_PARSE
             );
         }
-        let config: Self = toml::from_str(&raw).context("invalid project config format")?;
+        let mut lint_report = ProjectLintReport::default();
+        validate_unknown_keys(&manifest, &mut lint_report);
+        if let Some(issue) = lint_report.issues.first() {
+            anyhow::bail!("{} {}: {}", issue.code, issue.path, issue.message);
+        }
+        let config: Self = toml::from_str(&raw).with_context(|| {
+            format!("{} invalid project config format", constants::ERROR_CODE_CFG_PROJECT_PARSE)
+        })?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         self.prompts
             .validate()
-            .context("invalid project prompt configuration")?;
+            .with_context(|| {
+                format!(
+                    "{} invalid project prompt configuration",
+                    constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+                )
+            })?;
         Ok(())
     }
 
@@ -162,18 +189,214 @@ impl ProjectConfig {
     }
 }
 
+pub fn lint_project_toml(
+    project_toml_path: &Path,
+    service_callback_profiles: &HashMap<String, CallbackProfile>,
+    fix: bool,
+) -> Result<ProjectLintReport> {
+    let mut report = ProjectLintReport::default();
+    let raw = fs::read_to_string(project_toml_path).with_context(|| {
+        format!(
+            "{} failed to read project config {}",
+            constants::ERROR_CODE_CFG_PROJECT_PATH_INVALID,
+            project_toml_path.display()
+        )
+    })?;
+
+    let manifest: toml::Value = toml::from_str(&raw).with_context(|| {
+        format!(
+            "{} invalid project config format",
+            constants::ERROR_CODE_CFG_PROJECT_PARSE
+        )
+    })?;
+
+    if manifest.get("hooks").is_some() {
+        report.issues.push(ProjectLintIssue {
+            code: constants::ERROR_CODE_CFG_PROJECT_PARSE,
+            path: "hooks".to_string(),
+            message: "unsupported [hooks]; use [callbacks.lifecycle]".to_string(),
+        });
+    }
+
+    validate_unknown_keys(&manifest, &mut report);
+
+    let project_config: ProjectConfig = toml::from_str(&raw).with_context(|| {
+        format!(
+            "{} invalid project config format",
+            constants::ERROR_CODE_CFG_PROJECT_PARSE
+        )
+    })?;
+    project_config.validate()?;
+
+    validate_callback_profile_references(&project_config, service_callback_profiles, &mut report);
+
+    if fix {
+        report.fixed = false;
+    }
+
+    Ok(report)
+}
+
 impl ProjectPrompts {
     fn validate(&self) -> Result<()> {
         if self.foreman_file.trim().is_empty() {
-            return Err(anyhow::anyhow!("foreman_file cannot be empty"));
+            return Err(anyhow::anyhow!(
+                "{} prompts.foreman_file cannot be empty",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            ));
         }
         if self.worker_file.trim().is_empty() {
-            return Err(anyhow::anyhow!("worker_file cannot be empty"));
+            return Err(anyhow::anyhow!(
+                "{} prompts.worker_file cannot be empty",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            ));
         }
         if self.runbook_file.trim().is_empty() {
-            return Err(anyhow::anyhow!("runbook_file cannot be empty"));
+            return Err(anyhow::anyhow!(
+                "{} prompts.runbook_file cannot be empty",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            ));
         }
         Ok(())
+    }
+}
+
+fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport) {
+    let Some(root) = manifest.as_table() else {
+        report.issues.push(ProjectLintIssue {
+            code: constants::ERROR_CODE_CFG_PROJECT_PARSE,
+            path: "root".to_string(),
+            message: "project config root must be a TOML table".to_string(),
+        });
+        return;
+    };
+
+    let root_allowed = ["name", "prompts", "callbacks", "policy"];
+    push_unknown_table_keys(root, "", &root_allowed, report);
+
+    if let Some(prompts) = root.get("prompts").and_then(toml::Value::as_table) {
+        let prompts_allowed = ["foreman_file", "worker_file", "runbook_file", "handoff_file"];
+        push_unknown_table_keys(prompts, "prompts", &prompts_allowed, report);
+    }
+
+    if let Some(callbacks) = root.get("callbacks").and_then(toml::Value::as_table) {
+        let callbacks_allowed = ["profiles", "worker", "foreman", "bubble_up", "lifecycle"];
+        push_unknown_table_keys(callbacks, "callbacks", &callbacks_allowed, report);
+
+        for spec_name in ["worker", "foreman", "bubble_up"] {
+            if let Some(spec) = callbacks.get(spec_name).and_then(toml::Value::as_table) {
+                push_unknown_table_keys(
+                    spec,
+                    &format!("callbacks.{spec_name}"),
+                    &[
+                        "callback_profile",
+                        "callback_prompt_prefix",
+                        "callback_args",
+                        "callback_events",
+                        "callback_vars",
+                    ],
+                    report,
+                );
+            }
+        }
+
+        if let Some(lifecycle) = callbacks.get("lifecycle").and_then(toml::Value::as_table) {
+            let lifecycle_allowed = [
+                "start",
+                "compact",
+                "stop",
+                "worker_completed",
+                "worker_aborted",
+            ];
+            push_unknown_table_keys(
+                lifecycle,
+                "callbacks.lifecycle",
+                &lifecycle_allowed,
+                report,
+            );
+            for lifecycle_key in lifecycle_allowed {
+                if let Some(spec) = lifecycle.get(lifecycle_key).and_then(toml::Value::as_table) {
+                    push_unknown_table_keys(
+                        spec,
+                        &format!("callbacks.lifecycle.{lifecycle_key}"),
+                        &[
+                            "callback_profile",
+                            "callback_prompt_prefix",
+                            "callback_args",
+                            "callback_events",
+                            "callback_vars",
+                        ],
+                        report,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(policy) = root.get("policy").and_then(toml::Value::as_table) {
+        let policy_allowed = ["bubble_up_events", "compact_after_turns"];
+        push_unknown_table_keys(policy, "policy", &policy_allowed, report);
+    }
+}
+
+fn push_unknown_table_keys(
+    table: &toml::map::Map<String, toml::Value>,
+    prefix: &str,
+    allowed: &[&str],
+    report: &mut ProjectLintReport,
+) {
+    for key in table.keys() {
+        if allowed.iter().any(|allowed_key| allowed_key == key) {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        report.issues.push(ProjectLintIssue {
+            code: constants::ERROR_CODE_CFG_PROJECT_UNKNOWN_KEY,
+            path,
+            message: "unknown key".to_string(),
+        });
+    }
+}
+
+fn validate_callback_profile_references(
+    config: &ProjectConfig,
+    service_callback_profiles: &HashMap<String, CallbackProfile>,
+    report: &mut ProjectLintReport,
+) {
+    let mut specs: Vec<(&str, &CallbackSpec)> = vec![
+        ("callbacks.worker", &config.callbacks.worker),
+        ("callbacks.foreman", &config.callbacks.foreman),
+        ("callbacks.bubble_up", &config.callbacks.bubble_up),
+        ("callbacks.lifecycle.start", &config.callbacks.lifecycle.start),
+        ("callbacks.lifecycle.compact", &config.callbacks.lifecycle.compact),
+        ("callbacks.lifecycle.stop", &config.callbacks.lifecycle.stop),
+        (
+            "callbacks.lifecycle.worker_completed",
+            &config.callbacks.lifecycle.worker_completed,
+        ),
+        (
+            "callbacks.lifecycle.worker_aborted",
+            &config.callbacks.lifecycle.worker_aborted,
+        ),
+    ];
+
+    specs.retain(|(_, spec)| spec.callback_profile.is_some());
+
+    for (spec_path, spec) in specs {
+        if let Some(profile_name) = spec.callback_profile.as_deref()
+            && !config.callbacks.profiles.contains_key(profile_name)
+            && !service_callback_profiles.contains_key(profile_name)
+        {
+            report.issues.push(ProjectLintIssue {
+                code: constants::ERROR_CODE_CFG_CALLBACK_PROFILE_MISSING,
+                path: format!("{spec_path}.callback_profile"),
+                message: format!("unknown callback profile '{profile_name}'"),
+            });
+        }
     }
 }
 

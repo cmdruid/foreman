@@ -20,6 +20,24 @@ Expected:
 - prints loaded callback profiles
 - prints warnings if any
 
+1a. Validate project config and prompt contract:
+
+```bash
+foreman --project /tmp/example-project/project.toml --project-lint
+```
+
+1b. Run diagnostics:
+
+```bash
+foreman --project /tmp/example-project/project.toml --doctor
+```
+
+1c. Show resolved config:
+
+```bash
+foreman --project /tmp/example-project/project.toml --config-show-resolved
+```
+
 2. Initialize a sample project scaffold:
 
 ```bash
@@ -47,6 +65,7 @@ Defaults:
 
 - `--codex-binary` defaults to `codex`
 - `--service-config` defaults to `~/.foreman/config.toml`
+- `--project` must point to a `project.toml` file
 
 ```bash
 export FOREMAN_SOCKET_PATH="/tmp/cf-foreman.sock"

@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -40,6 +40,7 @@ use models::{
     CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, SendAgentInput,
     SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest, SteerAgentInput,
 };
+use project::{ProjectConfig, ProjectLintIssue, lint_project_toml};
 use state::PersistedState;
 
 #[derive(Parser, Debug)]
@@ -65,6 +66,14 @@ struct Args {
     service_config: String,
     #[arg(long)]
     validate_config: bool,
+    #[arg(long)]
+    project_lint: bool,
+    #[arg(long)]
+    fix: bool,
+    #[arg(long)]
+    doctor: bool,
+    #[arg(long)]
+    config_show_resolved: bool,
     #[arg(long)]
     state_path: Option<PathBuf>,
 }
@@ -124,7 +133,6 @@ async fn main() -> anyhow::Result<()> {
 
     let service_config = ServiceConfig::load(StdPath::new(&args.service_config))
         .with_context(|| format!("failed to load service config '{}'", args.service_config))?;
-    verify_codex_binary_version(&args.codex_binary, service_config.expected_codex_version())?;
 
     let warnings = service_config.validate()?;
     if args.validate_config {
@@ -167,15 +175,38 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let project_path = if args.init_project.is_none() && !args.validate_config {
-        args.project
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "--project <path-to-project.toml> is required unless --init-project or --validate-config is used"
-                )
-            })?
+    if args.project_lint {
+        let project_toml_path = resolve_required_project_toml_path(args.project.as_ref())?;
+        run_project_lint_command(
+            &project_toml_path,
+            &service_config,
+            args.fix,
+            project_toml_path.parent().unwrap_or_else(|| StdPath::new(".")),
+        )?;
+        return Ok(());
+    }
+
+    if args.doctor {
+        let project_toml_path = resolve_required_project_toml_path(args.project.as_ref())?;
+        run_doctor_command(&args, &service_config, &project_toml_path)?;
+        return Ok(());
+    }
+
+    if args.config_show_resolved {
+        let project_toml_path = resolve_required_project_toml_path(args.project.as_ref())?;
+        run_config_show_resolved(&args, &service_config, &project_toml_path)?;
+        return Ok(());
+    }
+
+    verify_codex_binary_version(&args.codex_binary, service_config.expected_codex_version())?;
+
+    let project_path = if args.init_project.is_none()
+        && !args.validate_config
+        && !args.project_lint
+        && !args.doctor
+        && !args.config_show_resolved
+    {
+        resolve_required_project_toml_path(args.project.as_ref())?
     } else {
         PathBuf::new()
     };
@@ -407,6 +438,383 @@ fn verify_codex_binary_version(
             stdout.trim()
         )),
     }
+}
+
+fn coded_error(code: &'static str, message: impl AsRef<str>) -> anyhow::Error {
+    anyhow!("[{code}] {}", message.as_ref())
+}
+
+fn resolve_required_project_toml_path(project_arg: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
+    let path = project_arg.ok_or_else(|| {
+        coded_error(
+            consts::ERROR_CODE_CFG_PROJECT_ARG_REQUIRED,
+            "--project <path-to-project.toml> is required",
+        )
+    })?;
+
+    if !path.exists() || !path.is_file() {
+        return Err(coded_error(
+            consts::ERROR_CODE_CFG_PROJECT_PATH_INVALID,
+            format!("project path '{}' must point to a file", path.display()),
+        ));
+    }
+
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if file_name != consts::PROJECT_CONFIG_FILE {
+        return Err(coded_error(
+            consts::ERROR_CODE_CFG_PROJECT_PATH_INVALID,
+            format!(
+                "project path '{}' must target '{}'",
+                path.display(),
+                consts::PROJECT_CONFIG_FILE
+            ),
+        ));
+    }
+
+    Ok(path.clone())
+}
+
+fn run_project_lint_command(
+    project_toml_path: &StdPath,
+    service_config: &ServiceConfig,
+    fix: bool,
+    project_root: &StdPath,
+) -> anyhow::Result<()> {
+    let mut report = lint_project_toml(project_toml_path, &service_config.callbacks.profiles, fix)?;
+    let config = ProjectConfig::load(project_root)?;
+    if let Err(err) = config.load_runtime_files(project_root) {
+        report.issues.push(ProjectLintIssue {
+            code: consts::ERROR_CODE_CFG_RUNTIME_IO,
+            path: "prompts".to_string(),
+            message: err.to_string(),
+        });
+    }
+
+    if report.issues.is_empty() {
+        println!(
+            "project lint passed: {}",
+            project_toml_path.to_string_lossy()
+        );
+        if fix {
+            println!("autofix: no safe rewrites required");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "project lint found {} issue(s): {}",
+        report.issues.len(),
+        project_toml_path.to_string_lossy()
+    );
+    for issue in &report.issues {
+        println!("[{}] {}: {}", issue.code, issue.path, issue.message);
+    }
+
+    Err(coded_error(
+        consts::ERROR_CODE_CFG_PROJECT_VALIDATION,
+        format!("project lint failed with {} issue(s)", report.issues.len()),
+    ))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    id: &'static str,
+    status: &'static str,
+    code: Option<&'static str>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorReport {
+    project: String,
+    checks: Vec<DoctorCheck>,
+}
+
+fn run_doctor_command(
+    args: &Args,
+    service_config: &ServiceConfig,
+    project_toml_path: &StdPath,
+) -> anyhow::Result<()> {
+    const PASS: &str = "pass";
+    const WARN: &str = "warn";
+    const FAIL: &str = "fail";
+
+    let mut checks = Vec::new();
+    let project_root = project_toml_path
+        .parent()
+        .unwrap_or_else(|| StdPath::new("."));
+
+    let codex_check = StdCommand::new(&args.codex_binary).arg("--version").output();
+    match codex_check {
+        Ok(output) if output.status.success() => checks.push(DoctorCheck {
+            id: "codex_binary",
+            status: PASS,
+            code: None,
+            message: format!("'{} --version' succeeded", args.codex_binary),
+        }),
+        Ok(output) => checks.push(DoctorCheck {
+            id: "codex_binary",
+            status: FAIL,
+            code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+            message: format!(
+                "'{} --version' failed with exit code {}",
+                args.codex_binary, output.status
+            ),
+        }),
+        Err(err) => checks.push(DoctorCheck {
+            id: "codex_binary",
+            status: FAIL,
+            code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+            message: format!("failed to execute '{} --version': {err}", args.codex_binary),
+        }),
+    }
+
+    match service_config.validate() {
+        Ok(warnings) => {
+            checks.push(DoctorCheck {
+                id: "service_config",
+                status: PASS,
+                code: None,
+                message: "service config validated".to_string(),
+            });
+            for warning in warnings {
+                checks.push(DoctorCheck {
+                    id: "service_config_warning",
+                    status: WARN,
+                    code: Some(consts::ERROR_CODE_CFG_SERVICE_INVALID),
+                    message: warning,
+                });
+            }
+        }
+        Err(err) => checks.push(DoctorCheck {
+            id: "service_config",
+            status: FAIL,
+            code: Some(consts::ERROR_CODE_CFG_SERVICE_INVALID),
+            message: err.to_string(),
+        }),
+    }
+
+    match ProjectConfig::load(project_root).and_then(|config| config.validate().map(|_| config)) {
+        Ok(config) => {
+            checks.push(DoctorCheck {
+                id: "project_config",
+                status: PASS,
+                code: None,
+                message: "project config validated".to_string(),
+            });
+
+            match config.load_runtime_files(project_root) {
+                Ok(_) => checks.push(DoctorCheck {
+                    id: "project_prompts",
+                    status: PASS,
+                    code: None,
+                    message: "all prompt files are readable and non-empty".to_string(),
+                }),
+                Err(err) => checks.push(DoctorCheck {
+                    id: "project_prompts",
+                    status: FAIL,
+                    code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+                    message: err.to_string(),
+                }),
+            }
+
+            for (profile_name, profile) in &config.callbacks.profiles {
+                if let CallbackProfile::Command(command) = profile {
+                    let path = StdPath::new(&command.program);
+                    if !path.exists() {
+                        checks.push(DoctorCheck {
+                            id: "project_callback_command",
+                            status: FAIL,
+                            code: Some(consts::ERROR_CODE_CB_COMMAND_INVALID),
+                            message: format!(
+                                "project callback profile '{profile_name}' command '{}' does not exist",
+                                command.program
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Err(err) => checks.push(DoctorCheck {
+            id: "project_config",
+            status: FAIL,
+            code: Some(consts::ERROR_CODE_CFG_PROJECT_VALIDATION),
+            message: err.to_string(),
+        }),
+    }
+
+    let runtime_dir = project_root.join(consts::FOREMAN_RUNTIME_DIR);
+    match fs::create_dir_all(&runtime_dir) {
+        Ok(_) => {
+            let probe = runtime_dir.join(".doctor-write-probe");
+            match fs::write(&probe, "ok") {
+                Ok(_) => {
+                    let _ = fs::remove_file(&probe);
+                    checks.push(DoctorCheck {
+                        id: "runtime_dir",
+                        status: PASS,
+                        code: None,
+                        message: format!("runtime directory is writable: {}", runtime_dir.display()),
+                    });
+                }
+                Err(err) => checks.push(DoctorCheck {
+                    id: "runtime_dir",
+                    status: FAIL,
+                    code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+                    message: format!(
+                        "runtime directory is not writable '{}': {err}",
+                        runtime_dir.display()
+                    ),
+                }),
+            }
+        }
+        Err(err) => checks.push(DoctorCheck {
+            id: "runtime_dir",
+            status: FAIL,
+            code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+            message: format!("failed to create runtime directory '{}': {err}", runtime_dir.display()),
+        }),
+    }
+
+    let git_dir = project_root.join(".git");
+    if git_dir.exists() {
+        checks.push(DoctorCheck {
+            id: "git_access",
+            status: PASS,
+            code: None,
+            message: format!("git metadata present: {}", git_dir.display()),
+        });
+    } else {
+        checks.push(DoctorCheck {
+            id: "git_access",
+            status: WARN,
+            code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
+            message: "no .git directory found (worktree operations may fail)".to_string(),
+        });
+    }
+
+    for (profile_name, profile) in &service_config.callbacks.profiles {
+        if let CallbackProfile::Command(command) = profile {
+            let command_path = StdPath::new(&command.program);
+            if command_path.exists() {
+                checks.push(DoctorCheck {
+                    id: "service_callback_command",
+                    status: PASS,
+                    code: None,
+                    message: format!(
+                        "service callback profile '{profile_name}' command exists: {}",
+                        command.program
+                    ),
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    id: "service_callback_command",
+                    status: FAIL,
+                    code: Some(consts::ERROR_CODE_CB_COMMAND_INVALID),
+                    message: format!(
+                        "service callback profile '{profile_name}' command '{}' does not exist",
+                        command.program
+                    ),
+                });
+            }
+        }
+    }
+
+    let report = DoctorReport {
+        project: project_toml_path.to_string_lossy().to_string(),
+        checks,
+    };
+    let failures = report
+        .checks
+        .iter()
+        .filter(|check| check.status == FAIL)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|check| check.status == WARN)
+        .count();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).context("serialize doctor report")?
+    );
+    println!("doctor summary: failures={failures} warnings={warnings}");
+
+    if failures > 0 {
+        return Err(coded_error(
+            consts::ERROR_CODE_WK_DOCTOR_FAILED,
+            format!("doctor found {failures} failure(s)"),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedConfigOutput {
+    precedence: Vec<&'static str>,
+    cli: ResolvedCliOutput,
+    service: ServiceConfig,
+    project: ProjectConfig,
+    effective_callback_profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedCliOutput {
+    project_toml: String,
+    service_config: String,
+    codex_binary: String,
+    socket_path: Option<String>,
+    state_path: Option<String>,
+}
+
+fn run_config_show_resolved(
+    args: &Args,
+    service_config: &ServiceConfig,
+    project_toml_path: &StdPath,
+) -> anyhow::Result<()> {
+    let project_root = project_toml_path
+        .parent()
+        .unwrap_or_else(|| StdPath::new("."));
+    let project_config = ProjectConfig::load(project_root)?;
+    project_config.validate()?;
+
+    let mut effective_profile_names: Vec<String> =
+        service_config.callbacks.profiles.keys().cloned().collect();
+    for profile_name in project_config.callbacks.profiles.keys() {
+        if !effective_profile_names.iter().any(|name| name == profile_name) {
+            effective_profile_names.push(profile_name.clone());
+        }
+    }
+    effective_profile_names.sort_unstable();
+
+    let resolved = ResolvedConfigOutput {
+        precedence: vec![
+            "project.toml overrides service callback profiles/settings when names overlap",
+            "service config provides global defaults and fallback callback profiles",
+            "CLI flags override runtime paths and process settings",
+        ],
+        cli: ResolvedCliOutput {
+            project_toml: project_toml_path.to_string_lossy().to_string(),
+            service_config: args.service_config.clone(),
+            codex_binary: args.codex_binary.clone(),
+            socket_path: args.socket_path.clone(),
+            state_path: args
+                .state_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+        },
+        service: service_config.clone(),
+        project: project_config,
+        effective_callback_profiles: effective_profile_names,
+    };
+
+    println!(
+        "{}",
+        toml::to_string_pretty(&resolved).context("serialize resolved config")?
+    );
+    Ok(())
 }
 
 async fn health() -> &'static str {

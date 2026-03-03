@@ -61,6 +61,29 @@ foreman --validate-config
 
 `--validate-config` loads and validates the service callback config and exits without starting the daemon.
 
+Validate project config, callback references, and prompt files:
+
+```bash
+foreman --project /tmp/example-project/project.toml --project-lint
+```
+
+Run startup diagnostics for codex binary, config, runtime dir, and callback commands:
+
+```bash
+foreman --project /tmp/example-project/project.toml --doctor
+```
+
+Show resolved runtime config (CLI + service + project):
+
+```bash
+foreman --project /tmp/example-project/project.toml --config-show-resolved
+```
+
+Important path contract:
+
+- CLI `--project` expects a file path to `project.toml`.
+- API `POST /projects` expects a directory path that contains `project.toml` and prompt files.
+
 ## 2.1 Sandbox And Permission Constraints For Project Runs
 
 When running from a restricted Codex execution context, the following permissions are required for codex-agent project runs:
