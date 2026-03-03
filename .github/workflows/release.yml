@@ -19,8 +19,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    name: release-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+      - name: Run release gate checks
+        env:
+          RUN_LIVE_MOCK_SMOKE: false
+        run: bash scripts/release_gate.sh
+
   build:
     name: build-${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -32,19 +48,16 @@ jobs:
             target_name: linux-x86_64
             ext: ""
             archive_ext: tar.gz
-            shell: bash
           - os: macos-latest
             target: x86_64-apple-darwin
             target_name: macos-x86_64
             ext: ""
             archive_ext: tar.gz
-            shell: bash
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             target_name: windows-x86_64
             ext: ".exe"
             archive_ext: zip
-            shell: pwsh
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     steps:
@@ -78,8 +91,9 @@ jobs:
       - name: Build release
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package binary and templates
-        shell: ${{ matrix.shell }}
+      - name: Package binary and templates (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         env:
           TAG_NAME: ${{ env.RELEASE_TAG }}
           TARGET_NAME: ${{ matrix.target_name }}
@@ -87,28 +101,40 @@ jobs:
           EXT: ${{ matrix.ext }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
         run: |
-          if ("${{ runner.os }}" -eq "Windows") {
-            $version = $env:TAG_NAME -replace "^v",""
-            $bundleName = "codex-foreman-$version-$env:TARGET_NAME"
-            $bundlePath = "dist/$bundleName"
-            $archive = "dist/$bundleName.$env:ARCHIVE_EXT"
-            New-Item -ItemType Directory -Force -Path $bundlePath | Out-Null
-            Copy-Item "target/$env:TARGET/release/codex-foreman$env:EXT" "$bundlePath/"
-            Copy-Item "templates" -Recurse -Destination "$bundlePath/"
-            Compress-Archive -Path "$bundlePath" -DestinationPath $archive
-            $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-            "${hash}  $(Split-Path $archive -Leaf)" | Set-Content "$archive.sha256"
-          } else {
-            set -euo pipefail
-            version="${TAG_NAME#v}"
-            bundle="codex-foreman-${version}-${TARGET_NAME}"
-            archive="dist/codex-foreman-${version}-${TARGET_NAME}.${ARCHIVE_EXT}"
-            mkdir -p "dist/$bundle"
-            cp "target/${TARGET}/release/codex-foreman${EXT}" "dist/$bundle/"
-            cp -r templates "dist/$bundle/"
-            tar -czf "$archive" -C dist "$bundle"
+          $version = $env:TAG_NAME -replace "^v",""
+          $bundleName = "foreman-$version-$env:TARGET_NAME"
+          $bundlePath = "dist/$bundleName"
+          $archive = "dist/$bundleName.$env:ARCHIVE_EXT"
+          New-Item -ItemType Directory -Force -Path $bundlePath | Out-Null
+          Copy-Item "target/$env:TARGET/release/foreman$env:EXT" "$bundlePath/"
+          Copy-Item "templates" -Recurse -Destination "$bundlePath/"
+          Compress-Archive -Path "$bundlePath" -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "${hash}  $(Split-Path $archive -Leaf)" | Set-Content "$archive.sha256"
+
+      - name: Package binary and templates (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG_NAME: ${{ env.RELEASE_TAG }}
+          TARGET_NAME: ${{ matrix.target_name }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          bundle="foreman-${version}-${TARGET_NAME}"
+          archive="dist/foreman-${version}-${TARGET_NAME}.${ARCHIVE_EXT}"
+          mkdir -p "dist/$bundle"
+          cp "target/${TARGET}/release/foreman${EXT}" "dist/$bundle/"
+          cp -r templates "dist/$bundle/"
+          tar -czf "$archive" -C dist "$bundle"
+          if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "$archive.sha256"
-          }
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -158,9 +184,10 @@ jobs:
       - name: Collect release assets
         run: |
           ls -la dist
-          find dist -maxdepth 1 -type f -name 'codex-foreman-*'
+          find dist -maxdepth 1 -type f -name 'foreman-*'
 
       - name: Extract release notes from changelog
+        shell: python
         env:
           TAG_NAME: ${{ env.RELEASE_TAG }}
         run: |
@@ -197,7 +224,7 @@ jobs:
               raise RuntimeError("No release notes found in CHANGELOG.md")
 
           Path("release-notes.md").write_text(
-              "# codex-foreman " + tag + "\n\n"
+              "# foreman " + tag + "\n\n"
               f"Release notes generated from {source}.\n\n"
               + title + "\n\n"
               + notes + "\n"
@@ -207,10 +234,10 @@ jobs:
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: codex-foreman ${{ env.RELEASE_TAG }}
+          name: foreman ${{ env.RELEASE_TAG }}
           body_path: release-notes.md
           files: |
-            dist/codex-foreman-*.tar.gz
-            dist/codex-foreman-*.tar.gz.sha256
-            dist/codex-foreman-*.zip
-            dist/codex-foreman-*.zip.sha256
+            dist/foreman-*.tar.gz
+            dist/foreman-*.tar.gz.sha256
+            dist/foreman-*.zip
+            dist/foreman-*.zip.sha256

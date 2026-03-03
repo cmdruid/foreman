@@ -211,7 +211,6 @@ If your environment is locked down, grant these before starting Foreman.
 Reference docs:
 
 - [`RELEASE.md`](RELEASE.md)
-- [`RELEASES.md`](RELEASES.md)
 - [`TESTING.md`](TESTING.md)
 
 ## Contributing
@@ -228,7 +227,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 - Manual: [`docs/manual.md`](docs/manual.md)
 - Testing: [`TESTING.md`](TESTING.md)
-- Releases: [`RELEASES.md`](RELEASES.md)
 - Release checklist: [`RELEASE.md`](RELEASE.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Security policy: [`SECURITY.md`](SECURITY.md)

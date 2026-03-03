@@ -25,7 +25,7 @@ fn release_metadata_tracks_package_version() {
 
     let expected_release_section = format!("## v{version}");
     let changelog_path = manifest_dir.join("CHANGELOG.md");
-    let releases_path = manifest_dir.join("RELEASES.md");
+    let release_guide_path = manifest_dir.join("RELEASE.md");
 
     assert!(
         changelog_path.exists(),
@@ -33,21 +33,21 @@ fn release_metadata_tracks_package_version() {
         changelog_path.display()
     );
     assert!(
-        releases_path.exists(),
-        "missing releases file at '{}'",
-        releases_path.display()
+        release_guide_path.exists(),
+        "missing release guide file at '{}'",
+        release_guide_path.display()
     );
 
     let changelog = read_text(&changelog_path);
-    let releases = read_text(&releases_path);
+    let release_guide = read_text(&release_guide_path);
 
     assert!(
         changelog.contains(&expected_release_section),
         "changelog does not contain release section '{expected_release_section}'"
     );
     assert!(
-        releases.contains(&expected_release_section),
-        "releases does not contain release section '{expected_release_section}'"
+        release_guide.contains("single source of truth"),
+        "release guide is missing core release-process section"
     );
 }
 

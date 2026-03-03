@@ -32,10 +32,10 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 echo "[release-gate] verifying workflow pinning"
-if [[ -x "$REPO_ROOT/scripts/verify_action_shas.sh" ]]; then
-  "$REPO_ROOT/scripts/verify_action_shas.sh"
+if [[ -x "$REPO_ROOT/scripts/verify_action.sh" ]]; then
+  "$REPO_ROOT/scripts/verify_action.sh"
 else
-  echo "missing verify_action_shas.sh" >&2
+  echo "missing verify_action.sh" >&2
   exit 1
 fi
 
@@ -48,9 +48,9 @@ for pattern in \
   "Live mock demo (release gate)" \
   "result: success" \
   "mixed mode" \
-  "before tagging" \
+  "Before tagging" \
   "contrib/demo/run_demo.sh"; do
-  if ! rg -q "$pattern" "$DOCS_ROOT"/TESTING.md "$DOCS_ROOT"/RELEASES.md "$DOCS_ROOT"/README.md "$DOCS_ROOT"/docs/manual.md; then
+  if ! rg -Fq "$pattern" "$DOCS_ROOT"/TESTING.md "$DOCS_ROOT"/RELEASE.md "$DOCS_ROOT"/README.md "$DOCS_ROOT"/docs/manual.md; then
     echo "required documentation pattern not found: $pattern" >&2
     exit 1
   fi

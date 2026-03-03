@@ -207,7 +207,7 @@ curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X DELETE "http://localhost/project
 - Ensure all workflow `uses:` references are pinned to full commit SHAs before release:
 
 ```bash
-./scripts/verify_action_shas.sh
+./scripts/verify_action.sh
 ```
 
 - Expected result:

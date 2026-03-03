@@ -1,50 +1,60 @@
-# Release checklist for foreman
+# foreman release guide
 
-Use this checklist before publishing any tag/release.
+This file is the single source of truth for release process.
+Versioned release notes live in `CHANGELOG.md`.
 
 ## Preflight
 
-- Confirm release versioning consistency:
+- Confirm release metadata and version wiring:
   - `cargo test --test release -- --nocapture`
-- Verify changelog/release notes are ready for the target version:
+- Confirm changelog entry exists for the target version:
   - `CHANGELOG.md` contains `## vX.Y.Z`
-  - `RELEASES.md` contains `## vX.Y.Z`
-- Verify workflow hardening:
-  - `./scripts/verify_action_shas.sh`
+- Verify workflow action pinning:
+  - `./scripts/verify_action.sh`
 
-## API + regression checks
+## Verification
 
-- Run normal workspace verification:
+- Run full release gate:
+  - `./scripts/release_gate.sh`
+- Run full workspace checks:
   - `cargo fmt --all -- --check`
   - `cargo check --locked`
   - `cargo test --all -- --nocapture`
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo build --locked --all-targets`
-- Run crate-level gate:
+- Run API contract/integration gate:
   - `cargo test -p codex-api --tests -- --nocapture`
 
-## Release gate script
+## Live mock demo (release gate)
 
-Run the release gate script:
-
-```bash
-./scripts/release_gate.sh
-```
-
-If you want to run the real mixed live smoke locally, opt in explicitly:
+The live smoke is optional in normal CI and opt-in locally:
 
 ```bash
 RUN_LIVE_MOCK_SMOKE=true ./scripts/release_gate.sh
 ```
 
-## Manual doc check
+Success criteria:
 
-- `README.md` references the live mock demo entrypoints.
-- `docs/manual.md` documents mixed-mode run/criteria.
-- `TESTING.md` and `RELEASES.md` reference the mixed-mode gate requirements.
+- `result: success`
+- mixed mode is exercised (`RUN_MOCK_DEMO_MODE=mixed`)
+- entrypoint used is `contrib/demo/run_demo.sh`
 
-## Packaging
+## Packaging and publish
 
-- Build release artifacts:
-  - `cargo build --locked --release`
-- Follow `RELEASES.md` packaging instructions for template paths and install layout.
+- Build release binary:
+  - `cargo build --locked --release --bin foreman`
+- Bundle `templates/` with the binary in release artifacts.
+- GitHub release workflow publishes tagged builds (`vX.Y.Z`) with checksums.
+
+## Before tagging
+
+- All required checks are green.
+- `CHANGELOG.md` has the final release notes for the exact tag.
+- Release artifacts include runtime templates.
+
+Publish:
+
+```bash
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
