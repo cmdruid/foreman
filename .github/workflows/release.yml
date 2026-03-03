@@ -192,7 +192,6 @@ jobs:
           TAG_NAME: ${{ env.RELEASE_TAG }}
         run: |
           import os
-          import re
           from pathlib import Path
 
           tag = os.environ["TAG_NAME"]
@@ -202,21 +201,28 @@ jobs:
                   "or trigger by pushing a `v*` tag."
               )
           version = tag.lstrip("v")
-          changelog = Path("CHANGELOG.md").read_text()
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
 
-          def section_for(heading: str):
-              pattern = re.compile(
-                  rf"(?ms)^## {re.escape(heading)}\\s*$\\n(.*?)(?=^## |\\Z)",
-                  re.MULTILINE,
-              )
-              match = pattern.search(changelog)
-              return match.group(1).strip() if match else None
+          sections = {}
+          current = None
+          buffer = []
+          for raw_line in changelog.splitlines():
+              line = raw_line.rstrip("\r")
+              if line.startswith("## "):
+                  if current is not None:
+                      sections[current] = "\n".join(buffer).strip()
+                  current = line[3:].strip()
+                  buffer = []
+              elif current is not None:
+                  buffer.append(line)
+          if current is not None:
+              sections[current] = "\n".join(buffer).strip()
 
-          notes = section_for(f"v{version}")
+          notes = sections.get(f"v{version}")
           title = f"## v{version}"
           source = f"`{title}` section in `CHANGELOG.md`"
-          if notes is None:
-              notes = section_for("Unreleased")
+          if not notes:
+              notes = sections.get("Unreleased")
               title = "## Unreleased"
               source = "`## Unreleased` section in `CHANGELOG.md`"
 
