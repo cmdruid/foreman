@@ -86,6 +86,8 @@ RUN_MOCK_DEMO_MODE="${RUN_MOCK_DEMO_MODE:-worktree}"
 WORKTREE_CLEANUP="${WORKTREE_CLEANUP:-true}"
 FOREMAN_MANAGED_WORKTREES="${FOREMAN_MANAGED_WORKTREES:-true}"
 BASE_BRANCH="$(git -C "$PROJECT_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+# Use a detached-safe ref for foreman-managed worktree creation.
+BASE_REF="$(git -C "$PROJECT_PATH" rev-parse HEAD 2>/dev/null || echo HEAD)"
 
 prepare_worktree() {
   local worktree_path="$1"
@@ -420,7 +422,7 @@ EOF
       --arg worktree_path "$worker_worktree_path" \
       --arg cwd "$worker_cwd" \
       --arg sandbox "$WORKER_SANDBOX" \
-      --arg base_ref "$BASE_BRANCH" \
+      --arg base_ref "$BASE_REF" \
       --arg model "$MODEL_ID" \
       --arg provider "$MODEL_PROVIDER" \
       --arg artifact_path "$deliverable_path" \
@@ -584,13 +586,13 @@ else
     fi
     if [[ -n "$worker_id" && "$worker_id" != "null" ]]; then
       agent_events="$(fetch_worker_events "$worker_id" 200)"
-      if ! jq -e 'any(.[]; .method == "item/assistantMessage" or .method == "item/assistantMessage/delta" or .method == "item/agentMessage" or .method == "item/agentMessage/delta")' <<<"$agent_events" >/dev/null; then
+      if ! jq -e 'any(.[]; .method == "item/assistantMessage" or .method == "item/assistantMessage/delta" or .method == "item/agentMessage" or .method == "item/agentMessage/delta" or .method == "agent_message" or .method == "agent_message_delta")' <<<"$agent_events" >/dev/null; then
         echo "warning: worker $worker_id had no assistant events; likely prompt-echo completion"
         if [[ "$STRICT_EXECUTION_CHECKS" == "true" ]]; then
           FAILED=true
         fi
       fi
-      if [[ "$requires_command" == "true" ]] && ! jq -e 'any(.[]; .method == "codex/event/exec_command_begin" or .method == "codex/event/exec_command_end")' <<<"$agent_events" >/dev/null; then
+      if [[ "$requires_command" == "true" ]] && ! jq -e 'any(.[]; .method == "exec_command_begin" or .method == "exec_command_end" or .method == "codex/event/exec_command_begin" or .method == "codex/event/exec_command_end")' <<<"$agent_events" >/dev/null; then
         echo "warning: worker $worker_id did not emit command events for a requires_command=true work item"
         if [[ "$STRICT_EXECUTION_CHECKS" == "true" ]]; then
           FAILED=true

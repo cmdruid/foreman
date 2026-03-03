@@ -18,3 +18,6 @@ artifacts/
 .DS_Store
 
 .foreman/
+.audit/
+.audit-generated/
+.audit-worktrees/
