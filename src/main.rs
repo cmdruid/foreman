@@ -7,6 +7,7 @@ mod project;
 mod state;
 
 use std::{
+    env,
     fs,
     path::{Path as StdPath, PathBuf},
     process::Command as StdCommand,
@@ -55,17 +56,29 @@ struct Args {
     #[arg(long)]
     init_project_overwrite: bool,
     #[arg(long)]
-    init_project_manual: bool,
+    with_manual: bool,
     #[arg(long, value_name = "PATH")]
     template_dir: Option<String>,
     #[arg(long = "project", value_name = "PATH")]
     project: Option<PathBuf>,
-    #[arg(long, default_value_t = consts::DEFAULT_SERVICE_CONFIG_PATH.to_string())]
+    #[arg(long, default_value_t = default_service_config_path())]
     service_config: String,
     #[arg(long)]
     validate_config: bool,
     #[arg(long)]
     state_path: Option<PathBuf>,
+}
+
+fn default_service_config_path() -> String {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| {
+            home.join(consts::FOREMAN_RUNTIME_DIR)
+                .join(consts::DEFAULT_SERVICE_CONFIG_FILENAME)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| consts::DEFAULT_SERVICE_CONFIG_PATH.to_string())
 }
 
 #[derive(Clone)]
@@ -103,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         init_project(
             path,
             args.init_project_overwrite,
-            args.init_project_manual,
+            args.with_manual,
             template_dir.as_path(),
         )?;
         return Ok(());

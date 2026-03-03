@@ -11,7 +11,7 @@
 1. Validate service config:
 
 ```bash
-cargo run -- --service-config /etc/foreman/config.toml --validate-config
+foreman --validate-config
 ```
 
 Expected:
@@ -23,7 +23,7 @@ Expected:
 2. Initialize a sample project scaffold:
 
 ```bash
-cargo run -- --init-project /tmp/example-project
+foreman --init-project /tmp/example-project
 ```
 
 Expected generated files:
@@ -33,17 +33,20 @@ Expected generated files:
 - `WORKER.md`
 - `RUNBOOK.md`
 - `HANDOFF.md`
-- `MANUAL.md` (only with `--init-project-manual`)
+- `MANUAL.md` (only with `--with-manual`)
 
 3. Launch service:
 
 ```bash
-cargo run -- \
+foreman \
   --socket-path /tmp/cf-foreman.sock \
-  --codex-binary /usr/local/bin/codex \
-  --service-config /etc/foreman/config.toml \
   --project /tmp/example-project/project.toml
 ```
+
+Defaults:
+
+- `--codex-binary` defaults to `codex`
+- `--service-config` defaults to `~/.foreman/config.toml`
 
 ```bash
 export FOREMAN_SOCKET_PATH="/tmp/cf-foreman.sock"

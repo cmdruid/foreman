@@ -432,6 +432,112 @@ async fn test_service_status_endpoint() {
 }
 
 #[tokio::test]
+async fn test_api_auth_header_scheme_and_custom_header() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let service_config = temp.path().join("service.toml");
+    let state_path = temp.path().join("foreman-state.json");
+    common::write_service_config(
+        &service_config,
+        r#"[security.auth]
+enabled = true
+token = "alpha-token"
+header_name = "x-foreman-token"
+header_scheme = "Token"
+skip_paths = ["/health", "/status"]
+
+[callbacks]
+"#,
+    )
+    .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let status_skip = client
+        .get(format!("{}/status", harness.base_url))
+        .send()
+        .await
+        .expect("status skip path request");
+    assert_eq!(status_skip.status(), StatusCode::OK);
+
+    let no_auth = client
+        .get(format!("{}/agents", harness.base_url))
+        .send()
+        .await
+        .expect("no auth request");
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scheme = client
+        .get(format!("{}/agents", harness.base_url))
+        .header("x-foreman-token", "Bearer alpha-token")
+        .send()
+        .await
+        .expect("wrong scheme request");
+    assert_eq!(wrong_scheme.status(), StatusCode::UNAUTHORIZED);
+
+    let correct = client
+        .get(format!("{}/agents", harness.base_url))
+        .header("x-foreman-token", "Token alpha-token")
+        .send()
+        .await
+        .expect("correct auth request");
+    assert_eq!(correct.status(), StatusCode::OK);
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_api_auth_token_env_with_custom_header() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let service_config = temp.path().join("service.toml");
+    let state_path = temp.path().join("foreman-state.json");
+    common::write_service_config(
+        &service_config,
+        r#"[security.auth]
+enabled = true
+token_env = "CODEX_FOREMAN_API_TOKEN"
+header_name = "x-auth-token"
+skip_paths = ["/health", "/status"]
+
+[callbacks]
+"#,
+    )
+    .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness = common::start_foreman_with_auth(
+        &socket_path,
+        &service_config,
+        &state_path,
+        &fake_codex,
+        Some("env-token"),
+    )
+    .await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let no_auth = client
+        .get(format!("{}/agents", harness.base_url))
+        .send()
+        .await
+        .expect("no auth request");
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let with_env_token = client
+        .get(format!("{}/agents", harness.base_url))
+        .header("x-auth-token", "env-token")
+        .send()
+        .await
+        .expect("env token auth request");
+    assert_eq!(with_env_token.status(), StatusCode::OK);
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
 async fn test_command_callback_timeout_isolation() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");
@@ -915,6 +1021,138 @@ async fn test_project_job_creation_and_result() {
 
     harness.terminate().await;
     webhook.stop().await;
+}
+
+#[tokio::test]
+async fn test_project_foreman_send_and_steer_endpoints() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-generic-worktree").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    common::write_service_config(&service_config, service_config_template_simple().as_str())
+        .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start this project",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let send_response = client
+        .post(format!(
+            "{}/projects/{}/foreman/send",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "send a follow-up foreman turn",
+        }))
+        .send()
+        .await
+        .expect("send project foreman turn");
+    assert_eq!(send_response.status(), StatusCode::OK);
+
+    let steer_response = client
+        .post(format!(
+            "{}/projects/{}/foreman/steer",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "keep the response concise",
+        }))
+        .send()
+        .await
+        .expect("steer project foreman");
+    assert!(
+        steer_response.status() == StatusCode::OK
+            || steer_response.status() == StatusCode::BAD_REQUEST,
+        "steer endpoint should be reachable even if active turn ended quickly"
+    );
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_jobs_list_endpoint_includes_created_job() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-generic-worktree").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    common::write_service_config(&service_config, service_config_template_simple().as_str())
+        .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start this project",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let create_jobs = client
+        .post(format!("{}/projects/{}/jobs", harness.base_url, project_id))
+        .json(&json!({
+            "workers": [
+                {"prompt": "worker one"},
+                {"prompt": "worker two"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("create project jobs");
+    assert_eq!(create_jobs.status(), StatusCode::CREATED);
+    let create_jobs = create_jobs
+        .json::<Value>()
+        .await
+        .expect("create jobs response");
+    let job_id = create_jobs["job_id"].as_str().expect("job id");
+
+    let list_jobs = client
+        .get(format!("{}/jobs", harness.base_url))
+        .send()
+        .await
+        .expect("list jobs request");
+    assert_eq!(list_jobs.status(), StatusCode::OK);
+    let jobs = list_jobs.json::<Value>().await.expect("jobs response");
+    let contains_job = jobs
+        .as_array()
+        .expect("jobs should be an array")
+        .iter()
+        .any(|entry| entry["id"].as_str() == Some(job_id));
+    assert!(contains_job, "newly created job should appear in /jobs");
+
+    harness.terminate().await;
 }
 
 fn write_fake_codex_deliverable_server_script(path: &Path) {
@@ -1900,6 +2138,564 @@ async fn test_project_fixture_validation_errors() {
     harness.terminate().await;
 }
 
+#[tokio::test]
+async fn test_project_local_callback_profile_executes_for_worker_completed() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let callback_output = PathBuf::from(format!("/tmp/foreman-local-callback-{}", common::random_port()));
+    let _ = fs::remove_file(&callback_output);
+
+    let project_config = format!(
+        r#"name = "local-callback-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.profiles.local_done]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "printf '%s' \"$FOREMAN_EVENT\" > '{callback_output}'"]
+events = ["project/lifecycle/worker/completed"]
+
+[callbacks.profiles.local_done.env]
+FOREMAN_EVENT = "{{{{event_json}}}}"
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "local_done"
+"#
+        ,
+        callback_output = callback_output.display()
+    );
+    fs::write(project_path.join("project.toml"), project_config).expect("write project config");
+    common::write_service_config(&service_config, "[callbacks]\n").expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start local callback test",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "complete one worker so lifecycle callback fires",
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+
+    assert!(
+        wait_for_file_has_content(&callback_output, Duration::from_secs(3)).await,
+        "project-local callback profile should execute on worker_completed"
+    );
+
+    let callback_status = client
+        .get(format!(
+            "{}/projects/{}/callback-status",
+            harness.base_url, project_id
+        ))
+        .send()
+        .await
+        .expect("callback status request");
+    assert_eq!(callback_status.status(), StatusCode::OK);
+    let callback_status = callback_status
+        .json::<Value>()
+        .await
+        .expect("callback status json");
+    let callbacks = callback_status["callbacks"]
+        .as_object()
+        .expect("callback status callbacks object");
+    let worker_completed_status = callbacks
+        .get("worker_completed")
+        .or_else(|| callbacks.get("project/lifecycle/worker/completed"))
+        .and_then(Value::as_str);
+    assert_eq!(
+        worker_completed_status,
+        Some("success"),
+        "callback_status={callback_status}"
+    );
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_project_local_callback_profile_overrides_same_named_global_profile() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let local_output = PathBuf::from(format!(
+        "/tmp/foreman-local-override-callback-{}",
+        common::random_port()
+    ));
+    let global_output = PathBuf::from(format!(
+        "/tmp/foreman-global-override-callback-{}",
+        common::random_port()
+    ));
+    let _ = fs::remove_file(&local_output);
+    let _ = fs::remove_file(&global_output);
+
+    let project_config = format!(
+        r#"name = "local-over-global-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.profiles.on_done]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "printf 'local:%s' \"$FOREMAN_EVENT\" > '{local_output}'"]
+events = ["project/lifecycle/worker/completed"]
+
+[callbacks.profiles.on_done.env]
+FOREMAN_EVENT = "{{{{method}}}}"
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "on_done"
+"#
+        ,
+        local_output = local_output.display()
+    );
+    fs::write(project_path.join("project.toml"), project_config).expect("write project config");
+
+    let service_config_contents = format!(
+        r#"[callbacks]
+
+[callbacks.profiles.on_done]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "printf 'global:%s' \"$FOREMAN_EVENT\" > '{global_output}'"]
+events = ["project/lifecycle/worker/completed"]
+
+[callbacks.profiles.on_done.env]
+FOREMAN_EVENT = "{{{{method}}}}"
+"#
+        ,
+        global_output = global_output.display()
+    );
+    common::write_service_config(&service_config, &service_config_contents)
+        .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start local-over-global callback test",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "finish worker and emit lifecycle callback",
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+
+    assert!(
+        wait_for_file_has_content(&local_output, Duration::from_secs(3)).await,
+        "project-local profile should execute when same name exists globally"
+    );
+    let local_payload = fs::read_to_string(&local_output).expect("read local callback output");
+    assert!(
+        local_payload.starts_with("local:"),
+        "local callback marker should be present"
+    );
+
+    assert!(
+        wait_for_path_absence(&global_output, Duration::from_millis(1200)).await,
+        "global same-name callback profile should not execute for this project callback"
+    );
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_project_local_webhook_profile_executes_for_worker_completed() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    common::write_service_config(&service_config, "[callbacks]\n").expect("write service config");
+    let webhook = common::start_webhook_capture().await;
+    let webhook_url = format!("{}/callback", webhook.url);
+
+    let project_config = format!(
+        r#"name = "local-webhook-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.profiles.local_webhook]
+type = "webhook"
+url = "{webhook_url}"
+events = ["project/lifecycle/worker/completed"]
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "local_webhook"
+"#
+    );
+    fs::write(project_path.join("project.toml"), project_config).expect("write project config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start local webhook callback project",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "run one worker for local webhook callback",
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+
+    assert!(
+        webhook.wait_for_events(1, Duration::from_secs(3)).await,
+        "project-local webhook callback should emit event"
+    );
+
+    let events = webhook.events().await;
+    let has_worker_completed_event = events.iter().any(|event| {
+        event["method"].as_str() == Some("project/lifecycle/worker/completed")
+    });
+    assert!(has_worker_completed_event);
+
+    webhook.stop().await;
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_project_callback_profile_falls_back_to_global_service_profile() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let output_path = PathBuf::from(format!(
+        "/tmp/foreman-global-fallback-callback-{}",
+        common::random_port()
+    ));
+    let _ = fs::remove_file(&output_path);
+
+    let service_config_contents = format!(
+        r#"[callbacks]
+
+[callbacks.profiles.global_done]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "printf '%s' \"$FOREMAN_EVENT\" > '{output_path}'"]
+events = ["project/lifecycle/worker/completed"]
+
+[callbacks.profiles.global_done.env]
+FOREMAN_EVENT = "{{{{method}}}}"
+"#
+        ,
+        output_path = output_path.display()
+    );
+    common::write_service_config(&service_config, &service_config_contents)
+        .expect("write service config");
+
+    let project_config = r#"name = "global-fallback-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "global_done"
+"#;
+    fs::write(project_path.join("project.toml"), project_config).expect("write project config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start global fallback callback project",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "run one worker for global fallback callback",
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+
+    assert!(
+        wait_for_file_has_content(&output_path, Duration::from_secs(3)).await,
+        "global callback profile should run when project-local profile is absent"
+    );
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_project_local_worker_aborted_callback_profile_executes() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-valid").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    common::write_service_config(&service_config, "[callbacks]\n").expect("write service config");
+    let callback_output = PathBuf::from(format!(
+        "/tmp/foreman-local-worker-aborted-callback-{}",
+        common::random_port()
+    ));
+    let _ = fs::remove_file(&callback_output);
+
+    let project_config = format!(
+        r#"name = "local-worker-aborted-project"
+
+[prompts]
+foreman_file = "FOREMAN.md"
+worker_file = "WORKER.md"
+runbook_file = "RUNBOOK.md"
+handoff_file = "HANDOFF.md"
+
+[callbacks.profiles.local_aborted]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "printf '%s' \"$FOREMAN_EVENT\" > '{callback_output}'"]
+events = ["project/lifecycle/worker/aborted"]
+
+[callbacks.profiles.local_aborted.env]
+FOREMAN_EVENT = "{{{{method}}}}"
+
+[callbacks.lifecycle.worker_aborted]
+callback_profile = "local_aborted"
+"#
+        ,
+        callback_output = callback_output.display()
+    );
+    fs::write(project_path.join("project.toml"), project_config).expect("write project config");
+
+    let fake_codex_script = temp.path().join("fake_codex_aborted.sh");
+    write_executable_script(
+        &fake_codex_script,
+        r#"#!/usr/bin/env sh
+if [ "$1" != "app-server" ]; then
+  exit 1
+fi
+
+extract_method() {
+  echo "$1" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p'
+}
+
+extract_id() {
+  echo "$1" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}
+
+while read -r line; do
+  [ -z "$line" ] && continue
+  method="$(extract_method "$line")"
+  id="$(extract_id "$line")"
+  [ -z "$id" ] && continue
+
+  case "$method" in
+    initialize)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
+      ;;
+    thread/start)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"threadId\":\"thread-abort-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"thread-abort-1\",\"status\":\"running\"}}"
+      ;;
+    turn/start)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turnId\":\"turn-abort-1\"}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-abort-1\",\"turn\":{\"id\":\"turn-abort-1\",\"status\":\"running\",\"items\":[]}}}"
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"method\":\"turn/aborted\",\"params\":{\"threadId\":\"thread-abort-1\",\"turnId\":\"turn-abort-1\",\"error\":\"forced aborted status for test\"}}"
+      ;;
+    turn/interrupt)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
+      ;;
+    turn/steer)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"turnId\":\"turn-abort-1\"}}"
+      ;;
+    *)
+      printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{}}"
+      ;;
+  esac
+done
+"#,
+    );
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let harness = common::start_foreman(
+        &socket_path,
+        &service_config,
+        &state_path,
+        fake_codex_script.to_string_lossy().as_ref(),
+    )
+    .await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project_response = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "start local worker aborted callback project",
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project_data = project_response
+        .json::<Value>()
+        .await
+        .expect("project response");
+    let project_id = project_data["project_id"].as_str().expect("project_id");
+
+    let worker_response = client
+        .post(format!(
+            "{}/projects/{}/workers",
+            harness.base_url, project_id
+        ))
+        .json(&json!({
+            "prompt": "spawn worker that will emit turn/aborted",
+        }))
+        .send()
+        .await
+        .expect("spawn worker");
+    assert_eq!(worker_response.status(), StatusCode::CREATED);
+    let worker = worker_response
+        .json::<Value>()
+        .await
+        .expect("worker response");
+    let worker_id = worker["id"].as_str().expect("worker id");
+
+    let wait = client
+        .get(format!(
+            "{}/agents/{}/wait?timeout_ms=8000&poll_ms=25",
+            harness.base_url, worker_id
+        ))
+        .send()
+        .await
+        .expect("wait for aborted worker");
+    assert_eq!(wait.status(), StatusCode::OK);
+
+    assert!(
+        wait_for_file_has_content(&callback_output, Duration::from_secs(5)).await,
+        "worker_aborted lifecycle callback should execute"
+    );
+
+    let callback_status = client
+        .get(format!(
+            "{}/projects/{}/callback-status",
+            harness.base_url, project_id
+        ))
+        .send()
+        .await
+        .expect("callback status request");
+    assert_eq!(callback_status.status(), StatusCode::OK);
+    let callback_status = callback_status
+        .json::<Value>()
+        .await
+        .expect("callback status json");
+    assert_eq!(
+        callback_status["callbacks"]["worker_aborted"].as_str(),
+        Some("success")
+    );
+
+    harness.terminate().await;
+}
+
 fn service_config_template(webhook_url: &str) -> String {
     format!(
         r#"[callbacks]
@@ -2060,6 +2856,17 @@ async fn wait_for_path_absence(path: &PathBuf, timeout: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn write_executable_script(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write executable test script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).expect("script metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("set script executable permissions");
     }
 }
 

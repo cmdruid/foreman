@@ -888,8 +888,8 @@ impl Foreman {
             }
             WorkerCallback::Profile(profile) => {
                 let profile_definition = self
-                    .config
-                    .get_callback_profile(&profile.profile)
+                    .resolve_callback_profile(&profile.profile, context.project_id)
+                    .await
                     .with_context(|| {
                         format!("callback profile '{}' is not configured", profile.profile)
                     })?;
@@ -909,16 +909,37 @@ impl Foreman {
 
                 match profile_definition {
                     CallbackProfile::Command(command) => {
-                        self.dispatch_command_callback(context, profile, command.clone())
-                            .await
+                        self.dispatch_command_callback(context, profile, command).await
                     }
                     CallbackProfile::Webhook(webhook) => {
-                        self.dispatch_webhook_callback_from_profile(&context, &profile, webhook)
+                        self.dispatch_webhook_callback_from_profile(&context, &profile, &webhook)
                             .await
                     }
                 }
             }
         }
+    }
+
+    async fn resolve_callback_profile(
+        &self,
+        profile_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Option<CallbackProfile> {
+        if let Some(project_id) = project_id {
+            let local_profile = {
+                let projects = self.projects.read().await;
+                projects
+                    .get(&project_id)
+                    .and_then(|project| project.config.callbacks.profiles.get(profile_name))
+                    .cloned()
+            };
+
+            if local_profile.is_some() {
+                return local_profile;
+            }
+        }
+
+        self.config.get_callback_profile(profile_name).cloned()
     }
 
     async fn execute_project_worker_callback(
@@ -1036,7 +1057,14 @@ impl Foreman {
                 .await;
         }
 
-        if !self.should_execute_callback_for_method(&context.method, &context.callback)? {
+        if !self
+            .should_execute_callback_for_method(
+                &context.method,
+                &context.callback,
+                context.project_id,
+            )
+            .await?
+        {
             return self
                 .set_project_lifecycle_callback_status(
                     project.id,
@@ -1071,10 +1099,11 @@ impl Foreman {
         }
     }
 
-    fn should_execute_callback_for_method(
+    async fn should_execute_callback_for_method(
         &self,
         method: &str,
         callback: &WorkerCallback,
+        project_id: Option<Uuid>,
     ) -> Result<bool> {
         match callback {
             WorkerCallback::None => Ok(false),
@@ -1083,21 +1112,21 @@ impl Foreman {
             }
             WorkerCallback::Profile(profile) => {
                 let callback_profile = self
-                    .config
-                    .get_callback_profile(&profile.profile)
+                    .resolve_callback_profile(&profile.profile, project_id)
+                    .await
                     .with_context(|| {
                         format!("callback profile '{}' is not configured", profile.profile)
                     })?;
 
-                let default_events = match callback_profile {
-                    CallbackProfile::Webhook(webhook) => webhook.events.as_deref(),
-                    CallbackProfile::Command(command) => command.events.as_deref(),
+                let default_events = match &callback_profile {
+                    CallbackProfile::Webhook(webhook) => webhook.events.clone(),
+                    CallbackProfile::Command(command) => command.events.clone(),
                 };
 
                 Ok(events_allowed(
                     method,
                     profile.events.as_deref(),
-                    default_events,
+                    default_events.as_deref(),
                 ))
             }
         }
@@ -1554,6 +1583,7 @@ impl Foreman {
         let _ = self
             .resolve_project_callback_spec(
                 &config.callbacks.foreman,
+                &config.callbacks.profiles,
                 &request.callback_overrides,
                 false,
             )
@@ -1561,6 +1591,7 @@ impl Foreman {
         let _ = self
             .resolve_project_callback_spec(
                 &config.callbacks.worker,
+                &config.callbacks.profiles,
                 &CallbackOverrides::default(),
                 false,
             )
@@ -1568,6 +1599,7 @@ impl Foreman {
         let _ = self
             .resolve_project_callback_spec(
                 &config.callbacks.bubble_up,
+                &config.callbacks.profiles,
                 &CallbackOverrides::default(),
                 false,
             )
@@ -1598,6 +1630,7 @@ impl Foreman {
         let callback = self
             .resolve_project_callback_spec(
                 &config.callbacks.foreman,
+                &config.callbacks.profiles,
                 &request.callback_overrides,
                 false,
             )
@@ -1779,6 +1812,7 @@ impl Foreman {
         let callback = self
             .resolve_project_callback_spec(
                 &project.config.callbacks.worker,
+                &project.config.callbacks.profiles,
                 &request.callback_overrides,
                 false,
             )
@@ -1866,6 +1900,7 @@ impl Foreman {
             let callback = self
                 .resolve_project_callback_spec(
                     &project.config.callbacks.worker,
+                    &project.config.callbacks.profiles,
                     &spec.callback_overrides,
                     false,
                 )
@@ -3033,6 +3068,14 @@ impl Foreman {
     }
 
     fn resolve_callback(&self, params: CallbackResolutionParams) -> Result<WorkerCallback> {
+        self.resolve_callback_with_project_profiles(params, None)
+    }
+
+    fn resolve_callback_with_project_profiles(
+        &self,
+        params: CallbackResolutionParams,
+        project_callback_profiles: Option<&HashMap<String, CallbackProfile>>,
+    ) -> Result<WorkerCallback> {
         let profile_name = if params.use_global_default {
             params
                 .callback_profile
@@ -3046,12 +3089,12 @@ impl Foreman {
             return Ok(WorkerCallback::None);
         }
 
-        let profile = self
-            .config
-            .get_callback_profile(&profile_name)
+        let profile = project_callback_profiles
+            .and_then(|profiles| profiles.get(&profile_name).cloned())
+            .or_else(|| self.config.get_callback_profile(&profile_name).cloned())
             .with_context(|| format!("callback profile '{profile_name}' is not configured"))?;
 
-        match profile {
+        match &profile {
             CallbackProfile::Webhook(profile) => {
                 let secret = profile
                     .secret_env
@@ -3079,6 +3122,7 @@ impl Foreman {
     fn resolve_project_callback_spec(
         &self,
         spec: &CallbackSpec,
+        project_callback_profiles: &HashMap<String, CallbackProfile>,
         overrides: &CallbackOverrides,
         use_global_default: bool,
     ) -> Result<WorkerCallback> {
@@ -3112,14 +3156,17 @@ impl Foreman {
             (None, None) => None,
         };
 
-        self.resolve_callback(CallbackResolutionParams {
-            callback_profile,
-            callback_prompt_prefix,
-            callback_args,
-            callback_vars,
-            callback_events,
-            use_global_default,
-        })
+        self.resolve_callback_with_project_profiles(
+            CallbackResolutionParams {
+                callback_profile,
+                callback_prompt_prefix,
+                callback_args,
+                callback_vars,
+                callback_events,
+                use_global_default,
+            },
+            Some(project_callback_profiles),
+        )
     }
 
     fn resolve_project_bubble_callback(
@@ -3127,7 +3174,12 @@ impl Foreman {
         project: &ProjectRecord,
         overrides: &CallbackOverrides,
     ) -> Result<WorkerCallback> {
-        self.resolve_project_callback_spec(&project.config.callbacks.bubble_up, overrides, false)
+        self.resolve_project_callback_spec(
+            &project.config.callbacks.bubble_up,
+            &project.config.callbacks.profiles,
+            overrides,
+            false,
+        )
     }
 
     fn resolve_project_lifecycle_callback_spec(
@@ -3149,7 +3201,12 @@ impl Foreman {
             _ => return Ok(WorkerCallback::None),
         };
 
-        self.resolve_project_callback_spec(spec, overrides, false)
+        self.resolve_project_callback_spec(
+            spec,
+            &project.config.callbacks.profiles,
+            overrides,
+            false,
+        )
     }
 
     fn resolve_callback_for_send(

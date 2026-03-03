@@ -6,7 +6,7 @@
 [![Latest](https://img.shields.io/github/v/tag/cmdruid/foreman?label=latest&sort=semver)](https://github.com/cmdruid/foreman/releases)
 [![Security](https://img.shields.io/badge/Security-Policy-blue?logo=github)](SECURITY.md)
 
-## Foreman: the control room for your AI assembly line
+## The control room for your AI assembly line
 
 When agent work starts looking like a messy shop floor, you need process discipline.
 **Foreman** is that floor manager for Codex: one service that keeps multiple agents moving through a repeatable workflow with measurable outputs.
@@ -22,16 +22,16 @@ You define the order ticket (task payload), Foreman moves it through execution, 
 - **Higher throughput, predictable output**
   Orchestrate many agents from a single API surface.
 - **Built for reliability**
-  Local `codex app-server` transport, persisted state, and restart recovery.
+  Uses local `codex app-server` via secure socket, with restart recovery.
 - **Quality gates on every batch**
   Release checks, live smoke scenarios, and docs for repeatable validation.
 - **Fast proof on delivery**
-  Run real mock scenarios and see concrete artifacts without waiting weeks.
+  Run real mock scenarios and see concrete artifacts on delivery.
 
 ### For agents and automation
 
 - **Explicit work orders, no guesswork**
-  `jobs` and `workers` are explicit, ordered instructions.
+  Your `foreman` and `workers` follow explicit, ordered instructions.
 - **Clean interface boundaries**
   Separate lanes for `agents`, `projects`, and `jobs`.
 - **Event visibility at each step**
@@ -51,31 +51,42 @@ flowchart LR
   J --> W[Optional git worktrees]
 ```
 
-## Start the line (3-minute onboarding)
+## Build and install
 
-### 1) Start Foreman
+Build a release binary:
 
 ```bash
-cargo build
-
-cargo run -- \
-  --codex-binary /usr/local/bin/codex \
-  --service-config /etc/foreman/config.toml \
-  --project /path/to/project/project.toml
+cargo build --release --bin foreman
 ```
 
-### 2) Validate the setup
+Install it to your user path:
 
 ```bash
-cargo run -- --service-config /etc/foreman/config.toml --validate-config
+install -Dm755 target/release/foreman ~/.local/bin/foreman
 ```
 
-### 3) Generate a starter project template
+## Quick start (minimal args)
+
+Run Foreman with only the required argument:
 
 ```bash
-cargo run -- --init-project /tmp/example-project
-cargo run -- --init-project /tmp/example-project --init-project-manual
-cargo run -- --init-project /tmp/example-project --init-project-overwrite
+foreman --project /path/to/project/project.toml
+```
+
+Defaults:
+
+- `--codex-binary` defaults to `codex`
+- `--service-config` defaults to `~/.foreman/config.toml`
+
+Optional setup commands:
+
+```bash
+foreman --validate-config
+foreman --init-project /tmp/example-project
+# optional: also generate MANUAL.md
+foreman --init-project /tmp/example-project --with-manual
+# optional: overwrite existing scaffold files
+foreman --init-project /tmp/example-project --init-project-overwrite
 ```
 
 Template directory defaults to `templates/`. Override when your plant has custom manifests:
@@ -189,6 +200,28 @@ timeout_ms = 10_000
 ```
 
 For webhook integrations, configure `type = "webhook"`, `url`, `secret_env`, and event filters.
+
+### Project-local callback profiles (`project.toml`)
+
+You can now define callback profiles directly in a project and reference them from lifecycle/worker/foreman callback specs.
+
+```toml
+[callbacks.profiles.on_worker_done]
+type = "command"
+program = "/home/cmd/bin/on_worker_done.sh"
+args = ["--project", "{{project_id}}", "--worker", "{{worker_id}}"]
+events = ["worker_completed"]
+timeout_ms = 10000
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "on_worker_done"
+callback_events = ["worker_completed"]
+```
+
+Resolution order:
+
+- project-local `callbacks.profiles.<name>` (in `project.toml`)
+- service-level `callbacks.profiles.<name>` (in `~/.foreman/config.toml`)
 
 ## Operating requirements
 

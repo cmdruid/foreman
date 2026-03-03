@@ -2,7 +2,8 @@ pub const APP_NAME: &str = "foreman";
 pub const APP_DESCRIPTION: &str = "foreman";
 
 pub const DEFAULT_CODEX_BINARY: &str = "codex";
-pub const DEFAULT_SERVICE_CONFIG_PATH: &str = "/etc/foreman/config.toml";
+pub const DEFAULT_SERVICE_CONFIG_FILENAME: &str = "config.toml";
+pub const DEFAULT_SERVICE_CONFIG_PATH: &str = "~/.foreman/config.toml";
 pub const DEFAULT_LOG_FILTER: &str = "foreman=debug";
 
 pub const FOREMAN_RUNTIME_DIR: &str = ".foreman";

@@ -34,7 +34,7 @@ fn e2e_init_project_scaffold_with_manual() {
     let status = Command::new(&binary)
         .arg("--init-project")
         .arg(&target)
-        .arg("--init-project-manual")
+        .arg("--with-manual")
         .arg("--init-project-overwrite")
         .status()
         .expect("run init project");
@@ -163,4 +163,26 @@ fn e2e_service_config_fixtures() {
         .status()
         .expect("validate invalid auth config");
     assert!(!invalid_auth_status.success());
+}
+
+#[test]
+fn e2e_help_reflects_new_defaults_and_flags() {
+    let binary = common::binary_path("foreman");
+    let output = Command::new(&binary)
+        .arg("--help")
+        .output()
+        .expect("run --help");
+    assert!(output.status.success());
+
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("[default: codex]"),
+        "help should advertise default codex binary"
+    );
+    assert!(
+        help.contains(".foreman/config.toml"),
+        "help should advertise project-local default service config path"
+    );
+    assert!(help.contains("--with-manual"));
+    assert!(!help.contains("--init-project-manual"));
 }

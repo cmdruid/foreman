@@ -4,6 +4,15 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+- Hardened callback and lifecycle behavior in project orchestration, including clearer status handling for worker completion/abort paths.
+- Improved project callback profile resolution and dispatch behavior between project-local and service-level profiles.
+- Updated CLI/docs defaults and examples to match current `foreman` workflows and project-first usage.
+- Expanded integration and e2e coverage for:
+  - project foreman send/steer endpoints
+  - job listing/wait/result behavior
+  - auth header/token permutations
+  - project-local and global callback fallback/override paths
+  - worker-aborted lifecycle callback handling
 - Added a release-consistency test that verifies release metadata tracks package version.
 - Added `CHANGELOG.md` and expanded release validation guidance for official release quality.
 

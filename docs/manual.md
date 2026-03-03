@@ -20,40 +20,43 @@ you define every worker prompt, then the foreman runs those workers.
 ## 2) Run and Validate
 
 ```bash
-cargo run -- \
-  --codex-binary /usr/local/bin/codex \
+foreman \
   --config /path/to/codex/config/override.toml \
-  --service-config /etc/foreman/config.toml \
   --project /tmp/project/project.toml
 ```
 
 `foreman` always starts and manages a local `codex app-server` process using
 JSON-RPC over stdio.
 
+Defaults:
+
+- `--codex-binary` defaults to `codex`
+- `--service-config` defaults to `~/.foreman/config.toml`
+
 State is persisted to `--state-path` after most mutations and reloaded automatically at startup. When `--state-path` is omitted, it defaults to `<project-dir>/.foreman/foreman-state.json` using the path from `--project`.
 
 Initialize a starter project scaffold:
 
 ```bash
-cargo run -- --init-project /tmp/example-project
+foreman --init-project /tmp/example-project
 ```
 
 Include an agent operating manual in the scaffold:
 
 ```bash
-cargo run -- --init-project /tmp/example-project --init-project-manual
+foreman --init-project /tmp/example-project --with-manual
 ```
 
 Force overwrite existing scaffold files:
 
 ```bash
-cargo run -- --init-project /tmp/example-project --init-project-overwrite
+foreman --init-project /tmp/example-project --init-project-overwrite
 ```
 
 Validate service callback config:
 
 ```bash
-cargo run -- --service-config /etc/foreman/config.toml --validate-config
+foreman --validate-config
 ```
 
 `--validate-config` loads and validates the service callback config and exits without starting the daemon.
@@ -237,7 +240,7 @@ rm -f "$STATE_FILE" "$SERV_CONF"
 
 ## 3) Service Configuration
 
-`foreman` uses a global callback config file, defaulting to `/etc/foreman/config.toml`.
+`foreman` uses a global callback config file, defaulting to `~/.foreman/config.toml`.
 
 Example:
 
@@ -310,6 +313,32 @@ skip_paths = ["/health"] # optional
 ```
 
 When auth is enabled, all non-health routes require the configured header.
+
+### 3.1 Project-local callback profiles
+
+Projects can define local callback profiles in `project.toml` and reuse them in project callback specs.
+
+Example:
+
+```toml
+[callbacks.profiles.on_worker_done]
+type = "command"
+program = "/home/cmd/bin/on_worker_done.sh"
+args = ["--project", "{{project_id}}", "--worker", "{{worker_id}}"]
+events = ["worker_completed"]
+timeout_ms = 10000
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "on_worker_done"
+callback_events = ["worker_completed"]
+```
+
+Profile resolution order:
+
+- project-local profile in `project.toml`
+- service-level profile in `~/.foreman/config.toml`
+
+This allows project-specific callback behavior without removing shared global profiles.
 
 Service config schema is implemented in `src/config.rs` as:
 

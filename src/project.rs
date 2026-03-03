@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, path::Path, path::PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::constants;
+use crate::{config::CallbackProfile, constants};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
@@ -42,6 +42,8 @@ impl Default for ProjectPrompts {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectCallbacks {
+    #[serde(default)]
+    pub profiles: HashMap<String, CallbackProfile>,
     #[serde(default)]
     pub worker: CallbackSpec,
     #[serde(default)]
