@@ -1,7 +1,7 @@
 //! `codex-api` is the low-level JSON-RPC client boundary for the local `codex` app-server.
 //!
 //! This crate owns wire-format protocol types and the transport-level `AppServerClient`
-//! used by `codex-foreman`.
+//! used by `foreman`.
 //!
 //! The supported runtime methods are intentionally narrow:
 //! - `initialize`
@@ -23,6 +23,7 @@
 //! - `item/tool/call`
 pub mod client;
 pub mod protocol;
+pub mod constants;
 
 pub use client::{
     AppServerClient, EmptyResponse, RawNotification, TextPayload, ThreadStartRequest,

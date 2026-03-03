@@ -225,6 +225,12 @@ pub struct ProjectState {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectCallbackStatusResponse {
+    pub project_id: Uuid,
+    pub callbacks: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JobState {
     pub id: Uuid,
     pub project_id: Option<Uuid>,

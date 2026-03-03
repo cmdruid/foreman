@@ -1,5 +1,4 @@
-# Project configuration for foreman
-name = "my-project"
+name = "valid-project"
 
 [prompts]
 foreman_file = "FOREMAN.md"
@@ -8,21 +7,27 @@ runbook_file = "RUNBOOK.md"
 handoff_file = "HANDOFF.md"
 
 [callbacks.worker]
-# Optional: callback_profile = "openclaw"
+callback_profile = "record_cmd"
+callback_events = ["turn/completed", "turn/aborted"]
 
 [callbacks.foreman]
-# Optional: callback_profile = "openclaw"
+callback_profile = "record_webhook"
+callback_events = ["turn/completed"]
 
 [callbacks.bubble_up]
-# Optional: callback_profile = "openclaw"
-# Optional: callback_events = ["turn/completed", "turn/aborted"]
+callback_profile = "record_webhook"
+callback_events = ["turn/completed"]
 
 [callbacks.lifecycle.start]
+
 [callbacks.lifecycle.compact]
+
 [callbacks.lifecycle.stop]
+
 [callbacks.lifecycle.worker_completed]
+
 [callbacks.lifecycle.worker_aborted]
 
 [policy]
-compact_after_turns = 10
+compact_after_turns = 1
 bubble_up_events = ["turn/completed", "turn/aborted"]

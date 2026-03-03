@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::models::{AgentEventDto, AgentResult};
 use crate::project::ProjectConfig;
+use crate::constants;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -21,7 +22,7 @@ pub struct PersistedState {
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: constants::PERSISTED_STATE_VERSION,
             generated_at: now_ts(),
             agents: Vec::new(),
             projects: Vec::new(),
@@ -42,7 +43,7 @@ impl PersistedState {
         let mut state: Self =
             serde_json::from_slice(&bytes).context("invalid persisted state JSON")?;
         if state.version == 0 {
-            state.version = 1;
+            state.version = constants::PERSISTED_STATE_VERSION;
         }
         state.generated_at = now_ts();
         Ok(state)
@@ -62,7 +63,7 @@ impl PersistedState {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("foreman-state.json");
+            .unwrap_or(constants::DEFAULT_STATE_FILENAME);
         let tmp = path.with_file_name(format!("{file_name}.{}.tmp", Uuid::new_v4()));
         let mut file = fs::File::create(&tmp)
             .await
@@ -142,6 +143,8 @@ pub struct PersistedProjectRecord {
     pub completed_worker_turns: u64,
     pub config: ProjectConfig,
     pub runtime: PersistedRuntimeFiles,
+    #[serde(default)]
+    pub lifecycle_callback_status: std::collections::HashMap<String, String>,
     pub created_at: u64,
     pub updated_at: u64,
 }

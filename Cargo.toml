@@ -1,10 +1,26 @@
 [package]
-name = "codex-foreman"
+name = "foreman"
 version = "0.1.0"
 edition = "2024"
 
 [workspace]
 members = ["crates/codex-api"]
+
+[[bin]]
+name = "fake_codex"
+path = "test/bin/fake_codex.rs"
+
+[[test]]
+name = "integration"
+path = "test/integration.rs"
+
+[[test]]
+name = "e2e"
+path = "test/e2e.rs"
+
+[[test]]
+name = "release"
+path = "test/release.rs"
 
 [dependencies]
 anyhow = "1"

@@ -1,18 +1,18 @@
-# codex-foreman Manual
+# foreman Manual
 
-This manual documents the alpha `codex-foreman` service: a control-plane that runs one `codex app-server` process and orchestrates many agents and project workflows.
+This manual documents the alpha `foreman` service: a control-plane that runs one `codex app-server` process and orchestrates many agents and project workflows.
 
-## 1) What codex-foreman Does
+## 1) What foreman Does
 
-`codex-foreman` is an HTTP server (`127.0.0.1:8787` by default) with:
+`foreman` is a Unix-domain-socket control surface (default socket path is `./.foreman/foreman.sock`) with:
 
 - `/agents` API for direct agent lifecycles
 - `/projects` API for long-running project scopes
 - callback dispatch for webhook and command profiles
-- project-scoped prompts, event callbacks, hooks, and compaction policy
+- project-scoped prompts, lifecycle callbacks, and compaction policy
 
 Agents and project foremen are backed by active Codex thread IDs.
-`codex-foreman` does not infer or create tasks automatically.
+`foreman` does not infer or create tasks automatically.
 It only spawns and tracks workers for tasks that are explicitly defined by the caller.
 Your integration should be treated as an explicit orchestration contract:
 you define every worker prompt, then the foreman runs those workers.
@@ -21,16 +21,16 @@ you define every worker prompt, then the foreman runs those workers.
 
 ```bash
 cargo run -- \
-  --bind 0.0.0.0:8787 \
   --codex-binary /usr/local/bin/codex \
   --config /path/to/codex/config/override.toml \
-  --service-config /etc/codex-foreman/config.toml
+  --service-config /etc/foreman/config.toml \
+  --project /tmp/project/project.toml
 ```
 
-`codex-foreman` always starts and manages a local `codex app-server` process using
+`foreman` always starts and manages a local `codex app-server` process using
 JSON-RPC over stdio.
 
-State is persisted to `--state-path` after most mutations and reloaded automatically at startup.
+State is persisted to `--state-path` after most mutations and reloaded automatically at startup. When `--state-path` is omitted, it defaults to `<project-dir>/.foreman/foreman-state.json` using the path from `--project`.
 
 Initialize a starter project scaffold:
 
@@ -53,7 +53,7 @@ cargo run -- --init-project /tmp/example-project --init-project-overwrite
 Validate service callback config:
 
 ```bash
-cargo run -- --service-config /etc/codex-foreman/config.toml --validate-config
+cargo run -- --service-config /etc/foreman/config.toml --validate-config
 ```
 
 `--validate-config` loads and validates the service callback config and exits without starting the daemon.
@@ -62,11 +62,11 @@ cargo run -- --service-config /etc/codex-foreman/config.toml --validate-config
 
 When running from a restricted Codex execution context, the following permissions are required for codex-agent project runs:
 
-- Bind/listen on a local TCP socket (`--bind`, default `127.0.0.1:8787`).
+- Access a local unix socket (`--socket-path` or default socket location derived from project-local `--state-path`).
 - Start a child `codex app-server` process.
 - Read/write `--state-path` (durable state recovery).
 - Read project files (`FOREMAN.md`, `WORKER.md`, `RUNBOOK.md`, `HANDOFF.md`, `project.toml`, reports).
-- Execute callback hooks/commands (if using command callbacks) and perform outbound webhook calls (if configured).
+- Execute callback commands (if using command callbacks) and perform outbound webhook calls (if configured).
 - Write callback artifacts (if callbacks include file/command targets).
 - Run foreground/background process management (start, inspect, terminate).
 
@@ -75,10 +75,10 @@ Required action before launch:
 If the runtime is restricted, request one-time external privileges for the launch command before creating project workers:
 
 ```text
-Do you want to run `codex-foreman` with external privileges for this project execution?
+Do you want to run `foreman` with external privileges for this project execution?
 ```
 
-Then execute the launch command with the caller-approved privilege path so the API server can bind and receive callbacks for the running project.
+Then execute the launch command with the caller-approved privilege path so the API server can create its unix socket and receive callbacks for the running project.
 
 If escalation is unavailable, use the existing test harness (`cargo test --test integration`) for validation instead, because tests execute without requiring a bound service process.
 
@@ -96,18 +96,23 @@ For a live generic mock project exercise using real workers, use one of the scri
 `contrib`:
 
 ```bash
-./contrib/run_mock_demo.sh
-./contrib/run_mock_mixed_demo.sh
+./contrib/demo/run_demo.sh
 ```
 
 Use cases:
 
-- `run_mock_demo.sh`: all workers receive worktree-backed tasks and emit per-category reports.
-- `run_mock_mixed_demo.sh`: mixed workers with/without worktrees in one `create_project_jobs` call.
+- `RUN_MOCK_DEMO_MODE=worktree` (default): all workers receive worktree-backed tasks and emit per-category reports.
+- `RUN_MOCK_DEMO_MODE=mixed`: mixed workers with/without worktrees in one `projects/:id/jobs` call.
+
+Helper script:
+
+```bash
+./contrib/demo/run_mixed.sh
+```
 
 You can tune timing by setting:
 
-- `PORT`
+- `FOREMAN_SOCKET_PATH`
 - `JOB_TIMEOUT_MS`
 - `JOB_POLL_MS`
 - `WORKTREE_BASE`
@@ -117,33 +122,44 @@ You can tune timing by setting:
 - `WORKER_MONITORING_MAX_RESTARTS`
 - `WORKER_MONITORING_WATCH_INTERVAL_MS`
 
-Try both modes:
+Try explicit mode runs:
 
 ```bash
-./contrib/run_mock_demo.sh
-./contrib/run_mock_mixed_demo.sh
+./contrib/demo/run_demo.sh
+RUN_MOCK_DEMO_MODE=worktree ./contrib/demo/run_demo.sh
+RUN_MOCK_DEMO_MODE=mixed ./contrib/demo/run_demo.sh
 ```
 
 Quick run recipe (mixed mode):
 
 ```bash
-PORT=8899 \
 RUN_MOCK_DEMO_MODE=mixed \
 JOB_TIMEOUT_MS=300000 \
 JOB_POLL_MS=500 \
 WORKTREE_CLEANUP=false \
-./contrib/run_mock_demo.sh
+./contrib/demo/run_demo.sh
 ```
 
 Success criteria:
 
-- All workers should reach `status=completed` in `/jobs/:id/wait` output.
-- Required deliverable files should exist in their expected worker paths.
-- A mixed run will produce both worktree and non-worktree deliverables.
+- All workers should reach a terminal state in `/jobs/:id/wait` output.
+- Terminal states are `completed` (success), `failed` (explicit failure), or `partial` (mixed outcomes).
+- If a worker fails, `failed_workers` and per-worker `completion_method=turn/aborted` should be visible in `/jobs/:id/result`.
+- Required deliverable files should exist for successful workers in their expected paths.
+- A mixed run can produce both worktree and non-worktree deliverables.
 
 Expected warning behavior:
 
 - Workers may emit `turn/completed` with empty `final_text`; this is not a failure by itself if the deliverable file exists.
+
+Failure from thread status events:
+
+- When an App Server emits `thread/status/changed` with terminal state (`aborted`, `interrupted`, `failed`, `error`, `stopped`, `timeout`, `timed_out`), foreman records the worker as failed with `completion_method=turn/aborted`.
+- Worker-level failure is surfaced in `GET /jobs/:id/result` and `GET /jobs/:id/wait` as:
+  - `workers[*].status == "failed"` or `"aborted"`
+  - `workers[*].completion_method == "turn/aborted"`
+  - `failed_workers > 0`
+- Project callbacks should include both completion and aborted worker states.
 
 ### Real-Backend Smoke Test
 
@@ -153,11 +169,11 @@ The following validates the service against a real `codex` binary (not `fake_cod
 set -euo pipefail
 
 CODEX_BIN=/home/cmd/.npm-global/bin/codex
-FOREMAN_BIN=target/debug/codex-foreman
-PORT=8895
-STATE_FILE=/tmp/codex-foreman-state-smoke.json
+FOREMAN_BIN=target/debug/foreman
+FOREMAN_SOCKET_PATH=/tmp/foreman-demo.sock
+STATE_FILE=.foreman/foreman-state-smoke.json
 SERV_CONF=/tmp/cf-smoke.toml
-PROJECT_DIR=/tmp/codex-foreman-smoke-project
+PROJECT_DIR=/tmp/foreman-smoke-project
 
 cat >"$SERV_CONF" <<'EOF'
 [callbacks]
@@ -169,37 +185,37 @@ ${FOREMAN_BIN} --init-project "$PROJECT_DIR" --init-project-overwrite
 
 # Start foreman in background for manual verification
 ${FOREMAN_BIN} \
-  --bind 127.0.0.1:$PORT \
   --codex-binary "$CODEX_BIN" \
   --service-config "$SERV_CONF" \
+  --project "$PROJECT_DIR/project.toml" \
   --state-path "$STATE_FILE" \
-  > /tmp/codex-foreman-smoke.log 2>&1 &
+  > /tmp/foreman-smoke.log 2>&1 &
 FOREMAN_PID=$!
 
 # Wait until server responds
 for i in {1..20}; do
-  if curl -fsS "http://127.0.0.1:$PORT/health" > /dev/null; then
+  if curl --unix-socket "$FOREMAN_SOCKET_PATH" -fsS "http://localhost/health" > /dev/null; then
     break
   fi
   sleep 0.25
 done
 
 # Health check
-curl -sS "http://127.0.0.1:$PORT/health"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -sS "http://localhost/health"
 
 # Standalone agent
-AGENT_ID=$(curl -sS -X POST "http://127.0.0.1:$PORT/agents" \
+AGENT_ID=$(curl --unix-socket "$FOREMAN_SOCKET_PATH" -sS -X POST "http://localhost/agents" \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"real path smoke: quick status probe"}' \
   | jq -r '.id')
-curl -sS "http://127.0.0.1:$PORT/agents/$AGENT_ID"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -sS "http://localhost/agents/$AGENT_ID"
 
 # Project route smoke
-PROJECT_ID=$(curl -sS -X POST "http://127.0.0.1:$PORT/projects" \
+PROJECT_ID=$(curl --unix-socket "$FOREMAN_SOCKET_PATH" -sS -X POST "http://localhost/projects" \
   -H 'Content-Type: application/json' \
   -d "$(jq -cn --arg p "$PROJECT_DIR" '{path:$p}')" \
   | jq -r '.project_id')
-curl -sS -X POST "http://127.0.0.1:$PORT/projects/$PROJECT_ID/workers" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -sS -X POST "http://localhost/projects/$PROJECT_ID/workers" \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"real project worker smoke"}'
 ```
@@ -221,7 +237,7 @@ rm -f "$STATE_FILE" "$SERV_CONF"
 
 ## 3) Service Configuration
 
-`codex-foreman` uses a global callback config file, defaulting to `/etc/codex-foreman/config.toml`.
+`foreman` uses a global callback config file, defaulting to `/etc/foreman/config.toml`.
 
 Example:
 
@@ -305,7 +321,7 @@ Service config schema is implemented in `src/config.rs` as:
 
 ## 4) API
 
-Base URL examples below: `http://127.0.0.1:8787`.
+Base URL examples below: `http://localhost` (with `--unix-socket "$FOREMAN_SOCKET_PATH"`).
 
 ### 4.1 Health
 
@@ -330,19 +346,19 @@ Base URL examples below: `http://127.0.0.1:8787`.
 Wait for terminal result with event preview:
 
 ```bash
-curl "http://127.0.0.1:8787/agents/8a6f.../wait?timeout_ms=120000&poll_ms=500&include_events=true"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" "http://localhost/agents/8a6f.../wait?timeout_ms=120000&poll_ms=500&include_events=true"
 ```
 
 Fetch only the last 20 events:
 
 ```bash
-curl "http://127.0.0.1:8787/agents/8a6f.../events?tail=20"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" "http://localhost/agents/8a6f.../events?tail=20"
 ```
 
 Get deterministic result only:
 
 ```bash
-curl "http://127.0.0.1:8787/agents/8a6f.../result"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" "http://localhost/agents/8a6f.../result"
 ```
 
 
@@ -419,7 +435,7 @@ POST /agents/8a6f.../interrupt
   - `status`
   - `foreman_pid`
   - `app_server_pid`
-  - `bind`
+  - `socket_path`
   - configured callback counts
   - `agent_count`, `project_count`
   - `uptime_seconds`
@@ -430,10 +446,10 @@ Example:
 {
   "status": "ready",
   "foreman_pid": 12345,
-  "bind": "127.0.0.1:8787",
+  "socket_path": "./.foreman/foreman.sock",
   "version": "0.1.0",
   "codex_binary": "/usr/local/bin/codex",
-  "state_path": "/var/lib/codex-foreman/foreman-state.json",
+  "state_path": "./.foreman/foreman-state.json",
   "app_server_pid": 12346,
   "callback_profiles": 2,
   "default_callback_profile": "openclaw",
@@ -451,6 +467,7 @@ Project management is the new alpha control-plane layer.
 - `POST /projects` → create project and spawn foreman agent
 - `GET /projects` → list projects
 - `GET /projects/:id` → get project state
+- `GET /projects/:id/callback-status` → get lifecycle callback status map
 - `DELETE /projects/:id` → close project and all agents
 - `POST /projects/:id/workers` → spawn a worker under project
 - `POST /projects/:id/foreman/send` → send prompt/callback updates to foreman
@@ -471,7 +488,7 @@ POST /projects
 {
   "path": "/path/to/project",
   "start_prompt": "Boot with context from onboarding notes.",
-  "model": "gpt-4o-mini",
+  "model": "gpt-5.3-codex-spark",
   "callback_overrides": {
     "callback_profile": "openclaw"
   }
@@ -495,7 +512,7 @@ Response:
 POST /projects/3f02.../workers
 {
   "prompt": "Investigate latest test failure logs and summarize.",
-  "model": "gpt-4o-mini"
+  "model": "gpt-5.3-codex-spark"
 }
 ```
 
@@ -543,6 +560,13 @@ When you need deterministic behavior, avoid generic handoff prompts and send dir
 - `GET /jobs/:id/result` → get aggregate + per-worker result payload
 - `GET /jobs/:id/wait` → wait for job terminal completion with optional `include_workers`, `timeout_ms`, `poll_ms`
 
+Job results are terminal only when workers stop producing events and are marked in one of:
+- `completed`
+- `partial`
+- `failed`
+
+`partial` means at least one worker completed and at least one worker failed.
+
 ## 5) Project Configuration and Files
 
 Each project folder may include `project.toml` (optional; defaults are used if missing). The folder must contain prompt files (`FOREMAN.md`, `WORKER.md`, `RUNBOOK.md`) unless changed via config.
@@ -577,12 +601,25 @@ callback_profile = "openclaw_webhook"
 callback_profile = "openclaw"
 callback_events = ["turn/completed", "turn/aborted"]
 
-[hooks]
-on_project_start = "scripts/on_project_start.sh"
-on_worker_completed = "scripts/worker_done.sh"
-on_worker_aborted = "scripts/worker_aborted.sh"
-on_project_compaction = "scripts/on_compact.sh"
-on_project_stop = "scripts/on_stop.sh"
+[callbacks.lifecycle.start]
+callback_profile = "openclaw_webhook"
+callback_events = ["turn/completed"]
+
+[callbacks.lifecycle.compact]
+callback_profile = "openclaw_webhook"
+callback_events = ["turn/completed"]
+
+[callbacks.lifecycle.stop]
+callback_profile = "openclaw_webhook"
+callback_events = ["turn/completed"]
+
+[callbacks.lifecycle.worker_completed]
+callback_profile = "openclaw"
+callback_events = ["turn/completed"]
+
+[callbacks.lifecycle.worker_aborted]
+callback_profile = "openclaw"
+callback_events = ["turn/aborted"]
 
 [policy]
 compact_after_turns = 10
@@ -594,12 +631,15 @@ bubble_up_events = ["turn/completed", "turn/aborted"]
 - `callbacks.worker`: applies to project workers
 - `callbacks.foreman`: applies to project foreman
 - `callbacks.bubble_up`: executes through the same callback system when configured
-- `hooks.on_*`: shell commands run via `sh -lc` with environment variable template injection.
-  Hook templates use `{{token}}` replacement and fail if any token cannot be resolved.
+- `callbacks.lifecycle.start`: runs on project creation
+- `callbacks.lifecycle.compact`: runs when compact is executed
+- `callbacks.lifecycle.stop`: runs when project closes
+- `callbacks.lifecycle.worker_completed`: runs on worker terminal completion
+- `callbacks.lifecycle.worker_aborted`: runs on worker terminal failure
 - `policy.compact_after_turns`: triggers auto-compaction after N completed/aborted worker turns
 - `policy.bubble_up_events`: event allow-list for optional bubble-up callbacks
 
-Hook payload variables available to shell hooks:
+Payload variables available to callback templates:
 
 - `project_id`, `project_path`, `project_name`, `project_status`
 - `event_payload` (where available)
@@ -662,7 +702,7 @@ Result payload includes an optional canonical result object on completion-orient
 
 ### 6.2 Command callback prefix and payload injection
 
-For command profiles, `codex-foreman` builds a text payload:
+For command profiles, `foreman` builds a text payload:
 
 - `event_prompt = <callback_prompt_prefix> + <compact JSON of params>`
 - this is injected as `event_prompt` by default
@@ -680,7 +720,7 @@ Template replacement applies to:
 - profile `program`
 - profile/command `args`
 - profile `env`
-- project hook command strings
+- callback command/profile templates
 
 Useful variable names:
 
@@ -699,7 +739,7 @@ This is the simplest reliable format for OpenClaw-style callback agents.
 
 ## 7) Lifecycle and Cleanup
 
-- Closing a project calls its configured stop hook, then closes tracked workers and foreman.
+- Closing a project calls its configured stop lifecycle callback, then closes tracked workers and foreman.
 - Worker/agent callbacks are best-effort: callback failures are logged and do not fail the originating API call.
 - Agent/project metadata is persisted to disk for best-effort restart recovery.
 

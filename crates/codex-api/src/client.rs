@@ -15,6 +15,7 @@ use crate::protocol::{
     JSONRPCError, JSONRPCErrorError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest,
     JSONRPCResponse, RequestId, parse_thread_id, parse_turn_id,
 };
+use crate::constants;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,13 +199,6 @@ pub struct AppServerClient {
 }
 
 impl AppServerClient {
-    const CONNECT_RETRY_ATTEMPTS: usize = 3;
-    const CONNECT_RETRY_DELAY_MS: u64 = 250;
-    #[allow(dead_code)]
-    const INITIALIZE_TIMEOUT_MS: u64 = 5_000;
-    #[allow(dead_code)]
-    const REQUEST_TIMEOUT_MS: u64 = 30_000;
-
     pub fn app_server_pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|child| child.id())
     }
@@ -219,8 +213,8 @@ impl AppServerClient {
             codex_binary,
             config_overrides,
             event_tx,
-            Self::INITIALIZE_TIMEOUT_MS,
-            Self::REQUEST_TIMEOUT_MS,
+            constants::DEFAULT_INITIALIZE_TIMEOUT_MS,
+            constants::DEFAULT_REQUEST_TIMEOUT_MS,
         )
         .await
     }
@@ -234,7 +228,7 @@ impl AppServerClient {
     ) -> Result<Arc<Self>> {
         let mut last_error: Option<anyhow::Error> = None;
 
-        for attempt in 1..=Self::CONNECT_RETRY_ATTEMPTS {
+        for attempt in 1..=constants::CONNECT_RETRY_ATTEMPTS {
             match Self::connect_once_with_timeouts(
                 codex_binary,
                 config_overrides,
@@ -245,10 +239,10 @@ impl AppServerClient {
             .await
             {
                 Ok(client) => return Ok(client),
-                Err(err) if attempt < Self::CONNECT_RETRY_ATTEMPTS => {
+                Err(err) if attempt < constants::CONNECT_RETRY_ATTEMPTS => {
                     warn!(attempt, %err, "app-server connect attempt failed, retrying");
                     last_error = Some(err);
-                    time::sleep(Duration::from_millis(Self::CONNECT_RETRY_DELAY_MS)).await;
+                    time::sleep(Duration::from_millis(constants::CONNECT_RETRY_DELAY_MS)).await;
                 }
                 Err(err) => {
                     return Err(err);
@@ -338,8 +332,8 @@ impl AppServerClient {
     async fn initialize(&self) -> Result<()> {
         let params = serde_json::json!({
             "clientInfo": {
-                "name": "codex-foreman",
-                "title": "Codex Foreman",
+                "name": constants::CLIENT_NAME,
+                "title": constants::CLIENT_TITLE,
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
@@ -347,8 +341,8 @@ impl AppServerClient {
             },
         });
 
-        let _: serde_json::Value = self.request("initialize", &params).await?;
-        self.notify("initialized", &serde_json::Value::Null).await?;
+        let _: serde_json::Value = self.request(constants::METHOD_INITIALIZE, &params).await?;
+        self.notify(constants::METHOD_INITIALIZED, &serde_json::Value::Null).await?;
         Ok(())
     }
 
@@ -402,30 +396,30 @@ impl AppServerClient {
     }
 
     pub async fn thread_start(&self, request: &ThreadStartRequest) -> Result<ThreadStartResponse> {
-        self.request("thread/start", request).await
+        self.request(constants::METHOD_THREAD_START, request).await
     }
 
     pub async fn turn_start(&self, request: &TurnStartRequest) -> Result<TurnStartResponse> {
-        self.request("turn/start", request).await
+        self.request(constants::METHOD_TURN_START, request).await
     }
 
     pub async fn turn_steer(&self, request: &TurnSteerRequest) -> Result<TurnSteerResponse> {
-        self.request("turn/steer", request).await
+        self.request(constants::METHOD_TURN_STEER, request).await
     }
 
     pub async fn turn_interrupt(&self, request: &TurnInterruptRequest) -> Result<EmptyResponse> {
-        self.request("turn/interrupt", request).await
+        self.request(constants::METHOD_TURN_INTERRUPT, request).await
     }
 
     pub async fn thread_interrupt(
         &self,
         request: &ThreadInterruptRequest,
     ) -> Result<serde_json::Value> {
-        self.request("thread/interrupt", request).await
+        self.request(constants::METHOD_THREAD_INTERRUPT, request).await
     }
 
     pub async fn model_list(&self) -> Result<ModelListResponse> {
-        self.request("model/list", &ModelListRequest {}).await
+        self.request(constants::METHOD_MODEL_LIST, &ModelListRequest {}).await
     }
 
     async fn fail_all_pending(&self, reason: String) {
@@ -506,13 +500,13 @@ impl AppServerClient {
         let method = request.method.as_str();
         let response = if matches!(
             method,
-            "item/commandExecution/requestApproval"
-                | "item/fileChange/requestApproval"
-                | "item/requestUserInput"
-                | "item/tool/requestUserInput"
+            constants::SERVER_REQUEST_METHOD_COMMAND_EXECUTION
+                | constants::SERVER_REQUEST_METHOD_FILE_CHANGE
+                | constants::SERVER_REQUEST_METHOD_REQUEST_USER_INPUT
+                | constants::SERVER_REQUEST_METHOD_TOOL_REQUEST_USER_INPUT
         ) {
             Some(serde_json::json!({"decision": "accept"}))
-        } else if method == "item/tool/call" {
+        } else if method == constants::SERVER_REQUEST_METHOD_TOOL_CALL {
             Some(serde_json::json!({"success": true, "content_items": []}))
         } else {
             None
@@ -530,14 +524,14 @@ impl AppServerClient {
             "method": request.method,
             "threadId": parse_thread_id(&request.params.unwrap_or(serde_json::Value::Null))
                 .unwrap_or_default(),
-            "status": "unhandled",
+            "status": constants::REQUEST_STATUS_UNHANDLED,
         });
 
         let reply = JSONRPCMessage::Error(JSONRPCError {
             id: request.id,
             error: JSONRPCErrorError {
-                code: -32601,
-                message: "Request not handled by codex-foreman".to_string(),
+                code: constants::REQUEST_NOT_HANDLED_ERROR_CODE,
+                message: constants::REQUEST_NOT_HANDLED_ERROR_MESSAGE.to_string(),
                 data: Some(data),
             },
         });
@@ -917,7 +911,7 @@ async fn connect_stdio(
     config_overrides: &[String],
 ) -> Result<(Child, Arc<Mutex<BufWriter<ChildStdin>>>, ChildStdout)> {
     let mut cmd = Command::new(codex_binary);
-    cmd.arg("app-server");
+    cmd.arg(constants::APP_SERVER_COMMAND);
     for override_kv in config_overrides {
         cmd.arg("--config").arg(override_kv);
     }

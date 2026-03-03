@@ -2,12 +2,12 @@ mod config;
 mod events;
 mod foreman;
 mod models;
+mod constants;
 mod project;
 mod state;
 
 use std::{
     fs,
-    net::SocketAddr,
     path::{Path as StdPath, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
@@ -34,19 +34,19 @@ use uuid::Uuid;
 use codex_api::AppServerClient;
 use config::{CallbackProfile, RuntimeAuthConfig, ServiceConfig};
 use foreman::Foreman;
+use constants as consts;
 use models::{
     CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, SendAgentInput,
     SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest, SteerAgentInput,
 };
-use project::PROJECT_CONFIG_FILE;
 use state::PersistedState;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "codex-foreman")]
+#[command(author, version, about = consts::APP_DESCRIPTION)]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:8787")]
-    bind: String,
-    #[arg(long, default_value = "codex")]
+    #[arg(long)]
+    socket_path: Option<String>,
+    #[arg(long, default_value_t = consts::DEFAULT_CODEX_BINARY.to_string())]
     codex_binary: String,
     #[arg(long)]
     config: Vec<String>,
@@ -58,19 +58,21 @@ struct Args {
     init_project_manual: bool,
     #[arg(long, value_name = "PATH")]
     template_dir: Option<String>,
-    #[arg(long, default_value = "/etc/codex-foreman/config.toml")]
+    #[arg(long = "project", value_name = "PATH")]
+    project: Option<PathBuf>,
+    #[arg(long, default_value_t = consts::DEFAULT_SERVICE_CONFIG_PATH.to_string())]
     service_config: String,
     #[arg(long)]
     validate_config: bool,
-    #[arg(long, default_value = "/var/lib/codex-foreman/foreman-state.json")]
-    state_path: PathBuf,
+    #[arg(long)]
+    state_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     foreman: Arc<Foreman>,
     security: Option<RuntimeAuthConfig>,
-    bind: String,
+    socket_path: String,
     codex_binary: String,
     state_path: String,
 }
@@ -83,9 +85,9 @@ struct ErrorBody {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
-        "codex_foreman=debug"
+        consts::DEFAULT_LOG_FILTER
             .parse::<tracing_subscriber::filter::Directive>()
-            .context("failed to parse built-in codex_foreman log directive")?,
+        .context("failed to parse built-in foreman log directive")?,
     );
 
     tracing_subscriber::registry()
@@ -114,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     let warnings = service_config.validate()?;
     if args.validate_config {
         println!(
-            "codex-foreman config validated: {} callback profile(s) loaded",
+            "foreman config validated: {} callback profile(s) loaded",
             service_config.callbacks.profiles.len()
         );
         for (name, profile) in &service_config.callbacks.profiles {
@@ -152,14 +154,36 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let persisted_state = PersistedState::load(&args.state_path)
+    let project_path = if args.init_project.is_none() && !args.validate_config {
+        args.project
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "--project <path-to-project.toml> is required unless --init-project or --validate-config is used"
+                )
+            })?
+    } else {
+        PathBuf::new()
+    };
+
+    let project_state_path = args.state_path.unwrap_or_else(|| {
+        let project_directory = project_path.parent().unwrap_or_else(|| StdPath::new("."));
+        project_directory
+            .join(consts::FOREMAN_RUNTIME_DIR)
+            .join(consts::DEFAULT_STATE_FILENAME)
+    });
+
+    let persisted_state = PersistedState::load(&project_state_path)
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(%err, "failed to load persisted state, starting with empty state");
             PersistedState::default()
         });
+    let socket_path = resolve_socket_path(&args.socket_path, &project_state_path)?;
+    cleanup_socket_path(&socket_path)?;
 
-    let (event_tx, event_rx) = broadcast::channel(256);
+    let (event_tx, event_rx) = broadcast::channel(consts::BROADCAST_CHANNEL_CAPACITY);
     let security = service_config.resolve_auth_config()?;
     let (initialize_timeout_ms, request_timeout_ms) = service_config.app_server_timeouts();
     let client = AppServerClient::connect_with_timeouts(
@@ -175,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         event_rx,
         service_config.clone(),
         persisted_state,
-        args.state_path.clone(),
+        project_state_path.clone(),
     );
     foreman
         .recover_state()
@@ -184,48 +208,120 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         foreman,
         security,
-        bind: args.bind.clone(),
+        socket_path: socket_path.to_string_lossy().to_string(),
         codex_binary: args.codex_binary.clone(),
-        state_path: args.state_path.to_string_lossy().to_string(),
+        state_path: project_state_path.to_string_lossy().to_string(),
     };
 
     let app = Router::new()
-        .route("/health", get(health))
-        .route("/agents", post(spawn_agent).get(list_agents))
-        .route("/agents/{id}", get(get_agent).delete(close_agent))
-        .route("/agents/{id}/result", get(get_agent_result))
-        .route("/agents/{id}/wait", get(wait_agent_result))
-        .route("/agents/{id}/events", get(get_agent_events))
-        .route("/agents/{id}/send", post(send_turn))
-        .route("/agents/{id}/steer", post(steer_agent))
-        .route("/agents/{id}/interrupt", post(interrupt_agent))
-        .route("/projects", post(create_project).get(list_projects))
-        .route("/projects/{id}", get(get_project).delete(close_project))
-        .route("/projects/{id}/workers", post(spawn_project_worker))
+        .route(consts::HEALTH_ROUTE, get(health))
+        .route(consts::ROUTE_AGENTS, post(spawn_agent).get(list_agents))
+        .route(consts::ROUTE_AGENT_ID, get(get_agent).delete(close_agent))
+        .route(consts::ROUTE_AGENT_RESULT, get(get_agent_result))
+        .route(consts::ROUTE_AGENT_WAIT, get(wait_agent_result))
+        .route(consts::ROUTE_AGENT_EVENTS, get(get_agent_events))
+        .route(consts::ROUTE_AGENT_SEND, post(send_turn))
+        .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
+        .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
+        .route(consts::ROUTE_PROJECTS, post(create_project).get(list_projects))
+        .route(consts::ROUTE_PROJECT_ID, get(get_project).delete(close_project))
         .route(
-            "/projects/{id}/foreman/send",
+            consts::ROUTE_PROJECT_CALLBACK_STATUS,
+            get(get_project_callback_status),
+        )
+        .route(consts::ROUTE_PROJECT_WORKERS, post(spawn_project_worker))
+        .route(
+            consts::ROUTE_PROJECT_FOREMAN_SEND,
             post(send_project_foreman_turn),
         )
-        .route("/projects/{id}/foreman/steer", post(steer_project_foreman))
-        .route("/projects/{id}/compact", post(compact_project))
-        .route("/projects/{id}/jobs", post(create_project_jobs))
-        .route("/jobs", get(list_jobs))
-        .route("/jobs/{id}", get(get_job))
-        .route("/jobs/{id}/result", get(get_job_result))
-        .route("/jobs/{id}/wait", get(wait_job_result))
-        .route("/status", get(get_status))
+        .route(
+            consts::ROUTE_PROJECT_FOREMAN_STEER,
+            post(steer_project_foreman),
+        )
+        .route(consts::ROUTE_PROJECT_COMPACT, post(compact_project))
+        .route(consts::ROUTE_PROJECT_JOBS, post(create_project_jobs))
+        .route(consts::ROUTE_JOBS, get(list_jobs))
+        .route(consts::ROUTE_JOB_ID, get(get_job))
+        .route(consts::ROUTE_JOB_RESULT, get(get_job_result))
+        .route(consts::ROUTE_JOB_WAIT, get(wait_job_result))
+        .route(consts::STATUS_ROUTE, get(get_status))
         .with_state(state.clone())
         .layer(from_fn_with_state(state.clone(), require_api_auth));
 
-    let addr: SocketAddr = args
-        .bind
-        .parse()
-        .context("failed to parse --bind address")?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    #[cfg(not(unix))]
+    return Err(anyhow::anyhow!(
+        "foreman now requires unix sockets, which are unsupported on this platform"
+    ));
 
-    tracing::info!(%addr, "codex-foreman listening");
-    axum::serve(listener, app).await?;
+    #[cfg(unix)]
+    {
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .with_context(|| format!("failed to bind unix socket '{}'", socket_path.display()))?;
+        set_socket_permissions(&socket_path)?;
+        tracing::info!(socket = ?socket_path, "foreman listening on Unix socket");
+        axum::serve(listener, app).await?;
+    }
+    Ok(())
+}
 
+fn resolve_socket_path(socket_path: &Option<String>, state_path: &PathBuf) -> anyhow::Result<PathBuf> {
+    if let Some(path) = socket_path {
+        return Ok(StdPath::new(path).to_path_buf());
+    }
+
+    let state_dir = state_path
+        .parent()
+        .unwrap_or_else(|| StdPath::new(consts::DEFAULT_WORKING_DIRECTORY));
+    if !state_dir.exists() {
+        fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "create state directory '{}' for derived socket path",
+                state_dir.display()
+            )
+        })?;
+    }
+
+    Ok(state_dir.join(consts::FOREMAN_SOCKET_FILENAME))
+}
+
+#[cfg(unix)]
+fn cleanup_socket_path(path: &StdPath) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    if path.exists() {
+        let file_type = fs::symlink_metadata(path)
+            .with_context(|| format!("read metadata for '{}'", path.display()))?
+            .file_type();
+        if !file_type.is_file() && !file_type.is_socket() {
+            return Err(anyhow::anyhow!(
+                "socket path '{}' exists and is not a regular file or socket",
+                path.display()
+            ));
+        }
+        fs::remove_file(path)
+            .with_context(|| format!("remove existing socket path '{}'", path.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cleanup_socket_path(_path: &StdPath) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_socket_permissions(path: &StdPath) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(consts::FOREMAN_SOCKET_PERMISSIONS)).with_context(|| {
+        format!("set socket permissions for '{}'", path.display())
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_socket_permissions(_path: &StdPath) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -275,7 +371,7 @@ fn verify_codex_binary_version(
 }
 
 async fn health() -> &'static str {
-    "ok"
+    consts::STATUS_OK
 }
 
 async fn require_api_auth(
@@ -432,7 +528,7 @@ async fn get_agent_events(
 struct StatusResponse {
     status: &'static str,
     foreman_pid: u32,
-    bind: String,
+    socket_path: String,
     version: &'static str,
     codex_binary: String,
     state_path: String,
@@ -451,9 +547,9 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let app_server_pid = state.foreman.app_server_pid().await;
 
     Json(StatusResponse {
-        status: "ready",
+        status: consts::FOREMAN_STATUS_READY,
         foreman_pid: std::process::id(),
-        bind: state.bind,
+        socket_path: state.socket_path,
         version: env!("CARGO_PKG_VERSION"),
         codex_binary: state.codex_binary,
         state_path: state.state_path,
@@ -532,6 +628,16 @@ async fn get_project(
     Path(project_id): Path<Uuid>,
 ) -> impl IntoResponse {
     match state.foreman.get_project(project_id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(err) => error_response(StatusCode::NOT_FOUND, err),
+    }
+}
+
+async fn get_project_callback_status(
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.foreman.get_project_callback_status(project_id).await {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response(StatusCode::NOT_FOUND, err),
     }
@@ -684,51 +790,51 @@ fn init_project(
     let mut created_files = Vec::new();
 
     write_template_file(
-        path.join(PROJECT_CONFIG_FILE),
-        &read_template_file(template_dir, "project.toml")?,
+        path.join(consts::PROJECT_CONFIG_FILE),
+        &read_template_file(template_dir, consts::PROJECT_CONFIG_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join(PROJECT_CONFIG_FILE).display().to_string());
+    created_files.push(path.join(consts::PROJECT_CONFIG_FILE).display().to_string());
 
     write_template_file(
-        path.join("FOREMAN.md"),
-        &read_template_file(template_dir, "FOREMAN.md")?,
+        path.join(consts::DEFAULT_FOREMAN_PROMPT_FILE),
+        &read_template_file(template_dir, consts::DEFAULT_FOREMAN_PROMPT_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join("FOREMAN.md").display().to_string());
+    created_files.push(path.join(consts::DEFAULT_FOREMAN_PROMPT_FILE).display().to_string());
 
     write_template_file(
-        path.join("WORKER.md"),
-        &read_template_file(template_dir, "WORKER.md")?,
+        path.join(consts::DEFAULT_WORKER_PROMPT_FILE),
+        &read_template_file(template_dir, consts::DEFAULT_WORKER_PROMPT_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join("WORKER.md").display().to_string());
+    created_files.push(path.join(consts::DEFAULT_WORKER_PROMPT_FILE).display().to_string());
 
     write_template_file(
-        path.join("RUNBOOK.md"),
-        &read_template_file(template_dir, "RUNBOOK.md")?,
+        path.join(consts::DEFAULT_RUNBOOK_FILE),
+        &read_template_file(template_dir, consts::DEFAULT_RUNBOOK_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join("RUNBOOK.md").display().to_string());
+    created_files.push(path.join(consts::DEFAULT_RUNBOOK_FILE).display().to_string());
 
     write_template_file(
-        path.join("HANDOFF.md"),
-        &read_template_file(template_dir, "HANDOFF.md")?,
+        path.join(consts::DEFAULT_HANDOFF_FILE),
+        &read_template_file(template_dir, consts::DEFAULT_HANDOFF_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join("HANDOFF.md").display().to_string());
+    created_files.push(path.join(consts::DEFAULT_HANDOFF_FILE).display().to_string());
 
     if include_manual {
         write_template_file(
-            path.join("MANUAL.md"),
-            &read_template_file(template_dir, "MANUAL.md")?,
+            path.join(consts::DEFAULT_MANUAL_FILE),
+            &read_template_file(template_dir, consts::DEFAULT_MANUAL_FILE)?,
             overwrite,
         )?;
-        created_files.push(path.join("MANUAL.md").display().to_string());
+        created_files.push(path.join(consts::DEFAULT_MANUAL_FILE).display().to_string());
     }
 
     println!(
-        "Initialized codex-foreman project scaffold at: {}",
+        "Initialized foreman project scaffold at: {}",
         path.display()
     );
     for file in created_files {
@@ -757,7 +863,7 @@ fn write_template_file(path: PathBuf, template: &str, overwrite: bool) -> anyhow
 fn resolve_template_dir(cli_template_dir: Option<&str>) -> anyhow::Result<PathBuf> {
     let candidates = [
         cli_template_dir.map(PathBuf::from),
-        std::env::var("CODEX_FOREMAN_TEMPLATE_DIR")
+        std::env::var(consts::TEMPLATE_DIR_ENV)
             .ok()
             .filter(|_env_dir| cli_template_dir.is_none())
             .map(PathBuf::from),
@@ -765,8 +871,8 @@ fn resolve_template_dir(cli_template_dir: Option<&str>) -> anyhow::Result<PathBu
         std::env::current_exe()
             .ok()
             .and_then(|exe_dir| exe_dir.parent().map(|parent| parent.join("templates"))),
-        Some("/usr/share/codex-foreman/templates".into()),
-        Some("/etc/codex-foreman/templates".into()),
+        Some(consts::TEMPLATE_DIR_SHARE.into()),
+        Some(consts::TEMPLATE_DIR_ETC.into()),
     ];
 
     let mut searched = Vec::new();
@@ -810,18 +916,18 @@ mod tests {
 
     #[test]
     fn resolve_template_dir_prefers_cli_override() {
-        let _guard = with_template_env_lock();
-        let preferred = tempfile::tempdir().expect("temp dir");
-        let fallback = tempfile::tempdir().expect("temp dir");
-        let backup = std::env::var_os("CODEX_FOREMAN_TEMPLATE_DIR");
+    let _guard = with_template_env_lock();
+    let preferred = tempfile::tempdir().expect("temp dir");
+    let secondary_template_dir = tempfile::tempdir().expect("temp dir");
+    let backup = std::env::var_os(super::constants::TEMPLATE_DIR_ENV);
 
-        let preferred_path = preferred.path().to_string_lossy().to_string();
-        let fallback_path = fallback.path().to_path_buf();
+    let preferred_path = preferred.path().to_string_lossy().to_string();
+    let secondary_path = secondary_template_dir.path().to_path_buf();
 
-        // ensure env is set to a different valid directory so precedence is testable.
-        // SAFETY: Tests are single-threaded and manipulate process environment for assertion setup.
-        unsafe {
-            std::env::set_var("CODEX_FOREMAN_TEMPLATE_DIR", &fallback_path);
+    // ensure env is set to a different valid directory so precedence is testable.
+    // SAFETY: Tests are single-threaded and manipulate process environment for assertion setup.
+    unsafe {
+            std::env::set_var(super::constants::TEMPLATE_DIR_ENV, &secondary_path);
         }
         let selected = resolve_template_dir(Some(&preferred_path)).expect("template dir resolves");
         assert_eq!(selected, preferred.path());
@@ -829,33 +935,33 @@ mod tests {
         if let Some(old) = backup {
             // SAFETY: Tests are single-threaded and restore environment only for test scope.
             unsafe {
-                std::env::set_var("CODEX_FOREMAN_TEMPLATE_DIR", old);
+                std::env::set_var(super::constants::TEMPLATE_DIR_ENV, old);
             }
         } else {
             // SAFETY: Tests are single-threaded and restore environment only for test scope.
             unsafe {
-                std::env::remove_var("CODEX_FOREMAN_TEMPLATE_DIR");
+                std::env::remove_var(super::constants::TEMPLATE_DIR_ENV);
             }
         }
     }
 
     #[test]
-    fn resolve_template_dir_falls_back_to_manifest_templates() {
+    fn resolve_template_dir_uses_manifest_templates_when_unset() {
         let _guard = with_template_env_lock();
-        let backup = std::env::var_os("CODEX_FOREMAN_TEMPLATE_DIR");
+        let backup = std::env::var_os(super::constants::TEMPLATE_DIR_ENV);
         // SAFETY: Tests are single-threaded and manage process environment temporarily.
         unsafe {
-            std::env::remove_var("CODEX_FOREMAN_TEMPLATE_DIR");
+            std::env::remove_var(super::constants::TEMPLATE_DIR_ENV);
         }
 
-        let resolved = resolve_template_dir(None).expect("manifest fallback");
+        let resolved = resolve_template_dir(None).expect("manifest template directory");
         let expected = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         assert_eq!(resolved, expected);
 
         if let Some(old) = backup {
             // SAFETY: Tests are single-threaded and restore environment only for test scope.
             unsafe {
-                std::env::set_var("CODEX_FOREMAN_TEMPLATE_DIR", old);
+                std::env::set_var(super::constants::TEMPLATE_DIR_ENV, old);
             }
         }
     }

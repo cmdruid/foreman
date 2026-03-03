@@ -1,14 +1,14 @@
-# Contributing to codex-foreman
+# Contributing to foreman
 
 Thank you for contributing.
 
 ## Repo layout
 
-- `src/main.rs` — CLI and HTTP handlers
+- `src/main.rs` — CLI and API handlers served via Unix socket
 - `src/foreman.rs` — worker/callback orchestration logic
 - `crates/codex-api/` — JSON-RPC bridge and protocol boundary to `codex app-server`
 - `src/config.rs` — service configuration model + validation
-- `src/project.rs` — project config model and prompt/hook loading
+- `src/project.rs` — project config model and prompt loading
 - `src/models.rs` — request/response payloads
 - `src/events.rs` — event normalization and routing
 - `docs/` — operational manual and references
@@ -16,7 +16,7 @@ Thank you for contributing.
 ## Development setup
 
 ```bash
-cd ~/repos/codex-foreman
+cd ~/repos/foreman
 cargo build
 ```
 
@@ -40,8 +40,8 @@ cargo test -p codex-api --tests
    - `cargo test --workspace --tests -- --nocapture`
 
 6. Validate fixture-based negative coverage:
-   - `tests/fixtures/project-missing-worker`
-   - `tests/fixtures/project-invalid-config`
+- `test/fixtures/project-missing-worker`
+- `test/fixtures/project-invalid-config`
 
 ## Coding style
 

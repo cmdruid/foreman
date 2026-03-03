@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, path::Path, path::PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const PROJECT_CONFIG_FILE: &str = "project.toml";
+use crate::constants;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
@@ -13,8 +13,6 @@ pub struct ProjectConfig {
     pub prompts: ProjectPrompts,
     #[serde(default)]
     pub callbacks: ProjectCallbacks,
-    #[serde(default)]
-    pub hooks: ProjectHooks,
     #[serde(default)]
     pub policy: ProjectPolicy,
 }
@@ -50,6 +48,8 @@ pub struct ProjectCallbacks {
     pub foreman: CallbackSpec,
     #[serde(default)]
     pub bubble_up: CallbackSpec,
+    #[serde(default)]
+    pub lifecycle: ProjectLifecycleCallbacks,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -62,17 +62,17 @@ pub struct CallbackSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProjectHooks {
+pub struct ProjectLifecycleCallbacks {
     #[serde(default)]
-    pub on_project_start: Option<String>,
+    pub start: CallbackSpec,
     #[serde(default)]
-    pub on_worker_completed: Option<String>,
+    pub compact: CallbackSpec,
     #[serde(default)]
-    pub on_worker_aborted: Option<String>,
+    pub stop: CallbackSpec,
     #[serde(default)]
-    pub on_project_compaction: Option<String>,
+    pub worker_completed: CallbackSpec,
     #[serde(default)]
-    pub on_project_stop: Option<String>,
+    pub worker_aborted: CallbackSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,10 +86,12 @@ pub struct ProjectPolicy {
 impl Default for ProjectPolicy {
     fn default() -> Self {
         Self {
-            bubble_up_events: Some(vec![
-                "turn/completed".to_string(),
-                "turn/aborted".to_string(),
-            ]),
+            bubble_up_events: Some(
+                constants::DEFAULT_BUBBLE_UP_EVENTS
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+            ),
             compact_after_turns: None,
         }
     }
@@ -106,13 +108,19 @@ pub struct ProjectRuntimeFiles {
 
 impl ProjectConfig {
     pub fn load(project_path: &Path) -> Result<Self> {
-        let config_path = project_path.join(PROJECT_CONFIG_FILE);
+        let config_path = project_path.join(constants::PROJECT_CONFIG_FILE);
         if !config_path.exists() {
             return Ok(Self::default());
         }
 
         let raw = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read project config {}", config_path.display()))?;
+        let manifest: toml::Value = toml::from_str(&raw).context("invalid project config format")?;
+        if manifest.get("hooks").is_some() {
+            anyhow::bail!(
+                "project config uses unsupported [hooks]; replace with [callbacks.lifecycle]"
+            );
+        }
         let config: Self = toml::from_str(&raw).context("invalid project config format")?;
         Ok(config)
     }
@@ -179,17 +187,17 @@ fn read_text_required(path: &Path) -> Result<String> {
 }
 
 fn default_foreman_prompt_file() -> String {
-    "FOREMAN.md".to_string()
+    constants::DEFAULT_FOREMAN_PROMPT_FILE.to_string()
 }
 
 fn default_worker_prompt_file() -> String {
-    "WORKER.md".to_string()
+    constants::DEFAULT_WORKER_PROMPT_FILE.to_string()
 }
 
 fn default_runbook_file() -> String {
-    "RUNBOOK.md".to_string()
+    constants::DEFAULT_RUNBOOK_FILE.to_string()
 }
 
 fn default_handoff_file() -> String {
-    "HANDOFF.md".to_string()
+    constants::DEFAULT_HANDOFF_FILE.to_string()
 }

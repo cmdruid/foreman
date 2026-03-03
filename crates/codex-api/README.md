@@ -1,6 +1,6 @@
 # `codex-api`
 
-`codex-api` is the protocol boundary crate used by `codex-foreman` to talk to the
+`codex-api` is the protocol boundary crate used by `foreman` to talk to the
 local `codex` app-server process.
 
 ## Scope
@@ -12,7 +12,7 @@ local `codex` app-server process.
 
 ## Supported RPC methods
 
-`codex-foreman` intentionally relies only on this small set for production control
+`foreman` intentionally relies only on this small set for production control
 flow:
 
 - `initialize`
@@ -21,7 +21,7 @@ flow:
 - `turn/steer`
 - `turn/interrupt`
 
-### Notifications forwarded to `codex-foreman`
+### Notifications forwarded to `foreman`
 
 All inbound notifications are parsed and exposed to the caller through the
 `RawNotification` channel with:
@@ -31,7 +31,7 @@ All inbound notifications are parsed and exposed to the caller through the
 
 ## Auto-approved server requests
 
-When the server sends the following requests, `codex-foreman` responds automatically:
+When the server sends the following requests, `foreman` responds automatically:
 
 - `item/commandExecution/requestApproval`
 - `item/fileChange/requestApproval`

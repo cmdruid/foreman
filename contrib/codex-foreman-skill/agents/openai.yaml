@@ -1,7 +1,0 @@
-interface:
-  display_name: "Codex-Foreman"
-  short_description: "Orchestrate agents and callbacks with codex-foreman."
-  default_prompt: "Use codex-foreman-orchestrator to bootstrap a project, spawn workers, steer foremen, and configure completion callbacks."
-  icon_small: "./assets/foreman-small.svg"
-  icon_large: "./assets/foreman-large.svg"
-  brand_color: "#0f172a"

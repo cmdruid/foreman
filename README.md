@@ -1,156 +1,158 @@
-# codex-foreman
+# foreman
 
-A Rust control-plane for orchestrating multiple long-lived `codex app-server` agents from a single process.
+[![CI](https://github.com/cmdruid/foreman/actions/workflows/ci.yml/badge.svg)](https://github.com/cmdruid/foreman/actions/workflows/ci.yml)
+[![Release workflow](https://github.com/cmdruid/foreman/actions/workflows/release.yml/badge.svg)](https://github.com/cmdruid/foreman/actions/workflows/release.yml)
+[![License](https://img.shields.io/github/license/cmdruid/foreman)](https://github.com/cmdruid/foreman/blob/main/LICENSE)
+[![Latest](https://img.shields.io/github/v/tag/cmdruid/foreman?label=latest&sort=semver)](https://github.com/cmdruid/foreman/releases)
+[![Security](https://img.shields.io/badge/Security-Policy-blue?logo=github)](SECURITY.md)
 
-`codex-foreman` is designed to:
+## Foreman: the control room for your AI assembly line
 
-- multiplex one Codex `app-server` transport for many logical workers
-- provide a simple HTTP control API (`/agents`, `/projects`)
-- dispatch event-driven callbacks (webhooks or shell commands)
-- support OpenClaw-style callback routing with prompt prefixes and templating
-- run project foremen with scoped prompts, hooks, and compaction policy
-- persist lightweight agent/project state for faster recovery after restart
+When agent work starts looking like a messy shop floor, you need process discipline.
+**Foreman** is that floor manager for Codex: one service that keeps multiple agents moving through a repeatable workflow with measurable outputs.
 
-## Build
+No improvisation. No mystery routing. No stalled lines waiting on unclear instructions.
+
+You define the order ticket (task payload), Foreman moves it through execution, monitoring, callbacks, and completion.
+
+## What Foreman delivers
+
+### For humans
+
+- **Higher throughput, predictable output**
+  Orchestrate many agents from a single API surface.
+- **Built for reliability**
+  Local `codex app-server` transport, persisted state, and restart recovery.
+- **Quality gates on every batch**
+  Release checks, live smoke scenarios, and docs for repeatable validation.
+- **Fast proof on delivery**
+  Run real mock scenarios and see concrete artifacts without waiting weeks.
+
+### For agents and automation
+
+- **Explicit work orders, no guesswork**
+  `jobs` and `workers` are explicit, ordered instructions.
+- **Clean interface boundaries**
+  Separate lanes for `agents`, `projects`, and `jobs`.
+- **Event visibility at each step**
+  Callback emissions keep downstream systems informed on turn and completion events.
+- **Isolated outputs when needed**
+  Optional worktree execution keeps deliverables separated.
+
+## Foreman process map
+
+```mermaid
+flowchart LR
+  Operator["Operator / CI"] -->|Unix domain socket| F[Foreman]
+  F -->|stdio JSON-RPC| C["codex app-server"]
+  F --> S[Persisted state]
+  F --> H[Callback events]
+  F --> J[Projects / Workers / Jobs]
+  J --> W[Optional git worktrees]
+```
+
+## Start the line (3-minute onboarding)
+
+### 1) Start Foreman
 
 ```bash
-cd ~/repos/codex-foreman
 cargo build
+
+cargo run -- \
+  --codex-binary /usr/local/bin/codex \
+  --service-config /etc/foreman/config.toml \
+  --project /path/to/project/project.toml
 ```
 
-`codex-foreman` now also includes the `codex-api` protocol crate as a workspace member, so all workspace commands can target that crate directly.
-
-## Run
+### 2) Validate the setup
 
 ```bash
-cargo run -- \
-  --bind 0.0.0.0:8787 \
-  --codex-binary /usr/local/bin/codex \
-  --service-config /etc/codex-foreman/config.toml \
-  --state-path /var/lib/codex-foreman/foreman-state.json
+cargo run -- --service-config /etc/foreman/config.toml --validate-config
 ```
 
-`codex-foreman` now always starts and uses a local `codex app-server` via stdio.
-- `--state-path`: path for persisted state recovery across restarts (default `/var/lib/codex-foreman/foreman-state.json`)
-
-Create a project scaffold:
+### 3) Generate a starter project template
 
 ```bash
 cargo run -- --init-project /tmp/example-project
-```
-
-Default scaffold templates are read from `templates`:
-
-- `templates/project.toml`
-- `templates/FOREMAN.md`
-- `templates/WORKER.md`
-- `templates/RUNBOOK.md`
-- `templates/HANDOFF.md`
-- `templates/MANUAL.md` (only when `--init-project-manual` is set)
-
-Set template root with CLI flag or environment variable:
-
-```bash
---template-dir /usr/share/codex-foreman/templates
-```
-
-or
-
-```bash
-export CODEX_FOREMAN_TEMPLATE_DIR=/usr/share/codex-foreman/templates
-```
-
-Include a tool-operating manual for agents:
-
-```bash
 cargo run -- --init-project /tmp/example-project --init-project-manual
-```
-
-Overwrite existing scaffold files:
-
-```bash
 cargo run -- --init-project /tmp/example-project --init-project-overwrite
 ```
 
-By default it assumes `codex` is on `PATH`.
-
-Validate config:
+Template directory defaults to `templates/`. Override when your plant has custom manifests:
 
 ```bash
-cargo run -- --service-config /etc/codex-foreman/config.toml --validate-config
+--template-dir /usr/share/foreman/templates
+# or
+export CODEX_FOREMAN_TEMPLATE_DIR=/usr/share/foreman/templates
 ```
 
-### Live mock demo (contrib)
+## Operations API
 
-Run a real codex-agent orchestration smoke using the local repository fixture:
+Use these endpoints as your control panels:
+
+- `GET /health`, `GET /status`
+- `POST /agents`, `GET /agents`, `GET /agents/:id`, `GET /agents/:id/result`, `GET /agents/:id/wait`, `GET /agents/:id/events`
+- `POST /agents/:id/send`, `POST /agents/:id/steer`, `POST /agents/:id/interrupt`, `DELETE /agents/:id`
+- `POST /projects`, `GET /projects`, `GET /projects/:id`, `DELETE /projects/:id`
+- `GET /projects/:id/callback-status`
+- `POST /projects/:id/workers`
+- `POST /projects/:id/foreman/send`, `POST /projects/:id/foreman/steer`
+- `POST /projects/:id/compact`
+- `POST /projects/:id/jobs`, `GET /jobs`, `GET /jobs/:id`, `GET /jobs/:id/result`, `GET /jobs/:id/wait`
+
+Keep instructions explicit in each worker item. That is how you keep outputs deterministic across runs.
+
+For full endpoint schemas and examples, see [`docs/manual.md`](docs/manual.md).
+
+## Live proof run (the acceptance test)
+
+Run the included mock project and verify end-to-end artifact generation:
 
 ```bash
-./contrib/run_mock_demo.sh
-./contrib/run_mock_mixed_demo.sh
+./contrib/demo/run_demo.sh
 ```
 
-See [`docs/manual.md`](docs/manual.md#mock-project-demo-live) for timing knobs and success criteria.
+Default `run_demo.sh` mode is `worktree` (all worktree-backed workers).
 
-### Permissions for Codex Agent Project Runs
+```bash
+RUN_MOCK_DEMO_MODE=worktree ./contrib/demo/run_demo.sh
+```
 
-Running `codex-foreman` to execute projects in a codex-agent context requires:
+Mixed mode example (explicit mix of worktree and non-worktree workers):
 
-- Socket bind/listen access on the configured `--bind` address.
-- Permission to spawn a child `codex app-server` process.
-- Read/write access to `--state-path` and project workspace files.
-- Permission for callback execution paths (if command/webhook callbacks are enabled).
+```bash
+RUN_MOCK_DEMO_MODE=mixed \
+WORKTREE_CLEANUP=true \
+./contrib/demo/run_demo.sh
+```
 
-In restricted environments, request one-time process privilege before startup if project execution requires the above.
+Acceptance criteria:
 
-## API
+- process exits `0`
+- final output includes `result: success`
+- in `worktree` mode: 3 workers complete and artifacts are present under `contrib/demo/.audit/reports/`
+- in `mixed` mode: 4 workers complete and artifacts are present under `contrib/demo/.audit/reports/`
 
-- `GET /health`
-- `POST /agents` → spawn a standalone agent
-- `GET /agents` → list agents
-- `GET /agents/:id` → get agent state
-- `GET /agents/:id/result` → get terminal result summary
-- `GET /agents/:id/wait` → wait for completion (`timeout_ms`, `poll_ms`, `include_events`)
-- `GET /agents/:id/events` → fetch recent events (`tail`)
-- `POST /agents/:id/send` → start turn or callback-only update
-- `POST /agents/:id/steer` → steer active turn
-- `POST /agents/:id/interrupt` → interrupt a turn
-- `DELETE /agents/:id` → remove local tracking
-- `GET /status` → service status and runtime metadata
-- `POST /projects` → create project and spawn project foreman
-- `GET /projects` → list projects
-- `GET /projects/:id` → get project state
-- `DELETE /projects/:id` → close project
-- `POST /projects/:id/workers` → spawn worker in project
-- `POST /projects/:id/foreman/send` → send to project foreman
-- `POST /projects/:id/foreman/steer` → steer project foreman
-- `POST /projects/:id/compact` → force project compaction handoff
-- `POST /projects/:id/jobs` → create a batch job for a project
-  - `workers` is explicit and complete: each item defines one worker prompt to execute.
-- `GET /jobs` → list project jobs
-- `GET /jobs/:id` → get job state
-- `GET /jobs/:id/result` → get per-worker result summary
-- `GET /jobs/:id/wait` → wait for job terminal state (`timeout_ms`, `poll_ms`, `include_workers`)
+Helper script:
 
-For deterministic orchestration, send explicit worker prompts in `jobs` payloads and avoid free-form “figure this out” instructions.
+- `./contrib/demo/run_mixed.sh` remains as a helper that sets `RUN_MOCK_DEMO_MODE=mixed`.
 
-See [`docs/manual.md`](docs/manual.md) for full endpoint schemas and usage examples.
+If you need heavier validation, treat this as your pre-scale production check.
 
-## Service config
+## Core configuration
 
-`codex-foreman` reads service defaults from `--service-config` (defaults to `/etc/codex-foreman/config.toml`):
+### app-server and protocol
 
 ```toml
 [app_server]
-# Optional: tune codex app-server startup and request behavior (milliseconds)
 initialize_timeout_ms = 5_000
 request_timeout_ms = 30_000
-```
 
-```toml
 [protocol]
-# Optional: fail startup unless the local codex binary reports this version.
 expected_codex_version = "0.9.2"
 ```
+
+### worker monitoring
 
 ```toml
 [worker_monitoring]
@@ -160,26 +162,18 @@ max_restarts = 1
 watch_interval_ms = 750
 ```
 
-`worker_monitoring` is optional:
-
-- set `enabled = true` to automatically detect stalled workers (no events for more than `inactivity_timeout_ms`)
-- `max_restarts` limits automatic worker restart attempts while stalled
-- `watch_interval_ms` controls how often Foreman checks for stale workers
-
-Service security is optional but recommended for shared environments:
+### optional auth
 
 ```toml
 [security.auth]
 enabled = true
 token = "replace-me"
 header_name = "authorization"
-# header_scheme = "Bearer" # optional
+# header_scheme = "Bearer"
 # skip_paths = ["/health"]
 ```
 
-When `security.auth.enabled = true`, every request except `/health` must include the
-configured auth header. If `header_scheme` is set, requests must provide
-`<scheme> <token>`.
+### callback profile (command)
 
 ```toml
 [callbacks]
@@ -192,57 +186,49 @@ args = ["--message", "{{event_prompt}}", "--thread-id", "{{thread_id}}"]
 prompt_prefix = "Handle this event payload from codex:\n"
 event_prompt_variable = "message"
 timeout_ms = 10_000
-
-[callbacks.profiles.openclaw.env]
-OPENCLAW_TOKEN = "{{openclaw_token}}"
-
-[callbacks.profiles.openclaw_webhook]
-type = "webhook"
-url = "https://example.local/events"
-secret_env = "OPENCLAW_WEBHOOK_SECRET"
-events = ["turn/completed", "turn/aborted"]
 ```
 
-`timeout_ms` defaults to `5000` when omitted. Set `timeout_ms = 0` to disable callback timeouts (allowed for command and webhook profiles).
+For webhook integrations, configure `type = "webhook"`, `url`, `secret_env`, and event filters.
 
-Project-specific prompts and callbacks are loaded from `project.toml` in each project folder (optional).
+## Operating requirements
 
-## Webhook payload
+To keep the line moving, provide:
 
-Callback payload shape:
+- unix socket filesystem permission for `--socket-path`
+- permission to start child `codex app-server`
+- permission to access `<project-file>.toml` and derived `--state-path` location (typically `<project-dir>/.foreman/foreman-state.json`)
+- workspace and callback execution rights when callbacks are used
 
-```json
-{
-  "agent_id": "uuid",
-  "thread_id": "thread-id",
-  "turn_id": "turn-id",
-  "event_id": "event-id",
-  "ts": 1710000000,
-  "method": "turn/completed",
-  "params": {"thread_id":"...", "turn_id":"..."},
-  "callback_vars": {
-    "agent_id": "uuid",
-    "thread_id": "thread-id",
-    "method": "turn/completed"
-  }
-}
-```
+If your environment is locked down, grant these before starting Foreman.
 
-For command profiles, `event_prompt` is created from `prompt_prefix + compact(event_json)` and exposed to command templates (default token `{{event_prompt}}`).
+## Release readiness checklist
 
-`turn/completed` payloads now include a normalized `result` object when available, making worker handoff and callback parsing easier for agents.
+- `./scripts/release_gate.sh`
+- `cargo test --test release -- --nocapture`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
 
-## Design notes
+Reference docs:
 
-- State is persisted after every state mutation.
-- Callbacks are best-effort: callback failures do not fail API mutation calls.
-- `codex-foreman` attempts best-effort recovery of agents/projects from persisted state at startup.
+- [`RELEASE.md`](RELEASE.md)
+- [`RELEASES.md`](RELEASES.md)
+- [`TESTING.md`](TESTING.md)
 
-See full release/testing instructions:
+## Contributing
+
+Bring production-minded changes:
+
+- keep PRs focused,
+- update test/fixtures for API contract changes,
+- keep prompts and payloads explicit and traceable.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Additional docs
 
 - Manual: [`docs/manual.md`](docs/manual.md)
-- Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Testing: [`TESTING.md`](TESTING.md)
 - Releases: [`RELEASES.md`](RELEASES.md)
 - Release checklist: [`RELEASE.md`](RELEASE.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Security policy: [`SECURITY.md`](SECURITY.md)

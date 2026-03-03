@@ -1,4 +1,4 @@
-# Release checklist for codex-foreman
+# Release checklist for foreman
 
 Use this checklist before publishing any tag/release.
 

@@ -8,7 +8,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 Usage: scripts/release_gate.sh
 
-Run release-readiness checks for codex-foreman:
+Run release-readiness checks for foreman:
 - workflow action pinning verification
 - release metadata/version check
 - documentation anchor checks
@@ -17,7 +17,7 @@ Run release-readiness checks for codex-foreman:
 Environment:
 - RUN_LIVE_MOCK_SMOKE=true (default: false)
 - CODEX_BIN (required when live smoke enabled)
-- FOREMAN_BIN (defaults to target/release/codex-foreman)
+- FOREMAN_BIN (defaults to target/release/foreman; may be set explicitly)
 - JOB_TIMEOUT_MS (default: 300000)
 - JOB_POLL_MS (default: 500)
 - WORKTREE_CLEANUP (default: true)
@@ -49,7 +49,7 @@ for pattern in \
   "result: success" \
   "mixed mode" \
   "before tagging" \
-  "contrib/run_mock_demo.sh"; do
+  "contrib/demo/run_demo.sh"; do
   if ! rg -q "$pattern" "$DOCS_ROOT"/TESTING.md "$DOCS_ROOT"/RELEASES.md "$DOCS_ROOT"/README.md "$DOCS_ROOT"/docs/manual.md; then
     echo "required documentation pattern not found: $pattern" >&2
     exit 1
@@ -63,10 +63,16 @@ if [[ "${RUN_LIVE_MOCK_SMOKE:-false}" == "true" ]]; then
     echo "RUN_LIVE_MOCK_SMOKE is true but CODEX_BIN is not set and codex is not on PATH" >&2
     exit 1
   fi
-  FOREMAN_BIN="${FOREMAN_BIN:-$REPO_ROOT/target/release/codex-foreman}"
+  if [[ -x "${FOREMAN_BIN:-}" ]]; then
+    :
+  elif [[ -x "$REPO_ROOT/target/release/foreman" ]]; then
+    FOREMAN_BIN="$REPO_ROOT/target/release/foreman"
+  else
+    FOREMAN_BIN="${FOREMAN_BIN:-$REPO_ROOT/target/release/foreman}"
+  fi
   if [[ ! -x "$FOREMAN_BIN" ]]; then
     echo "[release-gate] building release binary"
-    cargo build --locked --release --bin codex-foreman
+    cargo build --locked --release --bin foreman
   fi
 
   export CODEX_BIN="$CODEX_BIN"
@@ -76,7 +82,7 @@ if [[ "${RUN_LIVE_MOCK_SMOKE:-false}" == "true" ]]; then
   export WORKTREE_CLEANUP="${WORKTREE_CLEANUP:-true}"
   export RUN_MOCK_DEMO_MODE="${RUN_MOCK_DEMO_MODE:-mixed}"
 
-  if ! "$REPO_ROOT/contrib/run_mock_demo.sh"; then
+  if ! "$REPO_ROOT/contrib/demo/run_demo.sh"; then
     echo "live mock demo failed" >&2
     exit 1
   fi

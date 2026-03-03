@@ -2,13 +2,7 @@ use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-
-const DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_WORKER_MONITORING_ENABLED: bool = false;
-const DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS: u64 = 3_000;
-const DEFAULT_WORKER_MONITORING_MAX_RESTARTS: u32 = 1;
-const DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS: u64 = 750;
+use crate::constants;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -48,19 +42,19 @@ impl Default for WorkerMonitoringConfig {
 }
 
 fn default_worker_monitoring_enabled() -> bool {
-    DEFAULT_WORKER_MONITORING_ENABLED
+    constants::DEFAULT_WORKER_MONITORING_ENABLED
 }
 
 fn default_worker_monitoring_inactivity_timeout_ms() -> u64 {
-    DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS
+    constants::DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS
 }
 
 fn default_worker_monitoring_max_restarts() -> u32 {
-    DEFAULT_WORKER_MONITORING_MAX_RESTARTS
+    constants::DEFAULT_WORKER_MONITORING_MAX_RESTARTS
 }
 
 fn default_worker_monitoring_watch_interval_ms() -> u64 {
-    DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS
+    constants::DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,11 +81,11 @@ impl Default for AppServerConfig {
 }
 
 fn default_app_server_initialize_timeout_ms() -> u64 {
-    DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
+    constants::DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
 }
 
 fn default_app_server_request_timeout_ms() -> u64 {
-    DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
+    constants::DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -301,7 +295,7 @@ impl ServiceConfig {
         }
 
         let skip_paths = if auth.skip_paths.is_empty() {
-            vec!["/health".to_string()]
+            vec![constants::DEFAULT_AUTH_SKIP_PATH.to_string()]
         } else {
             auth.skip_paths.clone()
         };
@@ -311,7 +305,7 @@ impl ServiceConfig {
             header_name: auth
                 .header_name
                 .clone()
-                .unwrap_or_else(|| "authorization".to_string()),
+                .unwrap_or_else(|| constants::DEFAULT_AUTH_HEADER_NAME.to_string()),
             header_scheme: auth.header_scheme.clone(),
             skip_paths,
         }))
@@ -341,23 +335,22 @@ impl CallbackProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerConfig, AuthConfig, DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS,
-        DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS, SecurityConfig, ServiceConfig,
-        WorkerMonitoringConfig,
+        AppServerConfig, AuthConfig, SecurityConfig, ServiceConfig, WorkerMonitoringConfig,
     };
+    use crate::constants;
     use std::{env, path::Path};
 
     #[test]
     fn load_missing_file_returns_default_config() {
-        let config = ServiceConfig::load(Path::new("/tmp/does-not-exist-codex-foreman.toml"))
+        let config = ServiceConfig::load(Path::new("/tmp/does-not-exist-foreman.toml"))
             .expect("load missing file");
         assert_eq!(
             config.app_server.initialize_timeout_ms,
-            DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
+            constants::DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
         );
         assert_eq!(
             config.app_server.request_timeout_ms,
-            DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
+            constants::DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
         );
         assert!(config.callbacks.profiles.is_empty());
         assert!(config.security.auth.is_none());
@@ -370,16 +363,25 @@ mod tests {
         let config = ServiceConfig::default();
         assert_eq!(
             config.app_server.initialize_timeout_ms,
-            DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
+            constants::DEFAULT_APP_SERVER_INITIALIZE_TIMEOUT_MS
         );
         assert_eq!(
             config.app_server.request_timeout_ms,
-            DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
+            constants::DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS
         );
         assert!(!config.worker_monitoring.enabled);
-        assert_eq!(config.worker_monitoring.inactivity_timeout_ms, 3_000);
-        assert_eq!(config.worker_monitoring.max_restarts, 1);
-        assert_eq!(config.worker_monitoring.watch_interval_ms, 750);
+        assert_eq!(
+            config.worker_monitoring.inactivity_timeout_ms,
+            constants::DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.worker_monitoring.max_restarts,
+            constants::DEFAULT_WORKER_MONITORING_MAX_RESTARTS
+        );
+        assert_eq!(
+            config.worker_monitoring.watch_interval_ms,
+            constants::DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS
+        );
     }
 
     #[test]
@@ -491,8 +493,11 @@ mod tests {
             .expect("resolve auth config")
             .expect("auth enabled");
         assert_eq!(resolved.token, "inline-token");
-        assert_eq!(resolved.header_name, "authorization");
-        assert_eq!(resolved.skip_paths, vec!["/health".to_string()]);
+        assert_eq!(resolved.header_name, constants::DEFAULT_AUTH_HEADER_NAME);
+        assert_eq!(
+            resolved.skip_paths,
+            vec![constants::DEFAULT_AUTH_SKIP_PATH.to_string()]
+        );
     }
 
     #[test]

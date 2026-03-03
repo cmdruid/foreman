@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `codex-foreman` are documented here.
+All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
@@ -19,5 +19,5 @@ All notable changes to `codex-foreman` are documented here.
   - `CONTRIBUTING.md`
   - `TESTING.md`
   - `RELEASES.md`
-  - `src/bin/fake_codex.rs`
+  - `test/bin/fake_codex.rs`
   - integration and e2e test coverage

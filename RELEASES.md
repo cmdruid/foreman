@@ -9,8 +9,8 @@
     - CLI/env override
     - `$(CARGO_MANIFEST_DIR)/templates`
     - executable-adjacent `templates`
-    - `/usr/share/codex-foreman/templates`
-    - `/etc/codex-foreman/templates`
+    - `/usr/share/foreman/templates`
+    - `/etc/foreman/templates`
 - Added callback profile validation with `--validate-config`.
 - Added callback-only send flow (`POST /agents/:id/send` with no `prompt` and callback overrides only).
 - Made `SendAgentInput.prompt` optional to support callback steering updates independent of turn starts.
@@ -24,11 +24,10 @@
   - `POST /projects/:id/foreman/steer`
   - `POST /projects/:id/compact`
 - Added project config model and runtime files:
-  - `project.toml` parsing and prompt/hook loading
+  - `project.toml` parsing and prompt loading
   - `FOREMAN.md`, `WORKER.md`, `RUNBOOK.md`, `HANDOFF.md` integration
-- Added project event callbacks, lifecycle hooks, and compaction counters:
-  - `on_project_start`, `on_project_stop`, `on_project_compaction`
-  - `on_worker_completed`, `on_worker_aborted`
+- Added project event callbacks and lifecycle callback channels:
+  - `start`, `compact`, `stop`, `worker_completed`, `worker_aborted`
   - `policy.compact_after_turns` and `policy.bubble_up_events`
 - Extended callback event payload and `prompt` templating support for better external-agent forwarding.
 - Added hard-cut app-server lifecycle management: local stdio `codex app-server` launch and monitoring only.
@@ -40,7 +39,7 @@
   - `CONTRIBUTING.md`
   - `TESTING.md`
 - `--init-project` project scaffold generator for `FOREMAN.md`, `WORKER.md`, `RUNBOOK.md`, `HANDOFF.md`, and `project.toml`
-- Switched app-server transport to a hard-cut, single-mode stdio process model. `codex-foreman` now always launches/monitors a local `codex app-server` child.
+- Switched app-server transport to a hard-cut, single-mode stdio process model. `foreman` now always launches/monitors a local `codex app-server` child.
 - Expanded README for project scopes and service validation.
 
 ### Release Readiness Checklist
@@ -48,17 +47,17 @@
 - [x] API contract and behavior coverage
   - `POST /agents`
   - `GET /agents`, `GET /agents/:id`, `GET /agents/:id/result`, `GET /agents/:id/wait`, `GET /agents/:id/events`, `POST /agents/:id/send`, `POST /agents/:id/steer`, `POST /agents/:id/interrupt`, `DELETE /agents/:id`
-  - `POST /projects`, `GET /projects`, `GET /projects/:id`, `DELETE /projects/:id`, `POST /projects/:id/workers`, `POST /projects/:id/foreman/send`, `POST /projects/:id/foreman/steer`, `POST /projects/:id/compact`
+  - `POST /projects`, `GET /projects`, `GET /projects/:id`, `GET /projects/:id/callback-status`, `DELETE /projects/:id`, `POST /projects/:id/workers`, `POST /projects/:id/foreman/send`, `POST /projects/:id/foreman/steer`, `POST /projects/:id/compact`
 - [x] Status endpoint coverage
   - `GET /status`
 - [x] Mocking and deterministic event fixture support
-  - `src/bin/fake_codex.rs` for stable JSON-RPC behavior.
-  - webhook capture endpoint in `tests/common`.
+  - `test/bin/fake_codex.rs` for stable JSON-RPC behavior.
+- webhook capture endpoint in `test/common`.
 - [x] Test artifacts
-  - Fixture suites in `tests/fixtures/project-valid`, `tests/fixtures/project-missing-worker`, `tests/fixtures/project-invalid-config`.
+- Fixture suites in `test/fixtures/project-valid`, `test/fixtures/project-missing-worker`, `test/fixtures/project-invalid-config`.
 - [x] Automated test suites
-  - Integration tests: `tests/integration.rs`
-  - End-to-end tests: `tests/e2e.rs`
+- Integration tests: `test/integration.rs`
+- End-to-end tests: `test/e2e.rs`
 - [x] Documentation set
   - `README.md`
   - `docs/manual.md`
@@ -88,27 +87,27 @@
 Release artifacts must include the template assets because `--init-project` reads templates from disk at runtime.
 
 Recommended install layout:
-- `/usr/local/bin/codex-foreman`
-- `/usr/share/codex-foreman/templates/project.toml`
-- `/usr/share/codex-foreman/templates/FOREMAN.md`
-- `/usr/share/codex-foreman/templates/WORKER.md`
-- `/usr/share/codex-foreman/templates/RUNBOOK.md`
-- `/usr/share/codex-foreman/templates/HANDOFF.md`
-- `/usr/share/codex-foreman/templates/MANUAL.md`
+- `/usr/local/bin/foreman`
+- `/usr/share/foreman/templates/project.toml`
+- `/usr/share/foreman/templates/FOREMAN.md`
+- `/usr/share/foreman/templates/WORKER.md`
+- `/usr/share/foreman/templates/RUNBOOK.md`
+- `/usr/share/foreman/templates/HANDOFF.md`
+- `/usr/share/foreman/templates/MANUAL.md`
 
 Release commands:
 
 ```bash
 cargo build --release
-install -Dm755 target/release/codex-foreman /usr/local/bin/codex-foreman
-install -d /usr/share/codex-foreman/templates
-cp -r templates/*.md templates/*.toml /usr/share/codex-foreman/templates/
-chown -R root:root /usr/local/bin/codex-foreman /usr/share/codex-foreman/templates
+install -Dm755 target/release/foreman /usr/local/bin/foreman
+install -d /usr/share/foreman/templates
+cp -r templates/*.md templates/*.toml /usr/share/foreman/templates/
+chown -R root:root /usr/local/bin/foreman /usr/share/foreman/templates
 ```
 
 Runtime invocation options:
-- CLI: `--template-dir /usr/share/codex-foreman/templates`
-- Environment: `CODEX_FOREMAN_TEMPLATE_DIR=/usr/share/codex-foreman/templates`
+- CLI: `--template-dir /usr/share/foreman/templates`
+- Environment: `CODEX_FOREMAN_TEMPLATE_DIR=/usr/share/foreman/templates`
 
 ### Automated GitHub Release (Release Tag)
 
@@ -116,17 +115,17 @@ For each pushed tag matching `v*`, the release workflow:
 
 1. Builds artifacts for Linux, macOS, and Windows in parallel.
 2. Bundles:
-   - `codex-foreman` binary (from `target/<platform>/release`)
+   - `foreman` binary (from `target/<platform>/release`)
    - `templates/` directory
 3. Generates per-platform archive checksum files (`*.sha256`).
 4. Extracts release notes from `CHANGELOG.md`:
    - prefers `## v<version>` for the current tag
    - falls back to `## Unreleased`
 5. Publishes a GitHub release attaching:
-   - `dist/codex-foreman-*.tar.gz`
-   - `dist/codex-foreman-*.tar.gz.sha256`
-   - `dist/codex-foreman-*.zip`
-   - `dist/codex-foreman-*.zip.sha256`
+   - `dist/foreman-*.tar.gz`
+   - `dist/foreman-*.tar.gz.sha256`
+   - `dist/foreman-*.zip`
+   - `dist/foreman-*.zip.sha256`
 6. Uses immutable action revisions and enforces release pipeline protections:
     - `workflow_dispatch` for manual one-off runs
    - manual tag input validation (`RELEASE_TAG`) with strict semver pattern `vX.Y.Z` (optional prerelease suffix)

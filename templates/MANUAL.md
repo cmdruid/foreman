@@ -1,4 +1,4 @@
-# codex-foreman Manual
+# foreman Manual
 
 ## Runtime constraints for project runs
 
@@ -7,17 +7,17 @@ In restricted environments, project runs may fail before `/health` becomes avail
 For one-time project executions, request elevated execution for the launch command and keep that scope narrow:
 
 - Confirm permissions for:
-  - local bind/listen (`--bind`)
+  - local unix socket creation (`--socket-path`)
   - spawning `codex app-server`
   - writing state and callback artifacts
-- Start `codex-foreman` in a privileged run.
+- Start `foreman` in a privileged run.
 - Verify `GET /health`.
 - Run project/worker commands while elevated.
 - Stop the process when the run finishes.
 
 If escalation is unavailable, use test-based verification (`cargo test`) instead of live orchestrations.
 
-You are operating this project with `codex-foreman`.
+You are operating this project with `foreman`.
 
 Use this directory as a control surface for local Codex agent orchestration:
 

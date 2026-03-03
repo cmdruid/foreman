@@ -1,17 +1,17 @@
-# Testing codex-foreman
+# Testing foreman
 
 ## Environment assumptions
 
 - `codex` binary available and runnable with `app-server` support
 - `cargo` toolchain installed
-- Foreman bind address reachable locally
+- Foreman unix-socket path available locally (set via `FOREMAN_SOCKET_PATH`)
 
 ## Smoke tests
 
 1. Validate service config:
 
 ```bash
-cargo run -- --service-config /etc/codex-foreman/config.toml --validate-config
+cargo run -- --service-config /etc/foreman/config.toml --validate-config
 ```
 
 Expected:
@@ -39,16 +39,20 @@ Expected generated files:
 
 ```bash
 cargo run -- \
-  --bind 127.0.0.1:8787 \
+  --socket-path /tmp/cf-foreman.sock \
   --codex-binary /usr/local/bin/codex \
-  --service-config /etc/codex-foreman/config.toml \
-  --state-path /tmp/codex-foreman/foreman-state.json
+  --service-config /etc/foreman/config.toml \
+  --project /tmp/example-project/project.toml
+```
+
+```bash
+export FOREMAN_SOCKET_PATH="/tmp/cf-foreman.sock"
 ```
 
 4. Health:
 
 ```bash
-curl -s http://127.0.0.1:8787/health
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s http://localhost/health
 ```
 
 Expected: `ok`
@@ -56,25 +60,26 @@ Expected: `ok`
 5. Restart recovery smoke:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/projects \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/projects \
   -H "Content-Type: application/json" \
   -d '{
-    "path": "/tmp/my-project",
+    "path": "/tmp/example-project",
     "start_prompt": "recovery test"
   }'
 ```
 
 - Capture returned `project_id` and `foreman_agent_id`.
-- Stop and restart `codex-foreman` with same `--state-path`.
+- Stop and restart `foreman` with same project-local state path (`--state-path`).
 - Confirm `GET /projects/<project_id>` returns persisted metadata.
-- Confirm callbacks/hooks continue to trigger after restart.
+- Confirm callback dispatch continues to execute after restart.
+- Confirm `GET /projects/<project_id>/callback-status` reports lifecycle callback state.
 
 ## Agent flow
 
 ### Spawn + callback profile
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/agents \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/agents \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Write a one-line status update",
@@ -87,7 +92,7 @@ Save returned `id` as `<agent_id>`.
 ### Callback-only `/send`
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/send" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST "http://localhost/agents/<agent_id>/send" \
   -H "Content-Type: application/json" \
   -d '{
     "callback_events": ["turn/completed", "turn/aborted"],
@@ -98,7 +103,7 @@ curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/send" \
 ### Update callback and callback prefix
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/send" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST "http://localhost/agents/<agent_id>/send" \
   -H "Content-Type: application/json" \
   -d '{
     "callback_profile": "openclaw_webhook",
@@ -110,11 +115,11 @@ curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/send" \
 ### Steering + interrupt
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/steer" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST "http://localhost/agents/<agent_id>/steer" \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Please keep this short"}'
 
-curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/interrupt" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST "http://localhost/agents/<agent_id>/interrupt" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -122,7 +127,7 @@ curl -s -X POST "http://127.0.0.1:8787/agents/<agent_id>/interrupt" \
 ### Cleanup
 
 ```bash
-curl -s -X DELETE "http://127.0.0.1:8787/agents/<agent_id>"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X DELETE "http://localhost/agents/<agent_id>"
 ```
 
 ## Project flow
@@ -134,7 +139,7 @@ Use a real project folder with:
 ### Create project
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/projects \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/projects \
   -H "Content-Type: application/json" \
   -d '{
     "path": "/tmp/my-project",
@@ -148,19 +153,19 @@ Save `project_id` and `foreman_agent_id`.
 ### Spawn workers and steer foreman
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/projects/<project_id>/workers \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/projects/<project_id>/workers \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Investigate test failure in module X."
   }'
 
-curl -s -X POST http://127.0.0.1:8787/projects/<project_id>/foreman/send \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/projects/<project_id>/foreman/send \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Produce handoff notes and current risk list."
   }'
 
-curl -s -X POST "http://127.0.0.1:8787/projects/<project_id>/foreman/steer" \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST "http://localhost/projects/<project_id>/foreman/steer" \
   -H "Content-Type: application/json" \
   -d '{ "prompt":"Focus on blockers only." }'
 ```
@@ -168,11 +173,11 @@ curl -s -X POST "http://127.0.0.1:8787/projects/<project_id>/foreman/steer" \
 ### Compact + close
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/projects/<project_id>/compact \
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X POST http://localhost/projects/<project_id>/compact \
   -H "Content-Type: application/json" \
   -d '{ "reason": "Threshold policy trigger", "prompt": "Condense context and open next tasks." }'
 
-curl -s -X DELETE "http://127.0.0.1:8787/projects/<project_id>"
+curl --unix-socket "$FOREMAN_SOCKET_PATH" -s -X DELETE "http://localhost/projects/<project_id>"
 ```
 
 ## Callback verification
@@ -192,7 +197,7 @@ curl -s -X DELETE "http://127.0.0.1:8787/projects/<project_id>"
 - Confirm `/agents/:id/send` with no turn or callback changes returns `400`
 - Confirm project endpoints return expected IDs and statuses
 - Confirm service starts with both:
-  - `codex-foreman` uses local stdio `app-server` by default
+  - `foreman` uses local stdio `app-server` by default
 - Confirm API auth is enforced when `security.auth.enabled = true` and `/health` remains open.
 - Confirm command/webhook callback timeout paths do not block requests.
 - Confirm crash recovery restores state after process restart.
@@ -227,26 +232,39 @@ yq eval '.' .github/workflows/ci.yml
 
 ### Live mock demo (release gate)
 
-After endpoint-level tests pass, run a real mixed orchestration smoke:
+After endpoint-level tests pass, run a real mixed-or-worktree orchestration smoke:
 
 ```bash
 CODEX_BIN=/home/cmd/.npm-global/bin/codex \
-FOREMAN_BIN=target/release/codex-foreman \
+FOREMAN_BIN=target/release/foreman \
 JOB_TIMEOUT_MS=300000 \
 JOB_POLL_MS=500 \
-WORKTREE_CLEANUP=true \
-RUN_MOCK_DEMO_MODE=mixed \
-./contrib/run_mock_demo.sh
+WORKTREE_CLEANUP=false \
+RUN_MOCK_DEMO_MODE=worktree \
+./contrib/demo/run_demo.sh
 ```
 
 Success criteria:
 
 - exit code `0`
 - `result: success`
-- exactly four workers complete for mixed mode
+- for `RUN_MOCK_DEMO_MODE=worktree`: three workers complete
+- for `RUN_MOCK_DEMO_MODE=mixed`: four workers complete
 - all deliverable snapshots are created under:
-  - `contrib/mock/.audit/reports/`
+  - `contrib/demo/.audit/reports/`
 - non-fatal warnings only (e.g. empty `final_text` for `turn/completed`)
+
+To run mixed mode explicitly:
+
+```bash
+RUN_MOCK_DEMO_MODE=mixed ./contrib/demo/run_demo.sh
+```
+
+Or use the helper wrapper:
+
+```bash
+./contrib/demo/run_mixed.sh
+```
 
 Run the full release gate script when preparing a release:
 
@@ -258,14 +276,14 @@ Run the full release gate script when preparing a release:
 
 ### Mocks
 
-- `src/bin/fake_codex.rs` provides a deterministic JSON-RPC stub for tests.
+- `test/bin/fake_codex.rs` provides a deterministic JSON-RPC stub for tests.
 - Local webhook capture endpoints are started inside integration tests and record callback payloads.
 
 ### Fixtures
 
-- `tests/fixtures/project-valid/` — complete scaffold for project lifecycle tests.
-- `tests/fixtures/project-missing-worker/` — missing prompt file for validation failures.
-- `tests/fixtures/project-invalid-config/` — malformed `project.toml`.
+- `test/fixtures/project-valid/` — complete scaffold for project lifecycle tests.
+- `test/fixtures/project-missing-worker/` — missing prompt file for validation failures.
+- `test/fixtures/project-invalid-config/` — malformed `project.toml`.
 
 ## Test Commands
 

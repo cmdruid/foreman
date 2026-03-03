@@ -1,0 +1,20 @@
+# Demo-generated work artifacts
+/worktrees/
+worktrees/
+**/worktree*/
+*.log
+*.pid
+/tmp/
+/artifacts/
+artifacts/
+/task_state/
+/task-state/
+/task_state.json
+/task-state.json
+/demo-state*
+*.tmp
+*.swp
+*.swo
+.DS_Store
+
+.foreman/
