@@ -213,47 +213,6 @@ async fn main() -> anyhow::Result<()> {
         state_path: project_state_path.to_string_lossy().to_string(),
     };
 
-    let app = Router::new()
-        .route(consts::HEALTH_ROUTE, get(health))
-        .route(consts::ROUTE_AGENTS, post(spawn_agent).get(list_agents))
-        .route(consts::ROUTE_AGENT_ID, get(get_agent).delete(close_agent))
-        .route(consts::ROUTE_AGENT_RESULT, get(get_agent_result))
-        .route(consts::ROUTE_AGENT_WAIT, get(wait_agent_result))
-        .route(consts::ROUTE_AGENT_EVENTS, get(get_agent_events))
-        .route(consts::ROUTE_AGENT_SEND, post(send_turn))
-        .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
-        .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
-        .route(
-            consts::ROUTE_PROJECTS,
-            post(create_project).get(list_projects),
-        )
-        .route(
-            consts::ROUTE_PROJECT_ID,
-            get(get_project).delete(close_project),
-        )
-        .route(
-            consts::ROUTE_PROJECT_CALLBACK_STATUS,
-            get(get_project_callback_status),
-        )
-        .route(consts::ROUTE_PROJECT_WORKERS, post(spawn_project_worker))
-        .route(
-            consts::ROUTE_PROJECT_FOREMAN_SEND,
-            post(send_project_foreman_turn),
-        )
-        .route(
-            consts::ROUTE_PROJECT_FOREMAN_STEER,
-            post(steer_project_foreman),
-        )
-        .route(consts::ROUTE_PROJECT_COMPACT, post(compact_project))
-        .route(consts::ROUTE_PROJECT_JOBS, post(create_project_jobs))
-        .route(consts::ROUTE_JOBS, get(list_jobs))
-        .route(consts::ROUTE_JOB_ID, get(get_job))
-        .route(consts::ROUTE_JOB_RESULT, get(get_job_result))
-        .route(consts::ROUTE_JOB_WAIT, get(wait_job_result))
-        .route(consts::STATUS_ROUTE, get(get_status))
-        .with_state(state.clone())
-        .layer(from_fn_with_state(state.clone(), require_api_auth));
-
     #[cfg(not(unix))]
     return Err(anyhow::anyhow!(
         "foreman now requires unix sockets, which are unsupported on this platform"
@@ -261,6 +220,47 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
+        let app = Router::new()
+            .route(consts::HEALTH_ROUTE, get(health))
+            .route(consts::ROUTE_AGENTS, post(spawn_agent).get(list_agents))
+            .route(consts::ROUTE_AGENT_ID, get(get_agent).delete(close_agent))
+            .route(consts::ROUTE_AGENT_RESULT, get(get_agent_result))
+            .route(consts::ROUTE_AGENT_WAIT, get(wait_agent_result))
+            .route(consts::ROUTE_AGENT_EVENTS, get(get_agent_events))
+            .route(consts::ROUTE_AGENT_SEND, post(send_turn))
+            .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
+            .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
+            .route(
+                consts::ROUTE_PROJECTS,
+                post(create_project).get(list_projects),
+            )
+            .route(
+                consts::ROUTE_PROJECT_ID,
+                get(get_project).delete(close_project),
+            )
+            .route(
+                consts::ROUTE_PROJECT_CALLBACK_STATUS,
+                get(get_project_callback_status),
+            )
+            .route(consts::ROUTE_PROJECT_WORKERS, post(spawn_project_worker))
+            .route(
+                consts::ROUTE_PROJECT_FOREMAN_SEND,
+                post(send_project_foreman_turn),
+            )
+            .route(
+                consts::ROUTE_PROJECT_FOREMAN_STEER,
+                post(steer_project_foreman),
+            )
+            .route(consts::ROUTE_PROJECT_COMPACT, post(compact_project))
+            .route(consts::ROUTE_PROJECT_JOBS, post(create_project_jobs))
+            .route(consts::ROUTE_JOBS, get(list_jobs))
+            .route(consts::ROUTE_JOB_ID, get(get_job))
+            .route(consts::ROUTE_JOB_RESULT, get(get_job_result))
+            .route(consts::ROUTE_JOB_WAIT, get(wait_job_result))
+            .route(consts::STATUS_ROUTE, get(get_status))
+            .with_state(state.clone())
+            .layer(from_fn_with_state(state.clone(), require_api_auth));
+
         let listener = tokio::net::UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind unix socket '{}'", socket_path.display()))?;
         set_socket_permissions(&socket_path)?;
