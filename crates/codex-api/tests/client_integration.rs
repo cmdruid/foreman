@@ -335,12 +335,12 @@ done
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
             let contents = std::fs::read_to_string(&output_path).unwrap_or_default();
-            if contents.contains("server-approve-1") && contents.contains("decision\":\"accept\"") {
-                if contents.contains("server-tool-call")
-                    && contents.contains("\"content_items\":[]")
-                {
-                    return contents;
-                }
+            if contents.contains("server-approve-1")
+                && contents.contains("decision\":\"accept\"")
+                && contents.contains("server-tool-call")
+                && contents.contains("\"content_items\":[]")
+            {
+                return contents;
             }
         }
     })

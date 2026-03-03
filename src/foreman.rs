@@ -16,7 +16,7 @@ use reqwest::Client as HttpClient;
 use serde_json::Value;
 use tokio::{
     process::Command,
-    sync::{broadcast, Mutex, RwLock},
+    sync::{Mutex, RwLock, broadcast},
     time,
 };
 use tracing::{debug, warn};
@@ -30,9 +30,8 @@ use crate::{
         AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
         CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, JobResult,
         JobState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput, SpawnAgentRequest,
-        SpawnAgentResponse,
-        SpawnProjectRequest, SpawnProjectWorkerRequest, SpawnProjectWorkerResponse,
-        SteerAgentInput, WorkerWorktreeSpec,
+        SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
+        SpawnProjectWorkerResponse, SteerAgentInput, WorkerWorktreeSpec,
     },
     project::{CallbackSpec, ProjectConfig, ProjectRuntimeFiles},
     state::{
@@ -334,8 +333,8 @@ impl Foreman {
             if agent.restart_attempts >= max_restarts {
                 let result = Some(AgentResult {
                     agent_id,
-                status: constants::AGENT_STATUS_ABORTED.to_string(),
-                completion_method: Some(constants::EVENT_METHOD_TURN_ABORTED.to_string()),
+                    status: constants::AGENT_STATUS_ABORTED.to_string(),
+                    completion_method: Some(constants::EVENT_METHOD_TURN_ABORTED.to_string()),
                     turn_id: agent.active_turn_id.clone(),
                     final_text: None,
                     summary: Some("worker stalled and exceeded restart budget".to_string()),
@@ -534,9 +533,7 @@ impl Foreman {
         });
     }
 
-    async fn persist_state(
-        self: &Arc<Self>,
-    ) -> Result<()> {
+    async fn persist_state(self: &Arc<Self>) -> Result<()> {
         let agents = {
             let agents = self.agents.read().await;
             let mut snapshot = Vec::with_capacity(agents.len());
@@ -675,29 +672,29 @@ impl Foreman {
                     ));
                     should_update_job = true;
                 }
-                if method == constants::THREAD_EVENT_STARTED {
-                    if let Some(status) = params.get("status").and_then(|value| value.as_str()) {
-                        agent.status = status.to_string();
-                        if let Some(completion_method) = completion_method_for_thread_status(status) {
-                            let mut result = build_completion_result(
-                                agent.id,
-                                completion_method,
-                                parse_turn_id(&params).or_else(|| agent.active_turn_id.clone()),
-                                &params,
-                                ts,
-                                event_id,
-                            );
-                            if completion_method == constants::EVENT_METHOD_TURN_ABORTED
-                                && status != constants::EVENT_STATUS_ABORTED
-                            {
-                                result.status = constants::EVENT_STATUS_FAILED.to_string();
-                            }
-                            if let Some(error) = params.get("error").and_then(Value::as_str) {
-                                result.error = Some(error.to_string());
-                            }
-                            agent.result = Some(result);
-                            should_update_job = true;
+                if method == constants::THREAD_EVENT_STARTED
+                    && let Some(status) = params.get("status").and_then(|value| value.as_str())
+                {
+                    agent.status = status.to_string();
+                    if let Some(completion_method) = completion_method_for_thread_status(status) {
+                        let mut result = build_completion_result(
+                            agent.id,
+                            completion_method,
+                            parse_turn_id(&params).or_else(|| agent.active_turn_id.clone()),
+                            &params,
+                            ts,
+                            event_id,
+                        );
+                        if completion_method == constants::EVENT_METHOD_TURN_ABORTED
+                            && status != constants::EVENT_STATUS_ABORTED
+                        {
+                            result.status = constants::EVENT_STATUS_FAILED.to_string();
                         }
+                        if let Some(error) = params.get("error").and_then(Value::as_str) {
+                            result.error = Some(error.to_string());
+                        }
+                        agent.result = Some(result);
+                        should_update_job = true;
                     }
                 }
                 if method == constants::EVENT_METHOD_TURN_STARTED
@@ -747,8 +744,7 @@ impl Foreman {
         if let Some(context) = callback_context {
             if matches!(
                 context.method.as_str(),
-                constants::EVENT_METHOD_TURN_COMPLETED
-                    | constants::EVENT_METHOD_TURN_ABORTED
+                constants::EVENT_METHOD_TURN_COMPLETED | constants::EVENT_METHOD_TURN_ABORTED
             ) || should_update_job
             {
                 if let Some(job_id) = context.job_id {
@@ -960,7 +956,7 @@ impl Foreman {
                         .compact_project(
                             project_id,
                             CompactProjectRequest {
-                            prompt: None,
+                                prompt: None,
                                 reason: Some(constants::PROJECT_COMPACT_SUMMARY_PREFIX.to_string()),
                             },
                         )
@@ -1054,13 +1050,14 @@ impl Foreman {
             .dispatch_callback(context.clone(), context.callback.clone())
             .await
         {
-            Ok(()) => self
-                .set_project_lifecycle_callback_status(
+            Ok(()) => {
+                self.set_project_lifecycle_callback_status(
                     project.id,
                     lifecycle_key,
                     constants::PROJECT_CALLBACK_STATUS_SUCCESS,
                 )
-                .await,
+                .await
+            }
             Err(err) => {
                 let _ = self
                     .set_project_lifecycle_callback_status(
@@ -1113,9 +1110,7 @@ impl Foreman {
         status: &str,
     ) -> Result<()> {
         let mut projects = self.projects.write().await;
-        let project = projects
-            .get_mut(&project_id)
-            .context("project not found")?;
+        let project = projects.get_mut(&project_id).context("project not found")?;
         project
             .lifecycle_callback_status
             .insert(lifecycle_key.to_string(), status.to_string());
@@ -1303,7 +1298,7 @@ impl Foreman {
         let prefix = invocation.prompt_prefix.unwrap_or(base_prefix);
         let event_prompt_variable = profile
             .event_prompt_variable
-            .unwrap_or_else(|| constants::CALLBACK_VAR_WORKSPACE_PROMPT.to_string());
+            .unwrap_or_else(|| constants::CALLBACK_PROMPT_DEFAULT.to_string());
         let event_prompt = if prefix.trim().is_empty() {
             compact.clone()
         } else {
@@ -1314,19 +1309,28 @@ impl Foreman {
             constants::CALLBACK_EVENT_JSON_KEY.to_string(),
             compact.clone(),
         );
+        vars.insert(constants::CALLBACK_EVENT_PRETTY_KEY.to_string(), pretty);
         vars.insert(
-            constants::CALLBACK_EVENT_PRETTY_KEY.to_string(),
-            pretty,
+            constants::CALLBACK_EVENT_PAYLOAD_KEY.to_string(),
+            compact.clone(),
         );
         vars.insert(
             constants::CALLBACK_VAR_EVENT_PAYLOAD.to_string(),
             compact.clone(),
         );
-        vars.insert(constants::CALLBACK_EVENT_PROMPT_KEY.to_string(), event_prompt.clone());
+        vars.insert(
+            constants::CALLBACK_EVENT_PROMPT_KEY.to_string(),
+            event_prompt.clone(),
+        );
         vars.insert(event_prompt_variable.to_string(), event_prompt);
 
         let command = render_template_strict(&profile.program, &vars)
             .context("failed to render callback command program")?;
+        if !Path::new(&command).is_absolute() {
+            return Err(anyhow!(
+                "callback command program must resolve to an absolute path"
+            ));
+        }
         let args = if let Some(custom_args) = invocation.command_args {
             custom_args
         } else {
@@ -1398,6 +1402,8 @@ impl Foreman {
 
         if let Some(project_id) = context.project_id {
             payload[constants::PROJECT_VAR_ID] = serde_json::Value::String(project_id.to_string());
+            payload[constants::CALLBACK_VAR_PROJECT_ID] =
+                serde_json::Value::String(project_id.to_string());
         }
 
         if let Some(foreman_id) = context.foreman_id {
@@ -1453,7 +1459,14 @@ impl Foreman {
         }
 
         if let Some(project_id) = context.project_id {
-            inherited.insert(constants::PROJECT_VAR_ID.to_string(), project_id.to_string());
+            inherited.insert(
+                constants::PROJECT_VAR_ID.to_string(),
+                project_id.to_string(),
+            );
+            inherited.insert(
+                constants::CALLBACK_VAR_PROJECT_ID.to_string(),
+                project_id.to_string(),
+            );
         }
 
         if let Some(foreman_id) = context.foreman_id {
@@ -1463,7 +1476,10 @@ impl Foreman {
             );
         }
 
-        inherited.insert(constants::CALLBACK_VAR_TS.to_string(), context.ts.to_string());
+        inherited.insert(
+            constants::CALLBACK_VAR_TS.to_string(),
+            context.ts.to_string(),
+        );
         inherited.insert(
             constants::CALLBACK_EVENT_TYPE_KEY.to_string(),
             constants::CALLBACK_EVENT_TYPE_AGENT_EVENT.to_string(),
@@ -1481,12 +1497,18 @@ impl Foreman {
             .callback_vars(context, HashMap::new())
             .context("failed to build base callback vars")?;
 
-        vars.insert(constants::PROJECT_VAR_ID.to_string(), project.id.to_string());
+        vars.insert(
+            constants::PROJECT_VAR_ID.to_string(),
+            project.id.to_string(),
+        );
         vars.insert(
             constants::PROJECT_VAR_PATH.to_string(),
             project.path.clone(),
         );
-        vars.insert(constants::PROJECT_VAR_NAME.to_string(), project.name.clone());
+        vars.insert(
+            constants::PROJECT_VAR_NAME.to_string(),
+            project.name.clone(),
+        );
         vars.insert(
             constants::PROJECT_VAR_STATUS.to_string(),
             project.status.clone(),
@@ -1607,11 +1629,10 @@ impl Foreman {
             .context("failed to spawn project foreman")?;
 
         let name = config.name.clone().unwrap_or_else(|| {
-            path.file_name()
-                .map_or_else(
-                    || constants::DEFAULT_PROJECT_NAME.to_string(),
-                    |name| name.to_string_lossy().to_string(),
-                )
+            path.file_name().map_or_else(
+                || constants::DEFAULT_PROJECT_NAME.to_string(),
+                |name| name.to_string_lossy().to_string(),
+            )
         });
 
         let ts = now_ts();
@@ -1850,12 +1871,12 @@ impl Foreman {
                 )
                 .context("failed to resolve worker callback")?;
 
-        let worker_prompt = format!(
-            "{}\n\n{}{}\n",
-            project.runtime.worker_prompt,
-            constants::PROJECT_TASK_LABEL,
-            spec.prompt
-        );
+            let worker_prompt = format!(
+                "{}\n\n{}{}\n",
+                project.runtime.worker_prompt,
+                constants::PROJECT_TASK_LABEL,
+                spec.prompt
+            );
             let project_path = project.runtime.path.to_string_lossy().to_string();
             let worker_cwd = self
                 .resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
@@ -1893,7 +1914,7 @@ impl Foreman {
         let job_labels = aggregate_worker_labels(&labels);
         {
             let mut project_record = self.projects.write().await;
-        if let Some(project_record) = project_record.get_mut(&project_id) {
+            if let Some(project_record) = project_record.get_mut(&project_id) {
                 project_record.worker_ids.extend(worker_ids.iter().copied());
                 project_record.updated_at = now_ts();
             }
@@ -1952,12 +1973,8 @@ impl Foreman {
             .to_string();
 
         if worktree.create {
-            self.create_worktree(
-                project_path,
-                &worktree_path,
-                worktree.base_ref.as_deref(),
-            )
-            .await?;
+            self.create_worktree(project_path, &worktree_path, worktree.base_ref.as_deref())
+                .await?;
             return Ok(worktree_path);
         }
 
@@ -1986,7 +2003,7 @@ impl Foreman {
         if Path::new(worktree_path).exists() {
             if Path::new(worktree_path).is_dir() {
                 let verify = Command::new(constants::WORKTREE_GIT_COMMAND)
-                .arg(constants::WORKTREE_OPTION_WORKDIR)
+                    .arg(constants::WORKTREE_OPTION_WORKDIR)
                     .arg(worktree_path)
                     .arg(constants::WORKTREE_VERIFY_COMMAND)
                     .arg(constants::WORKTREE_VERIFY_ARG)
@@ -2003,7 +2020,9 @@ impl Foreman {
                 }
             }
 
-            return Err(anyhow!("worktree path already exists but is not a git worktree: {worktree_path}"));
+            return Err(anyhow!(
+                "worktree path already exists but is not a git worktree: {worktree_path}"
+            ));
         }
 
         let base_ref = base_ref.unwrap_or(constants::WORKTREE_BASE_REF_DEFAULT);
@@ -2200,14 +2219,14 @@ impl Foreman {
                         });
                     }
 
-                        return Ok(crate::models::JobWaitResponse {
-                            result: JobResult {
-                                id: job_id,
-                                project_id: None,
-                                status: constants::JOB_STATUS_UNKNOWN.to_string(),
-                                total_workers: 0,
-                                completed_workers: 0,
-                                running_workers: 0,
+                    return Ok(crate::models::JobWaitResponse {
+                        result: JobResult {
+                            id: job_id,
+                            project_id: None,
+                            status: constants::JOB_STATUS_UNKNOWN.to_string(),
+                            total_workers: 0,
+                            completed_workers: 0,
+                            running_workers: 0,
                             failed_workers: 0,
                             worker_count: 0,
                             workers: Vec::new(),
@@ -2604,10 +2623,10 @@ impl Foreman {
         self.schedule_state_persist();
 
         Ok(SpawnAgentResponse {
-                id: agent_meta.id,
-                thread_id: request.thread_id,
-                turn_id,
-                status: constants::AGENT_STATUS_RUNNING.to_string(),
+            id: agent_meta.id,
+            thread_id: request.thread_id,
+            turn_id,
+            status: constants::AGENT_STATUS_RUNNING.to_string(),
             project_id: agent_meta.project_id,
             role: agent_meta.role.as_str().to_string(),
             foreman_id: agent_meta.foreman_id,
@@ -2835,9 +2854,8 @@ impl Foreman {
         poll_ms: Option<u64>,
         include_events: bool,
     ) -> Result<crate::models::AgentWaitResponse> {
-        let poll_interval = std::time::Duration::from_millis(
-            poll_ms.unwrap_or(constants::DEFAULT_WAIT_POLL_MS),
-        );
+        let poll_interval =
+            std::time::Duration::from_millis(poll_ms.unwrap_or(constants::DEFAULT_WAIT_POLL_MS));
         let has_timeout = timeout_ms.unwrap_or(0) > 0;
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(0));
         let deadline = if has_timeout {
@@ -2850,7 +2868,8 @@ impl Foreman {
             let agent_result = self.get_agent_result(agent_id).await;
             if let Ok(result) = &agent_result {
                 let complete = result.completed_at.is_some()
-                    || (result.status != constants::AGENT_STATUS_RUNNING && result.turn_id.is_none())
+                    || (result.status != constants::AGENT_STATUS_RUNNING
+                        && result.turn_id.is_none())
                     || result.status == constants::AGENT_STATUS_ORPHANED;
                 if complete {
                     return Ok(crate::models::AgentWaitResponse {
@@ -3348,7 +3367,7 @@ fn json_pretty_value(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn extract_item_payload<'a>(params: &'a Value) -> Option<&'a Value> {
+fn extract_item_payload(params: &Value) -> Option<&Value> {
     params
         .get("item")
         .or_else(|| params.get("msg").and_then(|msg| msg.get("item")))
@@ -3361,7 +3380,7 @@ fn is_agent_item_completion(item: &Value) -> bool {
     let Some(role) = role else {
         return match item_type {
             Some(item_type) if item_type.eq_ignore_ascii_case("usermessage") => false,
-            Some(item_type) if item_type == "user_message" => false,
+            Some("user_message") => false,
             _ => true,
         };
     };
@@ -3372,14 +3391,13 @@ fn is_agent_item_completion(item: &Value) -> bool {
 
     match item_type {
         Some(item_type) if item_type.eq_ignore_ascii_case("usermessage") => false,
-        Some(item_type) if item_type == "user_message" => false,
+        Some("user_message") => false,
         _ => true,
     }
 }
 
 fn is_agent_item_completion_payload(params: &Value) -> bool {
-    extract_item_payload(params)
-        .map_or(false, is_agent_item_completion)
+    extract_item_payload(params).is_some_and(is_agent_item_completion)
 }
 
 fn extract_agent_result_text(method: &str, params: &Value) -> Option<String> {
@@ -3398,16 +3416,13 @@ fn extract_agent_result_text(method: &str, params: &Value) -> Option<String> {
                 .and_then(extract_text_from_item)
         }),
         constants::EVENT_METHOD_ITEM_AGENT_MESSAGE
-        | constants::EVENT_METHOD_ITEM_AGENT_MESSAGE_DELTA => {
-            extract_text_from_params(params, &["text", "message", "delta", "snippet"]).or_else(
-                || {
-                    extract_text_from_params(
-                        params.get("msg")?,
-                        &["text", "message", "delta", "snippet"],
-                    )
-                },
-            )
-        }
+        | constants::EVENT_METHOD_ITEM_AGENT_MESSAGE_DELTA => extract_text_from_params(
+            params,
+            &["text", "message", "delta", "snippet"],
+        )
+        .or_else(|| {
+            extract_text_from_params(params.get("msg")?, &["text", "message", "delta", "snippet"])
+        }),
         constants::EVENT_METHOD_ITEM_COMPLETED => extract_item_payload(params)
             .and_then(extract_text_from_item)
             .or_else(|| {
@@ -3500,9 +3515,7 @@ fn completion_method_for_thread_status(status: &str) -> Option<&'static str> {
         | constants::EVENT_STATUS_ERROR
         | constants::EVENT_STATUS_STOPPED
         | constants::EVENT_STATUS_TIMEOUT
-        | constants::EVENT_STATUS_TIMED_OUT => {
-            Some(constants::EVENT_METHOD_TURN_ABORTED)
-        }
+        | constants::EVENT_STATUS_TIMED_OUT => Some(constants::EVENT_METHOD_TURN_ABORTED),
         _ => None,
     }
 }
@@ -3612,7 +3625,9 @@ fn extract_result_references(params: &Value) -> Option<Vec<String>> {
             parse_references_value(params.get("item").and_then(|item| item.get("references")))
         })
         .or_else(|| {
-            parse_references_value(extract_item_payload(params).and_then(|item| item.get("references")))
+            parse_references_value(
+                extract_item_payload(params).and_then(|item| item.get("references")),
+            )
         })
         .or_else(|| {
             parse_references_value(
@@ -3877,9 +3892,9 @@ fn persist_worker_callback(callback: &WorkerCallback) -> PersistedWorkerCallback
     }
 }
 
-    fn restore_project_record(record: PersistedProjectRecord) -> Result<ProjectRecord> {
-        let id = Uuid::parse_str(&record.id).context("invalid persisted project id")?;
-        let foreman_agent_id = record
+fn restore_project_record(record: PersistedProjectRecord) -> Result<ProjectRecord> {
+    let id = Uuid::parse_str(&record.id).context("invalid persisted project id")?;
+    let foreman_agent_id = record
         .foreman_agent_id
         .map(|value| Uuid::parse_str(&value))
         .transpose()

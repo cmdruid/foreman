@@ -20,6 +20,12 @@ impl RequestId {
     }
 }
 
+impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JSONRPCMessage {
@@ -78,35 +84,32 @@ fn parse_id_field(value: &serde_json::Value, candidates: &[&str]) -> Option<Stri
 }
 
 fn parse_thread_id_from_message(value: &serde_json::Value) -> Option<String> {
-    parse_id_field(
-        value,
-        &["threadId", "thread_id"],
-    )
-    .or_else(|| {
-        value
-            .get("thread")
-            .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
-    })
-    .or_else(|| parse_id_field(value, &["conversationId", "conversation_id"]))
-    .or_else(|| {
-        value.get("conversation").and_then(|conversation| {
-            parse_id_field(
-                conversation,
-                &[
-                    "threadId",
-                    "thread_id",
-                    "id",
-                    "conversationId",
-                    "conversation_id",
-                ],
-            )
-            .or_else(|| {
-                conversation
-                    .get("thread")
-                    .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+    parse_id_field(value, &["threadId", "thread_id"])
+        .or_else(|| {
+            value
+                .get("thread")
+                .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+        })
+        .or_else(|| parse_id_field(value, &["conversationId", "conversation_id"]))
+        .or_else(|| {
+            value.get("conversation").and_then(|conversation| {
+                parse_id_field(
+                    conversation,
+                    &[
+                        "threadId",
+                        "thread_id",
+                        "id",
+                        "conversationId",
+                        "conversation_id",
+                    ],
+                )
+                .or_else(|| {
+                    conversation
+                        .get("thread")
+                        .and_then(|thread| parse_id_field(thread, &["id", "threadId", "thread_id"]))
+                })
             })
         })
-    })
 }
 
 fn parse_turn_id_from_message(value: &serde_json::Value) -> Option<String> {
@@ -187,9 +190,7 @@ pub fn parse_turn_id(params: &serde_json::Value) -> Option<String> {
                     )
                     .or_else(|| {
                         parse_turn_id_from_message(
-                            conversation
-                                .get("msg")
-                                .unwrap_or(&serde_json::json!(null)),
+                            conversation.get("msg").unwrap_or(&serde_json::json!(null)),
                         )
                     })
                 })
@@ -233,7 +234,9 @@ mod tests {
             Some("thread-002".into())
         );
         assert_eq!(
-            parse_thread_id(&json!({"msg":{"conversationId":"conv-3","thread":{"id":"thread-003"}}})),
+            parse_thread_id(
+                &json!({"msg":{"conversationId":"conv-3","thread":{"id":"thread-003"}}})
+            ),
             Some("thread-003".into())
         );
         assert_eq!(

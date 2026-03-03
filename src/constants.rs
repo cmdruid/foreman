@@ -61,7 +61,6 @@ pub const DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS: u64 = 750;
 pub const DEFAULT_WORKER_CALLBACK_TIMEOUT_MS: u64 = 5_000;
 pub const MIN_WORKER_MONITOR_INTERVAL_MS: u64 = 50;
 pub const DEFAULT_WAIT_POLL_MS: u64 = 250;
-pub const DEFAULT_RESTART_MONITORING_DELAY_MS: u64 = 50;
 pub const MILLISECONDS_PER_SECOND: u64 = 1000;
 
 pub const CODEX_EVENT_METHOD_PREFIX: &str = "codex/event/";
@@ -124,7 +123,6 @@ pub const CALLBACK_VAR_FOREMAN_ID: &str = "foreman_id";
 pub const CALLBACK_VAR_RESULT: &str = "result";
 pub const CALLBACK_VAR_CALLBACK_VARS: &str = "callback_vars";
 pub const CALLBACK_VAR_EVENT_PAYLOAD: &str = "event_payload";
-pub const CALLBACK_VAR_WORKSPACE_PROMPT: &str = "event_prompt";
 pub const CALLBACK_VAR_REASON: &str = "reason";
 pub const CALLBACK_PROMPT_DEFAULT: &str = "event_prompt";
 pub const PROJECT_VAR_ID: &str = "project_id";
@@ -164,24 +162,8 @@ pub const WORKTREE_BASE_REF_DEFAULT: &str = "HEAD";
 pub const WORKTREE_GIT_COMMAND: &str = "git";
 pub const WORKTREE_COMMAND: &str = "worktree";
 pub const WORKTREE_ARG_ADD: &str = "add";
-pub const WORKTREE_ARG_DETACH: &str = "--detach";
 pub const WORKTREE_OPTION_WORKDIR: &str = "-C";
-
-
-pub const APP_SERVER_COMMAND: &str = "app-server";
-pub const APP_SERVER_METHOD_INITIALIZE: &str = "initialize";
-pub const APP_SERVER_METHOD_INITIALIZED: &str = "initialized";
-pub const APP_SERVER_UNHANDLED_ERROR_CODE: i64 = -32601;
-pub const APP_SERVER_UNHANDLED_MESSAGE: &str = "Request not handled by foreman";
-
-pub const APP_SERVER_METHOD_THREAD_INTERRUPT: &str = "thread/interrupt";
-pub const APP_SERVER_METHOD_TURN_INTERRUPT: &str = "turn/interrupt";
-pub const APP_SERVER_METHOD_THREAD_START: &str = "thread/start";
-pub const APP_SERVER_METHOD_TURN_START: &str = "turn/start";
-pub const APP_SERVER_METHOD_TURN_STEER: &str = "turn/steer";
 
 pub const DEFAULT_AUTH_HEADER_NAME: &str = "authorization";
 pub const DEFAULT_AUTH_SKIP_PATH: &str = "/health";
 pub const PERSISTED_STATE_VERSION: u32 = 1;
-
-pub const APP_SERVER_ID_KEY: &str = "threadId";

@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf, time::{Duration, Instant}};
+use std::{
+    env, fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use codex_api::{
     AppServerClient, ModelListResponse, TextPayload, ThreadInterruptRequest, ThreadStartRequest,
@@ -37,16 +41,16 @@ struct SmokeModel {
 
 fn select_model_for_smoke_response(response: &ModelListResponse) -> SmokeModel {
     for candidate in &response.data {
-        if let Some(model) = candidate.model.as_deref().or(candidate.id.as_deref()) {
-            if model.contains("codex") {
-                return SmokeModel {
-                    id: model.to_string(),
-                    provider: candidate
-                        .provider
-                        .clone()
-                        .or_else(|| candidate.model_provider.clone()),
-                };
-            }
+        if let Some(model) = candidate.model.as_deref().or(candidate.id.as_deref())
+            && model.contains("codex")
+        {
+            return SmokeModel {
+                id: model.to_string(),
+                provider: candidate
+                    .provider
+                    .clone()
+                    .or_else(|| candidate.model_provider.clone()),
+            };
         }
     }
 
@@ -54,7 +58,10 @@ fn select_model_for_smoke_response(response: &ModelListResponse) -> SmokeModel {
         .data
         .first()
         .and_then(|first| {
-            let provider = first.provider.clone().or_else(|| first.model_provider.clone());
+            let provider = first
+                .provider
+                .clone()
+                .or_else(|| first.model_provider.clone());
             first
                 .model
                 .as_deref()
@@ -116,8 +123,7 @@ async fn codex_api_smoke_app_server_creates_real_file() {
 
     let prompt = format!(
         "Create the file `{}` using shell commands and write exactly this content: `{}`. Return DONE.",
-        SMOKE_FILE_REL_PATH,
-        output_text
+        SMOKE_FILE_REL_PATH, output_text
     );
 
     let mut event_rx = client.subscribe_events();
@@ -159,13 +165,13 @@ async fn codex_api_smoke_app_server_creates_real_file() {
         "smoke test timed out after {SMOKE_TIMEOUT:?}; saw_command_execution={saw_command_execution}, saw_turn_complete={saw_turn_complete}, file_exists={}",
         output_path.exists()
     );
-    assert!(output_path.exists(), "smoke expected output file {SMOKE_FILE_REL_PATH} to exist");
+    assert!(
+        output_path.exists(),
+        "smoke expected output file {SMOKE_FILE_REL_PATH} to exist"
+    );
 
     let generated = fs::read_to_string(output_path.clone()).expect("smoke file should be written");
-    assert!(
-        !generated.is_empty(),
-        "smoke file was created but empty"
-    );
+    assert!(!generated.is_empty(), "smoke file was created but empty");
     assert!(
         generated.contains(output_text),
         "unexpected smoke file content: {generated}"
@@ -262,7 +268,8 @@ async fn codex_api_smoke_app_server_turn_contract() {
             thread_id: thread.thread_id.clone(),
             expected_turn_id: turn.turn_id.clone(),
             input: vec![TextPayload::text(
-                "If the previous command is still running, do not cancel it. Return DONE.".to_string(),
+                "If the previous command is still running, do not cancel it. Return DONE."
+                    .to_string(),
             )],
         })
         .await;
@@ -297,7 +304,10 @@ async fn codex_api_smoke_app_server_turn_contract() {
         saw_turn_started || saw_turn_completed || saw_command_event,
         "expected turn lifecycle or command-related events"
     );
-    assert!(saw_command_event, "expected command-related event during steer smoke");
+    assert!(
+        saw_command_event,
+        "expected command-related event during steer smoke"
+    );
     assert!(saw_turn_started, "expected turn/started notification");
 }
 
@@ -329,10 +339,7 @@ async fn codex_api_smoke_app_server_model_list() {
         .or_else(|| response.get("models"))
         .and_then(Value::as_array)
         .expect("model list payload should include an array under `data` or `models`");
-    assert!(
-        !models.is_empty(),
-        "model/list returned no models"
-    );
+    assert!(!models.is_empty(), "model/list returned no models");
 }
 
 #[tokio::test]
@@ -374,8 +381,7 @@ async fn codex_api_smoke_app_server_turn_interrupt() {
         .turn_start(&TurnStartRequest {
             thread_id: thread.thread_id.clone(),
             input: vec![TextPayload::text(
-                "Echo `interrupt-smoke` and return DONE."
-                    .to_string(),
+                "Echo `interrupt-smoke` and return DONE.".to_string(),
             )],
         })
         .await
@@ -408,12 +414,13 @@ async fn codex_api_smoke_app_server_turn_interrupt() {
     if let Err(err) = turn_interrupt_result {
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("no active turn") || msg.contains("not found") || msg.contains("already completed"),
+            msg.contains("no active turn")
+                || msg.contains("not found")
+                || msg.contains("already completed"),
             "unexpected interrupt error: {msg}"
         );
         return;
     }
-
 }
 
 #[tokio::test]
@@ -452,7 +459,10 @@ async fn codex_api_smoke_app_server_thread_interrupt() {
         .expect("start app-server thread");
 
     let thread_interrupt = client
-        .request::<_, Value>("thread/interrupt", &serde_json::json!({ "thread_id": thread.thread_id }))
+        .request::<_, Value>(
+            "thread/interrupt",
+            &serde_json::json!({ "thread_id": thread.thread_id }),
+        )
         .await;
 
     match thread_interrupt {

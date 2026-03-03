@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::constants;
 use crate::models::{AgentEventDto, AgentResult};
 use crate::project::ProjectConfig;
-use crate::constants;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {

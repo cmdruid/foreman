@@ -22,12 +22,12 @@
 //! - `item/tool/requestUserInput`
 //! - `item/tool/call`
 pub mod client;
-pub mod protocol;
 pub mod constants;
+pub mod protocol;
 
 pub use client::{
-    AppServerClient, EmptyResponse, RawNotification, TextPayload, ThreadStartRequest,
-    ModelListEntry, ModelListRequest, ModelListResponse, ThreadInterruptRequest, ThreadStartResponse,
+    AppServerClient, EmptyResponse, ModelListEntry, ModelListRequest, ModelListResponse,
+    RawNotification, TextPayload, ThreadInterruptRequest, ThreadStartRequest, ThreadStartResponse,
     TurnInterruptRequest, TurnStartRequest, TurnStartResponse, TurnSteerRequest, TurnSteerResponse,
 };
 pub use protocol::{

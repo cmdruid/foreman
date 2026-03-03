@@ -115,7 +115,8 @@ impl ProjectConfig {
 
         let raw = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read project config {}", config_path.display()))?;
-        let manifest: toml::Value = toml::from_str(&raw).context("invalid project config format")?;
+        let manifest: toml::Value =
+            toml::from_str(&raw).context("invalid project config format")?;
         if manifest.get("hooks").is_some() {
             anyhow::bail!(
                 "project config uses unsupported [hooks]; replace with [callbacks.lifecycle]"

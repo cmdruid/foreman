@@ -75,8 +75,9 @@ fn run_stub_server() {
                 );
             }
             "thread/start" => {
-                let thread_id = parse_string_param(&params, "thread")
-                    .unwrap_or_else(|| format!("thread-{}", thread_counter.fetch_add(1, Ordering::SeqCst)));
+                let thread_id = parse_string_param(&params, "thread").unwrap_or_else(|| {
+                    format!("thread-{}", thread_counter.fetch_add(1, Ordering::SeqCst))
+                });
                 send_response(
                     &mut stdout,
                     &id,
@@ -96,13 +97,13 @@ fn run_stub_server() {
                     .unwrap_or_else(|| "thread-unknown".to_string());
                 let input = params.get("input").cloned().unwrap_or_else(|| json!([]));
                 let text = extract_prompt_text_from_input(&input);
-                let should_stall = if has_stall_marker(&text) && !thread_stall_state.contains(&thread_id)
-                {
-                    thread_stall_state.insert(thread_id.clone());
-                    true
-                } else {
-                    false
-                };
+                let should_stall =
+                    if has_stall_marker(&text) && !thread_stall_state.contains(&thread_id) {
+                        thread_stall_state.insert(thread_id.clone());
+                        true
+                    } else {
+                        false
+                    };
 
                 send_response(&mut stdout, &id, json!({"turnId": turn_id}));
 

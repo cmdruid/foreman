@@ -22,7 +22,8 @@ async fn test_standalone_agent_flow_with_callbacks() {
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
 
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let create = client
@@ -140,7 +141,8 @@ async fn test_agent_result_and_wait_endpoints() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let create = client
@@ -255,7 +257,8 @@ async fn test_callback_prompt_prefix_passes_rendered_event_payload_to_command() 
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
 
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
     let create = client
@@ -309,7 +312,8 @@ async fn test_command_callback_strictly_requires_template_variables() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let create = client
@@ -359,7 +363,8 @@ async fn test_api_auth() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let unauth = client
@@ -441,7 +446,8 @@ async fn test_command_callback_timeout_isolation() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let create = client
@@ -488,7 +494,8 @@ async fn test_recovery_after_process_crash() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let agent_create = client
@@ -517,7 +524,8 @@ async fn test_recovery_after_process_crash() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     harness.terminate().await;
 
-    let restarted = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let restarted =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let recovered_agents = client
         .get(format!("{}/agents", restarted.base_url))
         .send()
@@ -574,7 +582,8 @@ async fn test_project_lifecycle_and_recovery() {
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
 
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -655,7 +664,8 @@ async fn test_project_lifecycle_and_recovery() {
     assert!(webhook.wait_for_events(1, Duration::from_secs(3)).await);
 
     harness.terminate().await;
-    let restarted = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let restarted =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let recovered_projects = client
         .get(format!("{}/projects", restarted.base_url))
         .send()
@@ -722,7 +732,8 @@ async fn test_project_worker_callback_overrides_with_nested_object() {
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
 
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -801,7 +812,8 @@ async fn test_project_job_creation_and_result() {
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
 
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -971,7 +983,11 @@ mock_write_deliverable() {
   category="$3"
   worktree_path="$4"
 
-  [ -z "$worktree_path" ] && worktree_path="/tmp/fake-worktree-${thread_id}-${turn_id}-${category}"
+  case "$worktree_path" in
+    ""|*"<path>"*)
+      worktree_path="/tmp/fake-worktree-${thread_id}-${turn_id}-${category}"
+      ;;
+  esac
 
   mkdir -p "$worktree_path/.audit-generated"
   printf '%s\n' "# Worker Deliverable" > "$worktree_path/.audit-generated/${category}-worker-deliverable.md"
@@ -1153,9 +1169,7 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
     assert_eq!(result["timed_out"].as_bool(), Some(false));
     let status = result["status"].as_str().expect("job status");
     assert!(matches!(status, "completed" | "partial" | "failed"));
-    let workers_result = result["workers"]
-        .as_array()
-        .expect("job workers array");
+    let workers_result = result["workers"].as_array().expect("job workers array");
     assert_eq!(workers_result.len(), work_items.len());
     assert_eq!(
         result["total_workers"].as_u64().expect("total workers"),
@@ -1164,9 +1178,7 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
 
     for (idx, worker) in workers_result.iter().enumerate() {
         let mut worker_final_text = worker["final_text"].as_str().map(|text| text.to_string());
-        let worker_id = worker["agent_id"]
-            .as_str()
-            .expect("worker has agent_id");
+        let worker_id = worker["agent_id"].as_str().expect("worker has agent_id");
         let mut worker_status = worker["status"].as_str().unwrap_or("unknown").to_string();
         let mut completion_method = worker["completion_method"]
             .as_str()
@@ -1187,13 +1199,10 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
                 .json::<Value>()
                 .await
                 .expect("worker wait payload");
-            assert_eq!(
-                worker_wait_response["timed_out"].as_bool(),
-                Some(false)
-            );
+            assert_eq!(worker_wait_response["timed_out"].as_bool(), Some(false));
             worker_status = worker_wait_response["status"]
                 .as_str()
-                .unwrap_or_else(|| worker_status.as_str())
+                .unwrap_or(worker_status.as_str())
                 .to_string();
             completion_method = worker_wait_response["completion_method"]
                 .as_str()
@@ -1210,8 +1219,8 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
             .unwrap_or_else(|| work_items[idx].0.to_string());
         let default_worktree_path = worktree_base.join(&category);
         let default_worktree = default_worktree_path.to_string_lossy().to_string();
-        let worktree_path = label_value_to_string(labels, "worktree_path")
-            .unwrap_or(default_worktree);
+        let worktree_path =
+            label_value_to_string(labels, "worktree_path").unwrap_or(default_worktree);
 
         let worker_events = client
             .get(format!("{}/agents/{}/events", harness.base_url, worker_id))
@@ -1221,9 +1230,7 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
             .json::<Value>()
             .await
             .expect("worker events payload");
-        let events = worker_events
-            .as_array()
-            .expect("worker events as array");
+        let events = worker_events.as_array().expect("worker events as array");
 
         let deliverable = worker_final_text
             .as_deref()
@@ -1232,17 +1239,17 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
                 Some(
                     PathBuf::from(worktree_path)
                         .join(".audit-generated")
-                    .join(format!("{category}-worker-deliverable.md"))
+                        .join(format!("{category}-worker-deliverable.md"))
                         .to_string_lossy()
-                    .to_string(),
+                        .to_string(),
                 )
             })
             .map(PathBuf::from)
             .expect("deliverable path");
 
-        let has_command_event = events.iter().any(|event| {
-            is_command_like_event(event["method"].as_str().unwrap_or(""))
-        });
+        let has_command_event = events
+            .iter()
+            .any(|event| is_command_like_event(event["method"].as_str().unwrap_or("")));
         assert!(
             has_command_event,
             "worker {worker_id} should emit command-like event stream"
@@ -1256,7 +1263,10 @@ async fn test_project_job_dispatches_workers_with_fake_app_server() {
             assert_eq!(completion_method.as_deref(), Some("turn/completed"));
         }
 
-        assert!(deliverable.exists(), "missing worker deliverable at {deliverable:?}");
+        assert!(
+            deliverable.exists(),
+            "missing worker deliverable at {deliverable:?}"
+        );
         let contents = fs::read_to_string(&deliverable).expect("read worker deliverable");
         assert!(
             !contents.trim().is_empty(),
@@ -1396,35 +1406,47 @@ async fn test_project_job_failures_from_thread_status_status_map_to_failed_resul
         2
     );
 
-    let workers = job_result["workers"]
-        .as_array()
-        .expect("workers array");
+    let workers = job_result["workers"].as_array().expect("workers array");
     assert_eq!(workers[0]["status"].as_str(), Some("completed"));
     assert_eq!(workers[1]["status"].as_str(), Some("failed"));
-    assert_eq!(workers[1]["completion_method"].as_str(), Some("turn/aborted"));
+    assert_eq!(
+        workers[1]["completion_method"].as_str(),
+        Some("turn/aborted")
+    );
     assert!(workers[0]["final_text"].as_str().is_some());
     assert!(workers[1]["final_text"].is_null() || workers[1]["final_text"].as_str().is_none());
 
     let failed_worker_id = workers[1]["agent_id"].as_str().expect("failed worker id");
     let events = client
-        .get(format!("{}/agents/{}/events", harness.base_url, failed_worker_id))
+        .get(format!(
+            "{}/agents/{}/events",
+            harness.base_url, failed_worker_id
+        ))
         .send()
         .await
         .expect("worker events");
     assert_eq!(events.status(), StatusCode::OK);
     let events = events.json::<Value>().await.expect("worker events payload");
-    let events = events
-        .as_array()
-        .expect("worker events as array");
+    let events = events.as_array().expect("worker events as array");
     assert!(events.iter().any(|event| {
         event["method"].as_str() == Some("thread/status/changed")
-            && event["params"]["status"].as_str().is_some_and(|status| status == "error")
+            && event["params"]["status"]
+                .as_str()
+                .is_some_and(|status| status == "error")
     }));
 
-    let success_deliverable = success_worktree.join(".audit-generated/security-worker-deliverable.md");
-    assert!(success_deliverable.exists(), "successful worker should create deliverable");
-    let failure_deliverable = fail_worktree.join(".audit-generated/robustness-worker-deliverable.md");
-    assert!(!failure_deliverable.exists(), "failed worker should not create deliverable");
+    let success_deliverable =
+        success_worktree.join(".audit-generated/security-worker-deliverable.md");
+    assert!(
+        success_deliverable.exists(),
+        "successful worker should create deliverable"
+    );
+    let failure_deliverable =
+        fail_worktree.join(".audit-generated/robustness-worker-deliverable.md");
+    assert!(
+        !failure_deliverable.exists(),
+        "failed worker should not create deliverable"
+    );
 
     let project_delete = client
         .delete(format!("{}/projects/{project_id}", harness.base_url))
@@ -1443,14 +1465,14 @@ async fn test_worker_monitoring_restarts_stalled_worker() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");
     let service_config = temp.path().join("service.toml");
-    let service_config_contents =
-        service_config_template_worker_monitoring(6_000, 1, 300);
+    let service_config_contents = service_config_template_worker_monitoring(6_000, 1, 300);
     common::write_service_config(&service_config, service_config_contents.as_str())
         .expect("write service config");
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -1507,15 +1529,17 @@ async fn test_worker_monitoring_restarts_stalled_worker() {
         .expect("worker events");
     assert_eq!(events.status(), StatusCode::OK);
     let events = events.json::<Value>().await.expect("worker events payload");
-    let events = events
-        .as_array()
-        .expect("worker events as array");
-    assert!(events
-        .iter()
-        .any(|event| event["method"].as_str() == Some("turn/aborted")));
-    assert!(events
-        .iter()
-        .any(|event| event["method"].as_str() == Some("turn/completed")));
+    let events = events.as_array().expect("worker events as array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"].as_str() == Some("turn/aborted"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"].as_str() == Some("turn/completed"))
+    );
 
     harness.terminate().await;
 }
@@ -1527,14 +1551,14 @@ async fn test_worker_monitoring_failures_when_restart_budget_exhausted() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");
     let service_config = temp.path().join("service.toml");
-    let service_config_contents =
-        service_config_template_worker_monitoring(1_000, 0, 250);
+    let service_config_contents = service_config_template_worker_monitoring(1_000, 0, 250);
     common::write_service_config(&service_config, service_config_contents.as_str())
         .expect("write service config");
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -1587,9 +1611,7 @@ async fn test_worker_monitoring_failures_when_restart_budget_exhausted() {
         wait_payload["completion_method"].as_str(),
         Some("turn/aborted")
     );
-    let error = wait_payload["error"]
-        .as_str()
-        .expect("worker error text");
+    let error = wait_payload["error"].as_str().expect("worker error text");
     assert!(error.contains("stalled"));
 
     let events = client
@@ -1599,9 +1621,7 @@ async fn test_worker_monitoring_failures_when_restart_budget_exhausted() {
         .expect("worker events");
     assert_eq!(events.status(), StatusCode::OK);
     let events = events.json::<Value>().await.expect("worker events payload");
-    let events = events
-        .as_array()
-        .expect("worker events as array");
+    let events = events.as_array().expect("worker events as array");
     assert!(
         events
             .iter()
@@ -1626,14 +1646,14 @@ async fn test_worker_monitoring_single_restart_reaches_completion() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");
     let service_config = temp.path().join("service.toml");
-    let service_config_contents =
-        service_config_template_worker_monitoring(6_000, 1, 250);
+    let service_config_contents = service_config_template_worker_monitoring(6_000, 1, 250);
     common::write_service_config(&service_config, service_config_contents.as_str())
         .expect("write service config");
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -1694,9 +1714,7 @@ async fn test_worker_monitoring_single_restart_reaches_completion() {
         .expect("worker events");
     assert_eq!(events.status(), StatusCode::OK);
     let events = events.json::<Value>().await.expect("worker events payload");
-    let events = events
-        .as_array()
-        .expect("worker events as array");
+    let events = events.as_array().expect("worker events as array");
     let has_started = events
         .iter()
         .any(|event| event["method"].as_str() == Some("turn/started"));
@@ -1708,8 +1726,14 @@ async fn test_worker_monitoring_single_restart_reaches_completion() {
         .iter()
         .filter(|event| event["method"].as_str() == Some("turn/completed"))
         .count();
-    assert!(has_started, "single-restart worker should include started event");
-    assert!(aborted_count >= 1, "single-restart worker should include an abort event");
+    assert!(
+        has_started,
+        "single-restart worker should include started event"
+    );
+    assert!(
+        aborted_count >= 1,
+        "single-restart worker should include an abort event"
+    );
     assert!(completed_count >= 1, "worker should eventually complete");
     assert!(completed_count > 0, "expected completion after restart");
 
@@ -1748,7 +1772,8 @@ events = ["turn/completed"]
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let project_response = client
@@ -1843,7 +1868,8 @@ async fn test_project_fixture_validation_errors() {
 
     let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
     let fake_codex = common::binary_path("fake_codex");
-    let harness = common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
     let client = common::unix_client(&harness.socket_path).expect("unix socket client");
 
     let (missing_temp, missing_dir) =
@@ -2058,7 +2084,13 @@ fn label_value_to_string(labels: &Value, key: &str) -> Option<String> {
 
 fn extract_written_path(final_text: &str) -> Option<String> {
     final_text
-        .splitn(2, "WROTE ")
-        .nth(1)
-        .map(|path| path.split_whitespace().next().unwrap_or(path).trim().to_string())
+        .split_once("WROTE ")
+        .map(|(_, path)| path)
+        .map(|path| {
+            path.split_whitespace()
+                .next()
+                .unwrap_or(path)
+                .trim()
+                .to_string()
+        })
 }

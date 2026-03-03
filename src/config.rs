@@ -1,8 +1,8 @@
 use std::{collections::HashMap, fs, path::Path};
 
+use crate::constants;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use crate::constants;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -237,6 +237,16 @@ impl ServiceConfig {
                     if command.program.trim().is_empty() {
                         return Err(anyhow!(
                             "callback profile '{name}' has an empty command program"
+                        ));
+                    }
+                    if command.program.contains("{{") || command.program.contains("}}") {
+                        return Err(anyhow!(
+                            "callback profile '{name}' must use a static command program path (templates are not allowed)"
+                        ));
+                    }
+                    if !Path::new(command.program.trim()).is_absolute() {
+                        return Err(anyhow!(
+                            "callback profile '{name}' command program must be an absolute path"
                         ));
                     }
                 }

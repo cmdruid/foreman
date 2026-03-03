@@ -323,10 +323,7 @@ mod tests {
             serde_json::from_value(raw).expect("deserialize spawn project worker with worktree");
         let worktree = request.worktree.expect("worktree spec");
 
-        assert_eq!(
-            worktree.path,
-            ".cf-test-worktree"
-        );
+        assert_eq!(worktree.path, ".cf-test-worktree");
         assert!(worktree.create);
     }
 }

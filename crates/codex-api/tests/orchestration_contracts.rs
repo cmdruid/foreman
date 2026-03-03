@@ -20,8 +20,8 @@ fn write_fake_app_server_script(path: &std::path::Path, contents: &str) {
             .expect("script metadata")
             .permissions();
         perm.set_mode(0o755);
-    std::fs::set_permissions(path, perm).expect("make script executable");
-}
+        std::fs::set_permissions(path, perm).expect("make script executable");
+    }
 }
 
 fn assert_json_roundtrip<T>(value: &T)
@@ -38,7 +38,11 @@ fn request_id_text(entry: &Value) -> Option<String> {
     entry
         .get("id")
         .and_then(|id| id.as_str().map(str::to_string))
-        .or_else(|| entry.get("id").and_then(|id| id.as_u64().map(|id| id.to_string())))
+        .or_else(|| {
+            entry
+                .get("id")
+                .and_then(|id| id.as_u64().map(|id| id.to_string()))
+        })
         .or_else(|| {
             entry
                 .get("id")
@@ -207,9 +211,10 @@ done
         write_fake_app_server_script(&script_path, &script);
 
         let (event_tx, _event_rx) = broadcast::channel(16);
-        let client = AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
-            .await
-            .expect("connect fake app-server");
+        let client =
+            AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
+                .await
+                .expect("connect fake app-server");
 
         match action {
             MatrixAction::SpawnAgent => {
@@ -342,9 +347,10 @@ done
     write_fake_app_server_script(&script_path, &script);
 
     let (event_tx, mut event_rx) = broadcast::channel(16);
-    let client = AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
-        .await
-        .expect("connect fake app-server");
+    let client =
+        AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
+            .await
+            .expect("connect fake app-server");
 
     let thread = client
         .thread_start(&ThreadStartRequest {
@@ -410,10 +416,7 @@ done
         .expect("thread/start request");
     assert_eq!(thread_request["params"]["cwd"], "/tmp");
     assert_eq!(thread_request["params"]["model"], "gpt-4o");
-    assert_eq!(
-        thread_request["params"]["modelProvider"],
-        "openai"
-    );
+    assert_eq!(thread_request["params"]["modelProvider"], "openai");
     assert_eq!(thread_request["params"]["sandbox"], "default");
 
     let turn_request = requests
@@ -445,7 +448,9 @@ done
 async fn client_auto_handles_all_known_server_requests_with_typed_payloads() {
     let temp_dir = tempdir().expect("tempdir");
     let request_log = temp_dir.path().join("auto-responses.log");
-    let script_path = temp_dir.path().join("fake_app_server_server_request_acks.sh");
+    let script_path = temp_dir
+        .path()
+        .join("fake_app_server_server_request_acks.sh");
     let script = r#"#!/usr/bin/env sh
 if [ "$1" != "app-server" ]; then
   exit 1
@@ -507,9 +512,10 @@ done
     write_fake_app_server_script(&script_path, &script);
 
     let (event_tx, _event_rx) = broadcast::channel(16);
-    let client = AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
-        .await
-        .expect("connect fake app-server");
+    let client =
+        AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
+            .await
+            .expect("connect fake app-server");
 
     let _thread = client
         .thread_start(&ThreadStartRequest {
@@ -563,7 +569,8 @@ done
     let input_reply = find_reply("server-request-input").expect("requestUserInput response");
     assert_eq!(input_reply["result"]["decision"], "accept");
 
-    let tool_input_reply = find_reply("server-request-tool-input").expect("tool requestUserInput response");
+    let tool_input_reply =
+        find_reply("server-request-tool-input").expect("tool requestUserInput response");
     assert_eq!(tool_input_reply["result"]["decision"], "accept");
 
     let tool_call = find_reply("server-tool-call").expect("tool/call response");
@@ -629,9 +636,10 @@ done
     write_fake_app_server_script(&script_path, &script);
 
     let (event_tx, _event_rx) = broadcast::channel(16);
-    let client = AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
-        .await
-        .expect("connect fake app-server");
+    let client =
+        AppServerClient::connect(script_path.to_str().expect("script path"), &[], event_tx)
+            .await
+            .expect("connect fake app-server");
 
     let first_request = ThreadStartRequest {
         model: None,

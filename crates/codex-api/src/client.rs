@@ -11,11 +11,11 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+use crate::constants;
 use crate::protocol::{
     JSONRPCError, JSONRPCErrorError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest,
     JSONRPCResponse, RequestId, parse_thread_id, parse_turn_id,
 };
-use crate::constants;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -342,7 +342,8 @@ impl AppServerClient {
         });
 
         let _: serde_json::Value = self.request(constants::METHOD_INITIALIZE, &params).await?;
-        self.notify(constants::METHOD_INITIALIZED, &serde_json::Value::Null).await?;
+        self.notify(constants::METHOD_INITIALIZED, &serde_json::Value::Null)
+            .await?;
         Ok(())
     }
 
@@ -408,18 +409,21 @@ impl AppServerClient {
     }
 
     pub async fn turn_interrupt(&self, request: &TurnInterruptRequest) -> Result<EmptyResponse> {
-        self.request(constants::METHOD_TURN_INTERRUPT, request).await
+        self.request(constants::METHOD_TURN_INTERRUPT, request)
+            .await
     }
 
     pub async fn thread_interrupt(
         &self,
         request: &ThreadInterruptRequest,
     ) -> Result<serde_json::Value> {
-        self.request(constants::METHOD_THREAD_INTERRUPT, request).await
+        self.request(constants::METHOD_THREAD_INTERRUPT, request)
+            .await
     }
 
     pub async fn model_list(&self) -> Result<ModelListResponse> {
-        self.request(constants::METHOD_MODEL_LIST, &ModelListRequest {}).await
+        self.request(constants::METHOD_MODEL_LIST, &ModelListRequest {})
+            .await
     }
 
     async fn fail_all_pending(&self, reason: String) {
@@ -552,6 +556,57 @@ impl Drop for AppServerClient {
     }
 }
 
+async fn connect_stdio(
+    codex_binary: &str,
+    config_overrides: &[String],
+) -> Result<(Child, Arc<Mutex<BufWriter<ChildStdin>>>, ChildStdout)> {
+    let mut cmd = Command::new(codex_binary);
+    cmd.arg(constants::APP_SERVER_COMMAND);
+    for override_kv in config_overrides {
+        cmd.arg("--config").arg(override_kv);
+    }
+    cmd.stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::inherit());
+    configure_command_path(codex_binary, &mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn `{codex_binary} app-server`"))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .context("app-server stdin unavailable (expected piped)")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("app-server stdout unavailable (expected piped)")?;
+
+    let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
+    Ok((child, writer, stdout))
+}
+
+fn configure_command_path(binary_path: &str, cmd: &mut Command) {
+    let Some(parent) = PathBuf::from(binary_path)
+        .parent()
+        .map(|path| path.to_path_buf())
+    else {
+        return;
+    };
+
+    let inherited = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut merged = Vec::with_capacity(inherited.len() + 1);
+    merged.push(parent);
+    merged.extend(inherited);
+
+    if let Ok(new_path) = std::env::join_paths(merged) {
+        cmd.env("PATH", new_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AppServerClient;
@@ -578,7 +633,7 @@ mod tests {
         let script_path = temp_dir.path().join("fake_app_server_no_initialize.sh");
         write_fake_app_server_script(
             &script_path,
-r#"#!/usr/bin/env sh
+            r#"#!/usr/bin/env sh
 if [ "$1" != "app-server" ]; then
   exit 1
 fi
@@ -877,11 +932,11 @@ done
             .await
             .expect("turn interrupt");
 
-        let model_list = client
-            .model_list()
-            .await
-            .expect("model list");
-        assert!(!model_list.data.is_empty(), "model/list should include at least one item");
+        let model_list = client.model_list().await.expect("model list");
+        assert!(
+            !model_list.data.is_empty(),
+            "model/list should include at least one item"
+        );
 
         let thread_interrupt_result = client
             .thread_interrupt(&super::ThreadInterruptRequest {
@@ -903,49 +958,5 @@ done
         assert!(request_lines.contains("\"method\":\"thread/interrupt\""));
         assert!(request_lines.contains("\"method\":\"model/list\""));
         assert!(request_lines.contains("\"method\":\"initialized\""));
-    }
-}
-
-async fn connect_stdio(
-    codex_binary: &str,
-    config_overrides: &[String],
-) -> Result<(Child, Arc<Mutex<BufWriter<ChildStdin>>>, ChildStdout)> {
-    let mut cmd = Command::new(codex_binary);
-    cmd.arg(constants::APP_SERVER_COMMAND);
-    for override_kv in config_overrides {
-        cmd.arg("--config").arg(override_kv);
-    }
-    cmd.stdin(StdStdio::piped())
-        .stdout(StdStdio::piped())
-        .stderr(StdStdio::inherit());
-    configure_command_path(codex_binary, &mut cmd);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn `{codex_binary} app-server`"))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .context("app-server stdin unavailable (expected piped)")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("app-server stdout unavailable (expected piped)")?;
-
-    let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
-    Ok((child, writer, stdout))
-}
-
-fn configure_command_path(binary_path: &str, cmd: &mut Command) {
-    if let Some(parent) = PathBuf::from(binary_path).parent() {
-        if let Some(path) = std::env::var_os("PATH") {
-            let mut new_path = parent.as_os_str().to_owned();
-            new_path.push(":");
-            new_path.push(path);
-            cmd.env("PATH", new_path);
-        } else {
-            cmd.env("PATH", parent);
-        }
     }
 }

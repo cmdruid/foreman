@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use anyhow::Result;
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use reqwest::Client;
 use serde_json::Value;
 use std::{

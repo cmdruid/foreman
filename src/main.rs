@@ -1,8 +1,8 @@
 mod config;
+mod constants;
 mod events;
 mod foreman;
 mod models;
-mod constants;
 mod project;
 mod state;
 
@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use codex_api::AppServerClient;
 use config::{CallbackProfile, RuntimeAuthConfig, ServiceConfig};
-use foreman::Foreman;
 use constants as consts;
+use foreman::Foreman;
 use models::{
     CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, SendAgentInput,
     SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest, SteerAgentInput,
@@ -42,7 +42,7 @@ use models::{
 use state::PersistedState;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = consts::APP_DESCRIPTION)]
+#[command(name = consts::APP_NAME, author, version, about = consts::APP_DESCRIPTION)]
 struct Args {
     #[arg(long)]
     socket_path: Option<String>,
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
         consts::DEFAULT_LOG_FILTER
             .parse::<tracing_subscriber::filter::Directive>()
-        .context("failed to parse built-in foreman log directive")?,
+            .context("failed to parse built-in foreman log directive")?,
     );
 
     tracing_subscriber::registry()
@@ -223,8 +223,14 @@ async fn main() -> anyhow::Result<()> {
         .route(consts::ROUTE_AGENT_SEND, post(send_turn))
         .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
         .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
-        .route(consts::ROUTE_PROJECTS, post(create_project).get(list_projects))
-        .route(consts::ROUTE_PROJECT_ID, get(get_project).delete(close_project))
+        .route(
+            consts::ROUTE_PROJECTS,
+            post(create_project).get(list_projects),
+        )
+        .route(
+            consts::ROUTE_PROJECT_ID,
+            get(get_project).delete(close_project),
+        )
         .route(
             consts::ROUTE_PROJECT_CALLBACK_STATUS,
             get(get_project_callback_status),
@@ -264,7 +270,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_socket_path(socket_path: &Option<String>, state_path: &PathBuf) -> anyhow::Result<PathBuf> {
+fn resolve_socket_path(
+    socket_path: &Option<String>,
+    state_path: &StdPath,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = socket_path {
         return Ok(StdPath::new(path).to_path_buf());
     }
@@ -314,9 +323,11 @@ fn cleanup_socket_path(_path: &StdPath) -> anyhow::Result<()> {
 fn set_socket_permissions(path: &StdPath) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(consts::FOREMAN_SOCKET_PERMISSIONS)).with_context(|| {
-        format!("set socket permissions for '{}'", path.display())
-    })?;
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(consts::FOREMAN_SOCKET_PERMISSIONS),
+    )
+    .with_context(|| format!("set socket permissions for '{}'", path.display()))?;
     Ok(())
 }
 
@@ -334,6 +345,21 @@ fn extract_codex_version(text: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn constant_time_token_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+
+    for idx in 0..max_len {
+        let left_byte = *left.get(idx).unwrap_or(&0);
+        let right_byte = *right.get(idx).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+
+    diff == 0
 }
 
 fn verify_codex_binary_version(
@@ -440,7 +466,7 @@ async fn require_api_auth(
         token.as_str()
     };
 
-    if candidate != auth.token {
+    if !constant_time_token_eq(candidate, &auth.token) {
         return error_response(
             StatusCode::UNAUTHORIZED,
             anyhow::anyhow!("invalid API token"),
@@ -801,28 +827,44 @@ fn init_project(
         &read_template_file(template_dir, consts::DEFAULT_FOREMAN_PROMPT_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join(consts::DEFAULT_FOREMAN_PROMPT_FILE).display().to_string());
+    created_files.push(
+        path.join(consts::DEFAULT_FOREMAN_PROMPT_FILE)
+            .display()
+            .to_string(),
+    );
 
     write_template_file(
         path.join(consts::DEFAULT_WORKER_PROMPT_FILE),
         &read_template_file(template_dir, consts::DEFAULT_WORKER_PROMPT_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join(consts::DEFAULT_WORKER_PROMPT_FILE).display().to_string());
+    created_files.push(
+        path.join(consts::DEFAULT_WORKER_PROMPT_FILE)
+            .display()
+            .to_string(),
+    );
 
     write_template_file(
         path.join(consts::DEFAULT_RUNBOOK_FILE),
         &read_template_file(template_dir, consts::DEFAULT_RUNBOOK_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join(consts::DEFAULT_RUNBOOK_FILE).display().to_string());
+    created_files.push(
+        path.join(consts::DEFAULT_RUNBOOK_FILE)
+            .display()
+            .to_string(),
+    );
 
     write_template_file(
         path.join(consts::DEFAULT_HANDOFF_FILE),
         &read_template_file(template_dir, consts::DEFAULT_HANDOFF_FILE)?,
         overwrite,
     )?;
-    created_files.push(path.join(consts::DEFAULT_HANDOFF_FILE).display().to_string());
+    created_files.push(
+        path.join(consts::DEFAULT_HANDOFF_FILE)
+            .display()
+            .to_string(),
+    );
 
     if include_manual {
         write_template_file(
@@ -916,17 +958,17 @@ mod tests {
 
     #[test]
     fn resolve_template_dir_prefers_cli_override() {
-    let _guard = with_template_env_lock();
-    let preferred = tempfile::tempdir().expect("temp dir");
-    let secondary_template_dir = tempfile::tempdir().expect("temp dir");
-    let backup = std::env::var_os(super::constants::TEMPLATE_DIR_ENV);
+        let _guard = with_template_env_lock();
+        let preferred = tempfile::tempdir().expect("temp dir");
+        let secondary_template_dir = tempfile::tempdir().expect("temp dir");
+        let backup = std::env::var_os(super::constants::TEMPLATE_DIR_ENV);
 
-    let preferred_path = preferred.path().to_string_lossy().to_string();
-    let secondary_path = secondary_template_dir.path().to_path_buf();
+        let preferred_path = preferred.path().to_string_lossy().to_string();
+        let secondary_path = secondary_template_dir.path().to_path_buf();
 
-    // ensure env is set to a different valid directory so precedence is testable.
-    // SAFETY: Tests are single-threaded and manipulate process environment for assertion setup.
-    unsafe {
+        // ensure env is set to a different valid directory so precedence is testable.
+        // SAFETY: Tests are single-threaded and manipulate process environment for assertion setup.
+        unsafe {
             std::env::set_var(super::constants::TEMPLATE_DIR_ENV, &secondary_path);
         }
         let selected = resolve_template_dir(Some(&preferred_path)).expect("template dir resolves");
