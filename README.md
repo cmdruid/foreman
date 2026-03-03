@@ -1,7 +1,6 @@
 # foreman
 
 [![CI](https://github.com/cmdruid/foreman/actions/workflows/ci.yml/badge.svg)](https://github.com/cmdruid/foreman/actions/workflows/ci.yml)
-[![Release workflow](https://github.com/cmdruid/foreman/actions/workflows/release.yml/badge.svg)](https://github.com/cmdruid/foreman/actions/workflows/release.yml)
 [![License](https://img.shields.io/github/license/cmdruid/foreman)](https://github.com/cmdruid/foreman/blob/main/LICENSE)
 [![Latest](https://img.shields.io/github/v/tag/cmdruid/foreman?label=latest&sort=semver)](https://github.com/cmdruid/foreman/releases)
 [![Security](https://img.shields.io/badge/Security-Policy-blue?logo=github)](SECURITY.md)
@@ -184,6 +183,9 @@ watch_interval_ms = 750
 
 ### optional auth
 
+Unix sockets already limit exposure to local users/processes.
+`security.auth` is optional and mainly useful as defense-in-depth on shared hosts.
+
 ```toml
 [security.auth]
 enabled = true
@@ -217,7 +219,7 @@ You can now define callback profiles directly in a project and reference them fr
 ```toml
 [callbacks.profiles.on_worker_done]
 type = "command"
-program = "/home/cmd/bin/on_worker_done.sh"
+program = "/home/user/bin/on_worker_done.sh"
 args = ["--project", "{{project_id}}", "--worker", "{{worker_id}}"]
 events = ["worker_completed"]
 timeout_ms = 10000
