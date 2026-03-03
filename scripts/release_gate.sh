@@ -4,6 +4,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_ROOT="$REPO_ROOT"
 
+contains_text() {
+  local pattern="$1"
+  shift
+
+  if command -v rg >/dev/null 2>&1; then
+    rg -Fq "$pattern" "$@"
+  else
+    grep -Fq "$pattern" "$@" || return 1
+  fi
+}
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 Usage: scripts/release_gate.sh
@@ -50,7 +61,7 @@ for pattern in \
   "mixed mode" \
   "Before tagging" \
   "contrib/demo/run_demo.sh"; do
-  if ! rg -Fq "$pattern" "$DOCS_ROOT"/TESTING.md "$DOCS_ROOT"/RELEASE.md "$DOCS_ROOT"/README.md "$DOCS_ROOT"/docs/manual.md; then
+  if ! contains_text "$pattern" "$DOCS_ROOT"/TESTING.md "$DOCS_ROOT"/RELEASE.md "$DOCS_ROOT"/README.md "$DOCS_ROOT"/docs/manual.md; then
     echo "required documentation pattern not found: $pattern" >&2
     exit 1
   fi
