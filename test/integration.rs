@@ -2145,7 +2145,10 @@ async fn test_project_local_callback_profile_executes_for_worker_completed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");
     let service_config = temp.path().join("service.toml");
-    let callback_output = PathBuf::from(format!("/tmp/foreman-local-callback-{}", common::random_port()));
+    let callback_output = PathBuf::from(format!(
+        "/tmp/foreman-local-callback-{}",
+        common::random_port()
+    ));
     let _ = fs::remove_file(&callback_output);
 
     let project_config = format!(
@@ -2168,8 +2171,7 @@ FOREMAN_EVENT = "{{{{event_json}}}}"
 
 [callbacks.lifecycle.worker_completed]
 callback_profile = "local_done"
-"#
-        ,
+"#,
         callback_output = callback_output.display()
     );
     fs::write(project_path.join("project.toml"), project_config).expect("write project config");
@@ -2282,8 +2284,7 @@ FOREMAN_EVENT = "{{{{method}}}}"
 
 [callbacks.lifecycle.worker_completed]
 callback_profile = "on_done"
-"#
-        ,
+"#,
         local_output = local_output.display()
     );
     fs::write(project_path.join("project.toml"), project_config).expect("write project config");
@@ -2299,8 +2300,7 @@ events = ["project/lifecycle/worker/completed"]
 
 [callbacks.profiles.on_done.env]
 FOREMAN_EVENT = "{{{{method}}}}"
-"#
-        ,
+"#,
         global_output = global_output.display()
     );
     common::write_service_config(&service_config, &service_config_contents)
@@ -2431,9 +2431,9 @@ callback_profile = "local_webhook"
     );
 
     let events = webhook.events().await;
-    let has_worker_completed_event = events.iter().any(|event| {
-        event["method"].as_str() == Some("project/lifecycle/worker/completed")
-    });
+    let has_worker_completed_event = events
+        .iter()
+        .any(|event| event["method"].as_str() == Some("project/lifecycle/worker/completed"));
     assert!(has_worker_completed_event);
 
     webhook.stop().await;
@@ -2464,8 +2464,7 @@ events = ["project/lifecycle/worker/completed"]
 
 [callbacks.profiles.global_done.env]
 FOREMAN_EVENT = "{{{{method}}}}"
-"#
-        ,
+"#,
         output_path = output_path.display()
     );
     common::write_service_config(&service_config, &service_config_contents)
@@ -2561,8 +2560,7 @@ FOREMAN_EVENT = "{{{{method}}}}"
 
 [callbacks.lifecycle.worker_aborted]
 callback_profile = "local_aborted"
-"#
-        ,
+"#,
         callback_output = callback_output.display()
     );
     fs::write(project_path.join("project.toml"), project_config).expect("write project config");

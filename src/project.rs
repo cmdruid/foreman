@@ -131,7 +131,10 @@ impl ProjectConfig {
         let raw = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read project config {}", config_path.display()))?;
         let manifest: toml::Value = toml::from_str(&raw).with_context(|| {
-            format!("{} invalid project config format", constants::ERROR_CODE_CFG_PROJECT_PARSE)
+            format!(
+                "{} invalid project config format",
+                constants::ERROR_CODE_CFG_PROJECT_PARSE
+            )
         })?;
         if manifest.get("hooks").is_some() {
             anyhow::bail!(
@@ -145,20 +148,21 @@ impl ProjectConfig {
             anyhow::bail!("{} {}: {}", issue.code, issue.path, issue.message);
         }
         let config: Self = toml::from_str(&raw).with_context(|| {
-            format!("{} invalid project config format", constants::ERROR_CODE_CFG_PROJECT_PARSE)
+            format!(
+                "{} invalid project config format",
+                constants::ERROR_CODE_CFG_PROJECT_PARSE
+            )
         })?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.prompts
-            .validate()
-            .with_context(|| {
-                format!(
-                    "{} invalid project prompt configuration",
-                    constants::ERROR_CODE_CFG_PROJECT_VALIDATION
-                )
-            })?;
+        self.prompts.validate().with_context(|| {
+            format!(
+                "{} invalid project prompt configuration",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            )
+        })?;
         Ok(())
     }
 
@@ -275,7 +279,12 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
     push_unknown_table_keys(root, "", &root_allowed, report);
 
     if let Some(prompts) = root.get("prompts").and_then(toml::Value::as_table) {
-        let prompts_allowed = ["foreman_file", "worker_file", "runbook_file", "handoff_file"];
+        let prompts_allowed = [
+            "foreman_file",
+            "worker_file",
+            "runbook_file",
+            "handoff_file",
+        ];
         push_unknown_table_keys(prompts, "prompts", &prompts_allowed, report);
     }
 
@@ -308,12 +317,7 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
                 "worker_completed",
                 "worker_aborted",
             ];
-            push_unknown_table_keys(
-                lifecycle,
-                "callbacks.lifecycle",
-                &lifecycle_allowed,
-                report,
-            );
+            push_unknown_table_keys(lifecycle, "callbacks.lifecycle", &lifecycle_allowed, report);
             for lifecycle_key in lifecycle_allowed {
                 if let Some(spec) = lifecycle.get(lifecycle_key).and_then(toml::Value::as_table) {
                     push_unknown_table_keys(
@@ -371,8 +375,14 @@ fn validate_callback_profile_references(
         ("callbacks.worker", &config.callbacks.worker),
         ("callbacks.foreman", &config.callbacks.foreman),
         ("callbacks.bubble_up", &config.callbacks.bubble_up),
-        ("callbacks.lifecycle.start", &config.callbacks.lifecycle.start),
-        ("callbacks.lifecycle.compact", &config.callbacks.lifecycle.compact),
+        (
+            "callbacks.lifecycle.start",
+            &config.callbacks.lifecycle.start,
+        ),
+        (
+            "callbacks.lifecycle.compact",
+            &config.callbacks.lifecycle.compact,
+        ),
         ("callbacks.lifecycle.stop", &config.callbacks.lifecycle.stop),
         (
             "callbacks.lifecycle.worker_completed",

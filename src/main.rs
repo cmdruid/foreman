@@ -7,8 +7,7 @@ mod project;
 mod state;
 
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path as StdPath, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
@@ -181,7 +180,9 @@ async fn main() -> anyhow::Result<()> {
             &project_toml_path,
             &service_config,
             args.fix,
-            project_toml_path.parent().unwrap_or_else(|| StdPath::new(".")),
+            project_toml_path
+                .parent()
+                .unwrap_or_else(|| StdPath::new(".")),
         )?;
         return Ok(());
     }
@@ -459,7 +460,10 @@ fn resolve_required_project_toml_path(project_arg: Option<&PathBuf>) -> anyhow::
         ));
     }
 
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if file_name != consts::PROJECT_CONFIG_FILE {
         return Err(coded_error(
             consts::ERROR_CODE_CFG_PROJECT_PATH_INVALID,
@@ -544,7 +548,9 @@ fn run_doctor_command(
         .parent()
         .unwrap_or_else(|| StdPath::new("."));
 
-    let codex_check = StdCommand::new(&args.codex_binary).arg("--version").output();
+    let codex_check = StdCommand::new(&args.codex_binary)
+        .arg("--version")
+        .output();
     match codex_check {
         Ok(output) if output.status.success() => checks.push(DoctorCheck {
             id: "codex_binary",
@@ -654,7 +660,10 @@ fn run_doctor_command(
                         id: "runtime_dir",
                         status: PASS,
                         code: None,
-                        message: format!("runtime directory is writable: {}", runtime_dir.display()),
+                        message: format!(
+                            "runtime directory is writable: {}",
+                            runtime_dir.display()
+                        ),
                     });
                 }
                 Err(err) => checks.push(DoctorCheck {
@@ -672,7 +681,10 @@ fn run_doctor_command(
             id: "runtime_dir",
             status: FAIL,
             code: Some(consts::ERROR_CODE_CFG_RUNTIME_IO),
-            message: format!("failed to create runtime directory '{}': {err}", runtime_dir.display()),
+            message: format!(
+                "failed to create runtime directory '{}': {err}",
+                runtime_dir.display()
+            ),
         }),
     }
 
@@ -783,7 +795,10 @@ fn run_config_show_resolved(
     let mut effective_profile_names: Vec<String> =
         service_config.callbacks.profiles.keys().cloned().collect();
     for profile_name in project_config.callbacks.profiles.keys() {
-        if !effective_profile_names.iter().any(|name| name == profile_name) {
+        if !effective_profile_names
+            .iter()
+            .any(|name| name == profile_name)
+        {
             effective_profile_names.push(profile_name.clone());
         }
     }

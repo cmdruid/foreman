@@ -4,6 +4,8 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## v0.2.0
+
 - Hardened callback and lifecycle behavior in project orchestration, including clearer status handling for worker completion/abort paths.
 - Improved project callback profile resolution and dispatch behavior between project-local and service-level profiles.
 - Updated CLI/docs defaults and examples to match current `foreman` workflows and project-first usage.

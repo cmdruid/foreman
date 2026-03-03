@@ -909,7 +909,8 @@ impl Foreman {
 
                 match profile_definition {
                     CallbackProfile::Command(command) => {
-                        self.dispatch_command_callback(context, profile, command).await
+                        self.dispatch_command_callback(context, profile, command)
+                            .await
                     }
                     CallbackProfile::Webhook(webhook) => {
                         self.dispatch_webhook_callback_from_profile(&context, &profile, &webhook)
