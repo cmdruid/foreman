@@ -64,6 +64,12 @@ pub const DEFAULT_WORKER_MONITORING_ENABLED: bool = false;
 pub const DEFAULT_WORKER_MONITORING_INACTIVITY_TIMEOUT_MS: u64 = 3_000;
 pub const DEFAULT_WORKER_MONITORING_MAX_RESTARTS: u32 = 1;
 pub const DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS: u64 = 750;
+pub const DEFAULT_BUDGET_WATCH_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_BUDGET_MAX_TOKENS: u64 = 50_000;
+pub const DEFAULT_BUDGET_MAX_COST_USD: f64 = 0.15;
+pub const DEFAULT_BUDGET_MAX_DURATION_MS: u64 = 1_800_000;
+pub const DEFAULT_BUDGET_ON_EXCEED: &str = "kill";
+pub const DEFAULT_ESTIMATED_COST_PER_TOKEN_USD: f64 = 0.000_002;
 
 pub const DEFAULT_WORKER_CALLBACK_TIMEOUT_MS: u64 = 5_000;
 pub const MIN_WORKER_MONITOR_INTERVAL_MS: u64 = 50;
@@ -99,6 +105,7 @@ pub const AGENT_STATUS_COMPLETED: &str = "completed";
 pub const AGENT_STATUS_ORPHANED: &str = "orphaned";
 pub const AGENT_STATUS_UNKNOWN: &str = "unknown";
 pub const AGENT_STATUS_THROTTLED: &str = "throttled";
+pub const AGENT_STATUS_PAUSED: &str = "paused";
 
 pub const JOB_STATUS_EMPTY: &str = "empty";
 pub const JOB_STATUS_RUNNING: &str = "running";

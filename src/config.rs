@@ -19,7 +19,72 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub worker_monitoring: WorkerMonitoringConfig,
     #[serde(default)]
+    pub budgets: BudgetConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub defaults: BudgetDefaultsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetDefaultsConfig {
+    #[serde(default = "default_budget_max_tokens")]
+    pub max_tokens: u64,
+    #[serde(default = "default_budget_max_cost_usd")]
+    pub max_cost_usd: f64,
+    #[serde(default = "default_budget_max_duration_ms")]
+    pub max_duration_ms: u64,
+    #[serde(default = "default_budget_on_exceed")]
+    pub on_exceed: BudgetOnExceed,
+}
+
+impl Default for BudgetDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_budget_max_tokens(),
+            max_cost_usd: default_budget_max_cost_usd(),
+            max_duration_ms: default_budget_max_duration_ms(),
+            on_exceed: default_budget_on_exceed(),
+        }
+    }
+}
+
+fn default_budget_max_tokens() -> u64 {
+    constants::DEFAULT_BUDGET_MAX_TOKENS
+}
+
+fn default_budget_max_cost_usd() -> f64 {
+    constants::DEFAULT_BUDGET_MAX_COST_USD
+}
+
+fn default_budget_max_duration_ms() -> u64 {
+    constants::DEFAULT_BUDGET_MAX_DURATION_MS
+}
+
+fn default_budget_on_exceed() -> BudgetOnExceed {
+    BudgetOnExceed::from(constants::DEFAULT_BUDGET_ON_EXCEED)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetOnExceed {
+    Warn,
+    Pause,
+    Kill,
+}
+
+impl From<&str> for BudgetOnExceed {
+    fn from(value: &str) -> Self {
+        match value {
+            "warn" => Self::Warn,
+            "pause" => Self::Pause,
+            _ => Self::Kill,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +308,22 @@ impl ServiceConfig {
             }
         }
 
+        if self.budgets.defaults.max_tokens == 0 {
+            return Err(anyhow!(
+                "budgets.defaults.max_tokens must be greater than 0"
+            ));
+        }
+        if self.budgets.defaults.max_cost_usd <= 0.0 {
+            return Err(anyhow!(
+                "budgets.defaults.max_cost_usd must be greater than 0"
+            ));
+        }
+        if self.budgets.defaults.max_duration_ms == 0 {
+            return Err(anyhow!(
+                "budgets.defaults.max_duration_ms must be greater than 0"
+            ));
+        }
+
         if let Some(default_profile) = &self.callbacks.default_profile
             && !self.callbacks.profiles.contains_key(default_profile)
         {
@@ -380,7 +461,8 @@ impl CallbackProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerConfig, AuthConfig, SecurityConfig, ServiceConfig, WorkerMonitoringConfig,
+        AppServerConfig, AuthConfig, BudgetConfig, BudgetDefaultsConfig, BudgetOnExceed,
+        SecurityConfig, ServiceConfig, WorkerMonitoringConfig,
     };
     use crate::constants;
     use std::{env, path::Path};
@@ -401,6 +483,19 @@ mod tests {
         assert!(config.security.auth.is_none());
         assert!(config.protocol.expected_codex_version.is_none());
         assert!(!config.worker_monitoring.enabled);
+        assert_eq!(
+            config.budgets.defaults.max_tokens,
+            constants::DEFAULT_BUDGET_MAX_TOKENS
+        );
+        assert_eq!(
+            config.budgets.defaults.max_cost_usd,
+            constants::DEFAULT_BUDGET_MAX_COST_USD
+        );
+        assert_eq!(
+            config.budgets.defaults.max_duration_ms,
+            constants::DEFAULT_BUDGET_MAX_DURATION_MS
+        );
+        assert_eq!(config.budgets.defaults.on_exceed, BudgetOnExceed::Kill);
     }
 
     #[test]
@@ -427,6 +522,61 @@ mod tests {
             config.worker_monitoring.watch_interval_ms,
             constants::DEFAULT_WORKER_MONITORING_WATCH_INTERVAL_MS
         );
+        assert_eq!(
+            config.budgets.defaults.max_tokens,
+            constants::DEFAULT_BUDGET_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn budget_defaults_validate() {
+        let config = ServiceConfig {
+            budgets: BudgetConfig::default(),
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_budget_defaults_are_rejected() {
+        let config = ServiceConfig {
+            budgets: BudgetConfig {
+                defaults: BudgetDefaultsConfig {
+                    max_tokens: 0,
+                    max_cost_usd: 0.15,
+                    max_duration_ms: 1_000,
+                    on_exceed: BudgetOnExceed::Warn,
+                },
+            },
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = ServiceConfig {
+            budgets: BudgetConfig {
+                defaults: BudgetDefaultsConfig {
+                    max_tokens: 10,
+                    max_cost_usd: 0.0,
+                    max_duration_ms: 1_000,
+                    on_exceed: BudgetOnExceed::Pause,
+                },
+            },
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = ServiceConfig {
+            budgets: BudgetConfig {
+                defaults: BudgetDefaultsConfig {
+                    max_tokens: 10,
+                    max_cost_usd: 0.2,
+                    max_duration_ms: 0,
+                    on_exceed: BudgetOnExceed::Kill,
+                },
+            },
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -25,26 +25,27 @@ use uuid::Uuid;
 
 use crate::{
     config::{
-        CallbackFilter, CallbackProfile, CommandCallbackProfile, ServiceConfig,
+        BudgetOnExceed, CallbackFilter, CallbackProfile, CommandCallbackProfile, ServiceConfig,
         UnixSocketCallbackProfile, WebhookCallbackProfile,
     },
     constants,
     events::events_allowed,
     models::{
         AgentProgressEnvelope, AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
-        CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse,
-        JobEventEnvelope, JobResult, JobState, ProgressThrottleState, ProgressValidationState,
-        ProjectCallbackStatusResponse, ProjectState, SendAgentInput, SpawnAgentRequest,
-        SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
+        CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, FailureClass,
+        FailureReport, JobEventEnvelope, JobResult, JobState, ProgressThrottleState,
+        ProgressValidationState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput,
+        SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
         SpawnProjectWorkerResponse, SteerAgentInput, ThrottledWorkerStatus, ToolCallSummary,
-        ToolFilterCallbackPayload, WorkerLogEntry, WorkerWorktreeSpec,
+        ToolFilterCallbackPayload, WorkerBudgetLimits, WorkerBudgetStatus, WorkerBudgetUsage,
+        WorkerLogEntry, WorkerWorktreeSpec,
     },
     project::{
         CallbackSpec, JobDefaultsConfig, ProjectConfig, ProjectRuntimeFiles, ValidationConfig,
     },
     state::{
         PersistedAgentRecord, PersistedGovernorRecord, PersistedJobRecord, PersistedProjectRecord,
-        PersistedRuntimeFiles, PersistedState, PersistedWorkerCallback,
+        PersistedRuntimeFiles, PersistedState, PersistedWorkerBudget, PersistedWorkerCallback,
     },
 };
 
@@ -131,6 +132,8 @@ struct AgentRecord {
     throttled: bool,
     retry_at_ms: Option<u64>,
     throttle_reason: Option<String>,
+    failure_report: Option<FailureReport>,
+    budget: WorkerBudgetState,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -142,6 +145,41 @@ struct AgentRecord {
     created_at: u64,
     updated_at: u64,
     events: VecDeque<crate::models::AgentEventDto>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerBudgetState {
+    prompt_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    estimated_cost_usd: f64,
+    elapsed_ms: u64,
+    started_at_ms: u64,
+    exceeded: bool,
+    exceeded_reason: Option<String>,
+    paused_reason: Option<String>,
+}
+
+impl WorkerBudgetState {
+    fn new() -> Self {
+        Self {
+            prompt_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            estimated_cost_usd: 0.0,
+            elapsed_ms: 0,
+            started_at_ms: now_ms(),
+            exceeded: false,
+            exceeded_reason: None,
+            paused_reason: None,
+        }
+    }
+
+    fn total_tokens(&self) -> u64 {
+        self.prompt_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cached_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,6 +459,17 @@ impl Foreman {
                 agent.updated_at = now_ts();
                 agent.result = result;
                 agent.error = Some("worker monitoring restart budget exceeded".to_string());
+                update_failure_report(
+                    &mut agent.failure_report,
+                    FailureClass::Timeout,
+                    "worker monitoring restart budget exceeded".to_string(),
+                    Some(format!(
+                        "worker stalled for {} ms without progress",
+                        inactivity_timeout_ms
+                    )),
+                    false,
+                    now_ts(),
+                );
                 agent.restart_attempts = agent.restart_attempts.saturating_add(0);
 
                 Some(Candidate {
@@ -533,6 +582,14 @@ impl Foreman {
             Err(err) => {
                 agent.status = constants::AGENT_STATUS_FAILED.to_string();
                 agent.error = Some(format!("worker restart failed: {err}"));
+                update_failure_report(
+                    &mut agent.failure_report,
+                    FailureClass::Unknown,
+                    "worker restart failed".to_string(),
+                    Some(err.to_string()),
+                    true,
+                    now_ts(),
+                );
                 agent.result = Some(AgentResult {
                     agent_id,
                     status: constants::AGENT_STATUS_ABORTED.to_string(),
@@ -583,29 +640,48 @@ impl Foreman {
 
     fn spawn_worker_monitor(this: Arc<Self>) {
         let worker_monitoring = this.config.worker_monitoring.clone();
-        if !worker_monitoring.enabled {
-            return;
-        }
-
         tokio::spawn(async move {
             let interval = time::Duration::from_millis(
-                worker_monitoring
-                    .watch_interval_ms
-                    .max(constants::MIN_WORKER_MONITOR_INTERVAL_MS),
+                if worker_monitoring.enabled {
+                    worker_monitoring.watch_interval_ms
+                } else {
+                    constants::DEFAULT_BUDGET_WATCH_INTERVAL_MS
+                }
+                .max(constants::MIN_WORKER_MONITOR_INTERVAL_MS),
             );
             loop {
                 time::sleep(interval).await;
-                if let Err(err) = this
-                    .enforce_worker_monitoring(
-                        worker_monitoring.inactivity_timeout_ms,
-                        worker_monitoring.max_restarts,
-                    )
-                    .await
+                if let Err(err) = this.enforce_budget_guardrails().await {
+                    warn!(%err, "budget guardrail cycle failed");
+                }
+                if worker_monitoring.enabled
+                    && let Err(err) = this
+                        .enforce_worker_monitoring(
+                            worker_monitoring.inactivity_timeout_ms,
+                            worker_monitoring.max_restarts,
+                        )
+                        .await
                 {
                     warn!(%err, "worker monitoring cycle failed");
                 }
             }
         });
+    }
+
+    async fn enforce_budget_guardrails(self: &Arc<Self>) -> Result<()> {
+        let worker_ids = {
+            let agents = self.agents.read().await;
+            agents
+                .values()
+                .filter(|agent| agent.role == AgentRole::Worker)
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>()
+        };
+
+        for worker_id in worker_ids {
+            self.apply_budget_policy(worker_id, "budget/tick").await?;
+        }
+        Ok(())
     }
 
     fn schedule_state_persist(self: &Arc<Self>) {
@@ -772,6 +848,8 @@ impl Foreman {
                 while agent.events.len() > constants::EVENT_BUFFER_MAX {
                     agent.events.pop_front();
                 }
+                update_budget_counters(&mut agent.budget, &params);
+                agent.budget.elapsed_ms = now_ms().saturating_sub(agent.budget.started_at_ms);
 
                 if method == constants::EVENT_METHOD_ITEM_COMPLETED
                     && is_command_execution_item_completed(&method, &params)
@@ -804,6 +882,24 @@ impl Foreman {
                         ts,
                         event_id,
                     ));
+                    if method == constants::EVENT_METHOD_TURN_ABORTED {
+                        let error_text = params
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(std::string::ToString::to_string);
+                        let class =
+                            classify_failure_from_error(error_text.as_deref(), Some(&params));
+                        let summary = failure_summary_for_class(&class);
+                        let retryable = failure_class_retryable(&class);
+                        update_failure_report(
+                            &mut agent.failure_report,
+                            class,
+                            summary.to_string(),
+                            error_text,
+                            retryable,
+                            ts,
+                        );
+                    }
                     should_update_job = true;
                     should_release_inflight = true;
                 }
@@ -827,6 +923,21 @@ impl Foreman {
                         }
                         if let Some(error) = params.get("error").and_then(Value::as_str) {
                             result.error = Some(error.to_string());
+                        }
+                        if completion_method == constants::EVENT_METHOD_TURN_ABORTED {
+                            let error_text = result.error.clone();
+                            let class =
+                                classify_failure_from_error(error_text.as_deref(), Some(&params));
+                            let summary = failure_summary_for_class(&class);
+                            let retryable = failure_class_retryable(&class);
+                            update_failure_report(
+                                &mut agent.failure_report,
+                                class,
+                                summary.to_string(),
+                                error_text,
+                                retryable,
+                                ts,
+                            );
                         }
                         agent.result = Some(result);
                         should_update_job = true;
@@ -881,6 +992,10 @@ impl Foreman {
                 };
                 progress_event = Some(progress_from_agent_event(agent, &event));
             }
+        }
+
+        if let Err(err) = self.apply_budget_policy(agent_id, "budget/event").await {
+            warn!(%err, agent_id = %agent_id, "budget policy enforcement failed");
         }
 
         if should_release_inflight {
@@ -938,6 +1053,19 @@ impl Foreman {
             }
             self.schedule_state_persist();
             if let Err(err) = self.execute_event(context).await {
+                let mut agents = self.agents.write().await;
+                if let Some(agent) = agents.get_mut(&agent_id) {
+                    agent.error = Some(format!("callback execution failed: {err}"));
+                    update_failure_report(
+                        &mut agent.failure_report,
+                        FailureClass::CallbackError,
+                        "callback execution failed".to_string(),
+                        Some(err.to_string()),
+                        true,
+                        now_ts(),
+                    );
+                    agent.updated_at = now_ts();
+                }
                 warn!(%err, "callback execution failed");
             }
         }
@@ -1144,6 +1272,25 @@ impl Foreman {
                     {
                         job.merge_conflicts.push(branch_name_ref.to_string());
                         job.updated_at = now_ts();
+                    }
+                    drop(jobs);
+                    let mut agents = self.agents.write().await;
+                    if let Some(agent) = agents.get_mut(&context.agent_id) {
+                        let details = format!(
+                            "merge strategy '{}' failed for branch '{}': {}",
+                            merge_strategy, branch_name_ref, err
+                        );
+                        agent.error =
+                            Some("merge conflict while merging worker branch".to_string());
+                        update_failure_report(
+                            &mut agent.failure_report,
+                            FailureClass::MergeConflict,
+                            "merge conflict while merging worker branch".to_string(),
+                            Some(details),
+                            true,
+                            now_ts(),
+                        );
+                        agent.updated_at = now_ts();
                     }
                     return Err(err);
                 }
@@ -1358,6 +1505,14 @@ impl Foreman {
                 agent.worktree_path = None;
                 agent.status = constants::AGENT_STATUS_FAILED.to_string();
                 agent.error = Some(message.clone());
+                update_failure_report(
+                    &mut agent.failure_report,
+                    FailureClass::ValidationFailed,
+                    "validation failed".to_string(),
+                    Some(message.clone()),
+                    false,
+                    now_ts(),
+                );
                 if let Some(result) = agent.result.as_mut() {
                     result.status = constants::AGENT_STATUS_FAILED.to_string();
                     result.error = Some(message.clone());
@@ -3245,6 +3400,8 @@ impl Foreman {
                     throttled: false,
                     retry_at_ms: None,
                     throttle_reason: None,
+                    failure_report: None,
+                    budget: None,
                 }
             });
 
@@ -3789,22 +3946,51 @@ impl Foreman {
         Ok(())
     }
 
-    async fn start_agent_turn(self: &Arc<Self>, agent_id: Uuid, prompt: String) -> Result<Option<String>> {
-        let (thread_id, role, governor_key) = {
+    async fn start_agent_turn(
+        self: &Arc<Self>,
+        agent_id: Uuid,
+        prompt: String,
+    ) -> Result<Option<String>> {
+        let (thread_id, role, governor_key, paused_reason) = {
             let agents = self.agents.read().await;
             let agent = agents.get(&agent_id).context("agent not found")?;
             (
                 agent.thread_id.clone(),
                 agent.role.clone(),
                 agent.governor_key.clone(),
+                agent.budget.paused_reason.clone(),
             )
         };
+
+        if role == AgentRole::Worker
+            && let Some(reason) = paused_reason
+        {
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.status = constants::AGENT_STATUS_PAUSED.to_string();
+                agent.error = Some(reason);
+                agent.updated_at = now_ts();
+            }
+            return Ok(None);
+        }
 
         if role == AgentRole::Worker
             && let Some(key) = governor_key.clone()
             && let Some(retry_at_ms) = self.acquire_governor_permit(&key).await
         {
-            self.mark_agent_throttled(agent_id, retry_at_ms, "provider rate limit").await;
+            self.mark_agent_throttled(agent_id, retry_at_ms, "provider rate limit")
+                .await;
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                update_failure_report(
+                    &mut agent.failure_report,
+                    FailureClass::RateLimit,
+                    "provider rate limit".to_string(),
+                    agent.throttle_reason.clone(),
+                    true,
+                    now_ts(),
+                );
+            }
             self.schedule_throttled_retry(agent_id, retry_at_ms);
             return Ok(None);
         }
@@ -3830,17 +4016,32 @@ impl Foreman {
                         agent.updated_at = now_ts();
                     }
                 }
-                if role == AgentRole::Worker && let Some(key) = governor_key {
+                if role == AgentRole::Worker
+                    && let Some(key) = governor_key
+                {
                     self.governor_mark_success(&key).await;
                 }
                 Ok(Some(turn_id))
             }
             Err(err) => {
-                if role == AgentRole::Worker && let Some(key) = governor_key {
+                if role == AgentRole::Worker
+                    && let Some(key) = governor_key
+                {
                     if is_rate_limit_error(err.to_string().as_str()) {
                         let retry_at_ms = self.governor_mark_rate_limited(&key).await;
                         self.mark_agent_throttled(agent_id, retry_at_ms, err.to_string().as_str())
                             .await;
+                        let mut agents = self.agents.write().await;
+                        if let Some(agent) = agents.get_mut(&agent_id) {
+                            update_failure_report(
+                                &mut agent.failure_report,
+                                FailureClass::RateLimit,
+                                "provider rate limit".to_string(),
+                                Some(err.to_string()),
+                                true,
+                                now_ts(),
+                            );
+                        }
                         self.schedule_throttled_retry(agent_id, retry_at_ms);
                         return Ok(None);
                     }
@@ -3882,6 +4083,72 @@ impl Foreman {
         }
         let _ = self.start_agent_turn(agent_id, prompt).await?;
         self.schedule_state_persist();
+        Ok(())
+    }
+
+    async fn apply_budget_policy(self: &Arc<Self>, agent_id: Uuid, event_name: &str) -> Result<()> {
+        let defaults = self.config.budgets.defaults.clone();
+        let now_ms_value = now_ms();
+        let mut kill_snapshot: Option<(String, String)> = None;
+        let should_emit_event;
+
+        {
+            let mut agents = self.agents.write().await;
+            let Some(agent) = agents.get_mut(&agent_id) else {
+                return Ok(());
+            };
+            if agent.role != AgentRole::Worker {
+                return Ok(());
+            }
+
+            agent.budget.elapsed_ms = now_ms_value.saturating_sub(agent.budget.started_at_ms);
+            let evaluation = evaluate_budget(
+                &agent.budget,
+                defaults.max_tokens,
+                defaults.max_cost_usd,
+                defaults.max_duration_ms,
+            );
+
+            if !evaluation.exceeded {
+                return Ok(());
+            }
+
+            let reason = evaluation
+                .reason
+                .unwrap_or_else(|| "budget exceeded".to_string());
+            if agent.budget.exceeded
+                && agent.budget.exceeded_reason.as_deref() == Some(reason.as_str())
+            {
+                return Ok(());
+            }
+            agent.budget.exceeded = true;
+            agent.budget.exceeded_reason = Some(reason.clone());
+            should_emit_event = true;
+
+            if let Some(kill) =
+                apply_budget_transition(agent, &defaults.on_exceed, reason.as_str(), now_ts())
+            {
+                kill_snapshot = Some(kill);
+            }
+            agent.updated_at = now_ts();
+        }
+
+        if let Some((thread_id, turn_id)) = kill_snapshot {
+            let _ = self
+                .client
+                .turn_interrupt(&TurnInterruptRequest { thread_id, turn_id })
+                .await;
+        }
+
+        if should_emit_event {
+            let agents = self.agents.read().await;
+            if let Some(agent) = agents.get(&agent_id) {
+                let _ = self
+                    .agent_progress_tx
+                    .send(progress_budget_state(agent, event_name));
+            }
+            self.schedule_state_persist();
+        }
         Ok(())
     }
 
@@ -4004,7 +4271,11 @@ impl Foreman {
 
     pub async fn list_agents(&self) -> Vec<crate::models::AgentState> {
         let agents = self.agents.read().await;
-        agents.values().map(build_agent_state).collect()
+        let defaults = self.config.budgets.defaults.clone();
+        agents
+            .values()
+            .map(|agent| build_agent_state(agent, &defaults))
+            .collect()
     }
 
     pub async fn app_server_pid(&self) -> Option<u32> {
@@ -4123,7 +4394,7 @@ impl Foreman {
             .context("agent not found")?
             .clone();
 
-        Ok(build_agent_state(&agent))
+        Ok(build_agent_state(&agent, &self.config.budgets.defaults))
     }
 
     pub async fn get_agent_events(
@@ -4234,10 +4505,12 @@ impl Foreman {
                 .result
                 .as_ref()
                 .and_then(|result| result.error.clone())
-                .or(agent.error),
+                .or(agent.error.clone()),
             throttled: agent.throttled,
             retry_at_ms: agent.retry_at_ms,
             throttle_reason: agent.throttle_reason.clone(),
+            failure_report: agent.failure_report.clone(),
+            budget: Some(worker_budget_status(&agent, &self.config.budgets.defaults)),
         })
     }
 
@@ -4301,6 +4574,8 @@ impl Foreman {
                                     throttled: false,
                                     retry_at_ms: None,
                                     throttle_reason: None,
+                                    failure_report: None,
+                                    budget: None,
                                 }
                             })
                         },
@@ -4356,7 +4631,8 @@ impl Foreman {
             Some(request.prompt.clone())
         };
         let cwd = request.cwd.clone();
-        let governor_key = governor_key(request.model_provider.as_deref(), request.model.as_deref());
+        let governor_key =
+            governor_key(request.model_provider.as_deref(), request.model.as_deref());
         {
             let agent = AgentRecord {
                 id,
@@ -4377,6 +4653,8 @@ impl Foreman {
                 throttled: false,
                 retry_at_ms: None,
                 throttle_reason: None,
+                failure_report: None,
+                budget: WorkerBudgetState::new(),
                 status: constants::AGENT_STATUS_IDLE.into(),
                 callback,
                 role: role.clone(),
@@ -4702,7 +4980,10 @@ fn resolve_agent_status(agent: &AgentRecord) -> String {
     agent.status.clone()
 }
 
-fn build_agent_state(agent: &AgentRecord) -> AgentState {
+fn build_agent_state(
+    agent: &AgentRecord,
+    defaults: &crate::config::BudgetDefaultsConfig,
+) -> AgentState {
     let mut files_modified = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
     let mut last_tool_call = None;
@@ -4746,6 +5027,8 @@ fn build_agent_state(agent: &AgentRecord) -> AgentState {
         throttled: agent.throttled,
         retry_at_ms: agent.retry_at_ms,
         throttle_reason: agent.throttle_reason.clone(),
+        failure_report: agent.failure_report.clone(),
+        budget: Some(worker_budget_status(agent, defaults)),
     }
 }
 
@@ -5759,6 +6042,11 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         throttled: record.throttled,
         retry_at_ms: record.retry_at_ms,
         throttle_reason: record.throttle_reason,
+        failure_report: record.failure_report,
+        budget: record
+            .budget
+            .map(restore_worker_budget)
+            .unwrap_or_else(WorkerBudgetState::new),
         status,
         callback,
         role,
@@ -5882,6 +6170,8 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         throttled: agent.throttled,
         retry_at_ms: agent.retry_at_ms,
         throttle_reason: agent.throttle_reason.clone(),
+        failure_report: agent.failure_report.clone(),
+        budget: Some(persist_worker_budget(&agent.budget)),
         status: agent.status.clone(),
         callback,
         role,
@@ -5958,6 +6248,33 @@ fn persist_worker_callback(callback: &WorkerCallback) -> PersistedWorkerCallback
             events: profile.events.clone(),
             vars: profile.vars.clone(),
         },
+    }
+}
+
+fn restore_worker_budget(value: PersistedWorkerBudget) -> WorkerBudgetState {
+    WorkerBudgetState {
+        prompt_tokens: value.prompt_tokens,
+        output_tokens: value.output_tokens,
+        cached_tokens: value.cached_tokens,
+        estimated_cost_usd: value.estimated_cost_usd,
+        elapsed_ms: value.elapsed_ms,
+        started_at_ms: now_ms().saturating_sub(value.elapsed_ms),
+        exceeded: value.exceeded,
+        exceeded_reason: value.exceeded_reason,
+        paused_reason: value.paused_reason,
+    }
+}
+
+fn persist_worker_budget(value: &WorkerBudgetState) -> PersistedWorkerBudget {
+    PersistedWorkerBudget {
+        prompt_tokens: value.prompt_tokens,
+        output_tokens: value.output_tokens,
+        cached_tokens: value.cached_tokens,
+        estimated_cost_usd: value.estimated_cost_usd,
+        elapsed_ms: value.elapsed_ms,
+        exceeded: value.exceeded,
+        exceeded_reason: value.exceeded_reason.clone(),
+        paused_reason: value.paused_reason.clone(),
     }
 }
 
@@ -6124,6 +6441,332 @@ fn truncate_json_value(value: &Value, max_len: usize) -> Value {
     }
 }
 
+#[derive(Debug)]
+struct BudgetEvaluation {
+    exceeded: bool,
+    reason: Option<String>,
+}
+
+fn evaluate_budget(
+    budget: &WorkerBudgetState,
+    max_tokens: u64,
+    max_cost_usd: f64,
+    max_duration_ms: u64,
+) -> BudgetEvaluation {
+    if budget.total_tokens() > max_tokens {
+        return BudgetEvaluation {
+            exceeded: true,
+            reason: Some(format!(
+                "token budget exceeded ({}/{})",
+                budget.total_tokens(),
+                max_tokens
+            )),
+        };
+    }
+    if budget.estimated_cost_usd > max_cost_usd {
+        return BudgetEvaluation {
+            exceeded: true,
+            reason: Some(format!(
+                "cost budget exceeded ({:.6}/{:.6})",
+                budget.estimated_cost_usd, max_cost_usd
+            )),
+        };
+    }
+    if budget.elapsed_ms > max_duration_ms {
+        return BudgetEvaluation {
+            exceeded: true,
+            reason: Some(format!(
+                "duration budget exceeded ({}/{})",
+                budget.elapsed_ms, max_duration_ms
+            )),
+        };
+    }
+    BudgetEvaluation {
+        exceeded: false,
+        reason: None,
+    }
+}
+
+fn update_budget_counters(budget: &mut WorkerBudgetState, params: &Value) {
+    if let Some(value) = find_numeric_key(params, &["prompt_tokens", "input_tokens"]) {
+        budget.prompt_tokens = budget.prompt_tokens.saturating_add(value);
+    }
+    if let Some(value) = find_numeric_key(params, &["output_tokens", "completion_tokens"]) {
+        budget.output_tokens = budget.output_tokens.saturating_add(value);
+    }
+    if let Some(value) = find_numeric_key(params, &["cached_tokens", "cache_read_tokens"]) {
+        budget.cached_tokens = budget.cached_tokens.saturating_add(value);
+    }
+
+    if let Some(cost_usd) =
+        find_float_key(params, &["cost_usd", "estimated_cost_usd", "usd", "cost"])
+    {
+        budget.estimated_cost_usd += cost_usd.max(0.0);
+    } else {
+        budget.estimated_cost_usd =
+            budget.total_tokens() as f64 * constants::DEFAULT_ESTIMATED_COST_PER_TOKEN_USD;
+    }
+}
+
+fn find_numeric_key(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(item) = map.get(*key) {
+                    if let Some(v) = item.as_u64() {
+                        return Some(v);
+                    }
+                    if let Some(v) = item.as_f64()
+                        && v >= 0.0
+                    {
+                        return Some(v as u64);
+                    }
+                }
+            }
+            for nested in map.values() {
+                if let Some(v) = find_numeric_key(nested, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(v) = find_numeric_key(item, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_float_key(value: &Value, keys: &[&str]) -> Option<f64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(item) = map.get(*key) {
+                    if let Some(v) = item.as_f64() {
+                        return Some(v);
+                    }
+                    if let Some(v) = item.as_u64() {
+                        return Some(v as f64);
+                    }
+                }
+            }
+            for nested in map.values() {
+                if let Some(v) = find_float_key(nested, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(v) = find_float_key(item, keys) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn worker_budget_status(
+    agent: &AgentRecord,
+    defaults: &crate::config::BudgetDefaultsConfig,
+) -> WorkerBudgetStatus {
+    let on_exceed = match defaults.on_exceed {
+        BudgetOnExceed::Warn => "warn",
+        BudgetOnExceed::Pause => "pause",
+        BudgetOnExceed::Kill => "kill",
+    };
+    WorkerBudgetStatus {
+        usage: WorkerBudgetUsage {
+            prompt_tokens: agent.budget.prompt_tokens,
+            output_tokens: agent.budget.output_tokens,
+            cached_tokens: agent.budget.cached_tokens,
+            estimated_cost_usd: agent.budget.estimated_cost_usd,
+            elapsed_ms: agent.budget.elapsed_ms,
+        },
+        limits: WorkerBudgetLimits {
+            max_tokens: defaults.max_tokens,
+            max_cost_usd: defaults.max_cost_usd,
+            max_duration_ms: defaults.max_duration_ms,
+            on_exceed: on_exceed.to_string(),
+        },
+        exceeded: agent.budget.exceeded,
+        exceeded_reason: agent.budget.exceeded_reason.clone(),
+    }
+}
+
+fn worker_budget_json(agent: &AgentRecord) -> Value {
+    serde_json::json!({
+        "prompt_tokens": agent.budget.prompt_tokens,
+        "output_tokens": agent.budget.output_tokens,
+        "cached_tokens": agent.budget.cached_tokens,
+        "estimated_cost_usd": agent.budget.estimated_cost_usd,
+        "elapsed_ms": agent.budget.elapsed_ms,
+        "exceeded": agent.budget.exceeded,
+        "exceeded_reason": agent.budget.exceeded_reason.clone(),
+    })
+}
+
+fn classify_failure_from_error(error: Option<&str>, params: Option<&Value>) -> FailureClass {
+    let status = params
+        .and_then(|value| value.get("status").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if status == constants::EVENT_STATUS_TIMEOUT || status == constants::EVENT_STATUS_TIMED_OUT {
+        return FailureClass::Timeout;
+    }
+
+    let normalized = error.unwrap_or_default().to_ascii_lowercase();
+    if normalized.contains("rate limit")
+        || normalized.contains("429")
+        || normalized.contains("too many requests")
+    {
+        return FailureClass::RateLimit;
+    }
+    if normalized.contains("timeout") || normalized.contains("timed out") {
+        return FailureClass::Timeout;
+    }
+    if normalized.contains("validation") {
+        return FailureClass::ValidationFailed;
+    }
+    if normalized.contains("merge conflict") || normalized.contains("conflict") {
+        return FailureClass::MergeConflict;
+    }
+    if normalized.contains("callback") {
+        return FailureClass::CallbackError;
+    }
+    if normalized.contains("tool") || normalized.contains("command") {
+        return FailureClass::ToolError;
+    }
+    FailureClass::Unknown
+}
+
+fn failure_summary_for_class(class: &FailureClass) -> &'static str {
+    match class {
+        FailureClass::RateLimit => "rate limit reached",
+        FailureClass::ValidationFailed => "validation failed",
+        FailureClass::MergeConflict => "merge conflict detected",
+        FailureClass::Timeout => "operation timed out",
+        FailureClass::ToolError => "tool execution failed",
+        FailureClass::CallbackError => "callback execution failed",
+        FailureClass::Unknown => "unknown worker failure",
+    }
+}
+
+fn failure_class_retryable(class: &FailureClass) -> bool {
+    matches!(
+        class,
+        FailureClass::RateLimit
+            | FailureClass::Timeout
+            | FailureClass::ToolError
+            | FailureClass::CallbackError
+    )
+}
+
+fn update_failure_report(
+    slot: &mut Option<FailureReport>,
+    class: FailureClass,
+    summary: String,
+    details: Option<String>,
+    retryable: bool,
+    ts: u64,
+) {
+    match slot {
+        Some(existing) if existing.class == class && existing.summary == summary => {
+            existing.last_seen = ts;
+            existing.details = details.or_else(|| existing.details.clone());
+            existing.retryable = retryable;
+        }
+        Some(existing) => {
+            *existing = FailureReport {
+                class,
+                summary,
+                details,
+                first_seen: existing.first_seen,
+                last_seen: ts,
+                retryable,
+            };
+        }
+        None => {
+            *slot = Some(FailureReport {
+                class,
+                summary,
+                details,
+                first_seen: ts,
+                last_seen: ts,
+                retryable,
+            });
+        }
+    }
+}
+
+fn apply_budget_transition(
+    agent: &mut AgentRecord,
+    on_exceed: &BudgetOnExceed,
+    reason: &str,
+    ts: u64,
+) -> Option<(String, String)> {
+    match on_exceed {
+        BudgetOnExceed::Warn => {
+            agent.error = Some(format!("budget warning: {reason}"));
+            None
+        }
+        BudgetOnExceed::Pause => {
+            agent.budget.paused_reason = Some(reason.to_string());
+            if agent.active_turn_id.is_none() {
+                agent.status = constants::AGENT_STATUS_PAUSED.to_string();
+            }
+            agent.error = Some(format!("budget paused: {reason}"));
+            None
+        }
+        BudgetOnExceed::Kill => {
+            let summary = format!("budget exceeded: {reason}");
+            let class = if reason.contains("duration") {
+                FailureClass::Timeout
+            } else {
+                FailureClass::Unknown
+            };
+            update_failure_report(
+                &mut agent.failure_report,
+                class,
+                summary.clone(),
+                Some(reason.to_string()),
+                false,
+                ts,
+            );
+            agent.status = constants::AGENT_STATUS_FAILED.to_string();
+            agent.error = Some(summary.clone());
+            let turn_id = agent.active_turn_id.clone();
+            if let Some(result) = agent.result.as_mut() {
+                result.status = constants::AGENT_STATUS_FAILED.to_string();
+                result.error = Some(summary.clone());
+            } else {
+                agent.result = Some(AgentResult {
+                    agent_id: agent.id,
+                    status: constants::AGENT_STATUS_FAILED.to_string(),
+                    completion_method: Some(constants::EVENT_METHOD_TURN_ABORTED.to_string()),
+                    turn_id: turn_id.clone(),
+                    final_text: None,
+                    summary: Some("worker stopped by budget guardrail".to_string()),
+                    references: None,
+                    completed_at: Some(ts),
+                    event_id: None,
+                    error: Some(summary),
+                });
+            }
+
+            turn_id.map(|turn_id| (agent.thread_id.clone(), turn_id))
+        }
+    }
+}
+
 fn progress_from_agent_event(
     agent: &AgentRecord,
     event: &crate::models::AgentEventDto,
@@ -6150,11 +6793,7 @@ fn progress_from_agent_event(
         tool_call: parse_tool_call_summary(event),
         validation,
         throttle,
-        budget: Some(serde_json::json!({
-            "used": null,
-            "limit": null,
-            "unit": "tokens"
-        })),
+        budget: Some(worker_budget_json(agent)),
         payload: truncate_json_value(&event.params, 240),
     }
 }
@@ -6176,11 +6815,7 @@ fn progress_validation_state(agent: &AgentRecord, event: &str) -> AgentProgressE
             retry_at_ms: agent.retry_at_ms,
             reason: agent.throttle_reason.clone(),
         }),
-        budget: Some(serde_json::json!({
-            "used": null,
-            "limit": null,
-            "unit": "tokens"
-        })),
+        budget: Some(worker_budget_json(agent)),
         payload: serde_json::json!({}),
     }
 }
@@ -6199,11 +6834,26 @@ fn progress_throttle_state(agent: &AgentRecord, event: &str) -> AgentProgressEnv
             retry_at_ms: agent.retry_at_ms,
             reason: agent.throttle_reason.clone(),
         }),
-        budget: Some(serde_json::json!({
-            "used": null,
-            "limit": null,
-            "unit": "tokens"
-        })),
+        budget: Some(worker_budget_json(agent)),
+        payload: serde_json::json!({}),
+    }
+}
+
+fn progress_budget_state(agent: &AgentRecord, event: &str) -> AgentProgressEnvelope {
+    AgentProgressEnvelope {
+        agent_id: agent.id,
+        ts: now_ts(),
+        event: event.to_string(),
+        status: agent.status.clone(),
+        turn_id: agent.active_turn_id.clone(),
+        tool_call: None,
+        validation: None,
+        throttle: Some(ProgressThrottleState {
+            throttled: agent.throttled,
+            retry_at_ms: agent.retry_at_ms,
+            reason: agent.throttle_reason.clone(),
+        }),
+        budget: Some(worker_budget_json(agent)),
         payload: serde_json::json!({}),
     }
 }
@@ -6220,17 +6870,22 @@ fn is_job_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRecord, AgentRole, Foreman, GovernorState, WorkerCallback, build_worker_branch_name,
-        build_worker_worktree_path, callback_timeout_ms, continuation_prompt_for_turn,
-        governor_apply_rate_limit, governor_apply_success, render_template,
+        AgentRecord, AgentRole, Foreman, GovernorState, WorkerBudgetState, WorkerCallback,
+        apply_budget_transition, build_worker_branch_name, build_worker_worktree_path,
+        callback_timeout_ms, classify_failure_from_error, continuation_prompt_for_turn,
+        evaluate_budget, governor_apply_rate_limit, governor_apply_success, render_template,
         render_template_strict, resolve_agent_status, run_validation_commands,
         should_fire_tool_filter, unresolved_template_tokens, update_completed_turn_counter,
     };
-    use crate::config::CallbackFilter;
+    use crate::config::{BudgetOnExceed, CallbackFilter};
+    use crate::constants;
     use crate::events::events_allowed;
     use crate::project::JobDefaultsConfig;
     use crate::state::{PersistedAgentRecord, PersistedState, PersistedWorkerCallback};
-    use crate::{config::ServiceConfig, models::AgentResult};
+    use crate::{
+        config::ServiceConfig,
+        models::{AgentResult, FailureClass},
+    };
     use codex_api::AppServerClient;
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
@@ -6238,7 +6893,6 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::broadcast;
     use uuid::Uuid;
-    use crate::constants;
 
     #[test]
     fn compact_turn_counter_resets_on_threshold() {
@@ -6528,7 +7182,10 @@ mod tests {
             shared.backoff_ms >= first_backoff,
             "shared backoff should grow across worker errors"
         );
-        assert!(second_retry > first_retry.saturating_sub(200), "retry window should move forward");
+        assert!(
+            second_retry > first_retry.saturating_sub(200),
+            "retry window should move forward"
+        );
     }
 
     #[test]
@@ -6546,6 +7203,74 @@ mod tests {
         assert_eq!(shared.backoff_ms, 0);
         assert_eq!(shared.recent_errors, 0);
         assert_eq!(shared.throttled_until_ms, 0);
+    }
+
+    #[test]
+    fn failure_classification_detects_common_error_types() {
+        assert_eq!(
+            classify_failure_from_error(Some("429 rate limit exceeded"), None),
+            FailureClass::RateLimit
+        );
+        assert_eq!(
+            classify_failure_from_error(Some("operation timed out"), None),
+            FailureClass::Timeout
+        );
+        assert_eq!(
+            classify_failure_from_error(Some("callback command failed"), None),
+            FailureClass::CallbackError
+        );
+        assert_eq!(
+            classify_failure_from_error(Some("mystery issue"), None),
+            FailureClass::Unknown
+        );
+    }
+
+    #[test]
+    fn budget_enforcement_transitions_warn_pause_kill() {
+        let mut warn_agent = sample_worker_agent();
+        warn_agent.budget.prompt_tokens = 12;
+        let warn_eval = evaluate_budget(&warn_agent.budget, 10, 1.0, 100_000);
+        assert!(warn_eval.exceeded);
+        let _ = apply_budget_transition(
+            &mut warn_agent,
+            &BudgetOnExceed::Warn,
+            warn_eval.reason.as_deref().expect("warn reason"),
+            1_700_000_100,
+        );
+        assert!(
+            warn_agent
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("budget warning"))
+        );
+        assert_ne!(warn_agent.status, constants::AGENT_STATUS_PAUSED);
+        assert_ne!(warn_agent.status, constants::AGENT_STATUS_FAILED);
+
+        let mut pause_agent = sample_worker_agent();
+        pause_agent.budget.prompt_tokens = 12;
+        let pause_eval = evaluate_budget(&pause_agent.budget, 10, 1.0, 100_000);
+        let _ = apply_budget_transition(
+            &mut pause_agent,
+            &BudgetOnExceed::Pause,
+            pause_eval.reason.as_deref().expect("pause reason"),
+            1_700_000_200,
+        );
+        assert_eq!(pause_agent.status, constants::AGENT_STATUS_PAUSED);
+        assert!(pause_agent.budget.paused_reason.is_some());
+
+        let mut kill_agent = sample_worker_agent();
+        kill_agent.active_turn_id = Some("turn-9".to_string());
+        kill_agent.budget.elapsed_ms = 999_999;
+        let kill_eval = evaluate_budget(&kill_agent.budget, 100, 999.0, 10);
+        let kill = apply_budget_transition(
+            &mut kill_agent,
+            &BudgetOnExceed::Kill,
+            kill_eval.reason.as_deref().expect("kill reason"),
+            1_700_000_300,
+        );
+        assert_eq!(kill_agent.status, constants::AGENT_STATUS_FAILED);
+        assert!(kill_agent.failure_report.is_some());
+        assert!(kill.is_some(), "kill should request turn interrupt");
     }
 
     #[test]
@@ -6675,6 +7400,8 @@ mod tests {
             throttled: false,
             retry_at_ms: None,
             throttle_reason: None,
+            failure_report: None,
+            budget: WorkerBudgetState::new(),
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -6700,6 +7427,42 @@ mod tests {
         };
 
         assert_eq!(resolve_agent_status(&agent), "completed");
+    }
+
+    fn sample_worker_agent() -> AgentRecord {
+        AgentRecord {
+            id: Uuid::new_v4(),
+            thread_id: "thread-budget".to_string(),
+            active_turn_id: None,
+            prompt: None,
+            cwd: None,
+            restart_attempts: 0,
+            turns_completed: 0,
+            validation_retries: 0,
+            last_validation_error: None,
+            worktree_path: None,
+            branch_name: None,
+            model: Some("gpt-5".to_string()),
+            model_provider: Some("openai".to_string()),
+            governor_key: Some("openai/gpt-5".to_string()),
+            governor_inflight: false,
+            throttled: false,
+            retry_at_ms: None,
+            throttle_reason: None,
+            failure_report: None,
+            budget: WorkerBudgetState::new(),
+            status: constants::AGENT_STATUS_IDLE.to_string(),
+            callback: WorkerCallback::None,
+            role: AgentRole::Worker,
+            project_id: None,
+            foreman_id: None,
+            error: None,
+            result: None,
+            job_id: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            events: VecDeque::new(),
+        }
     }
 
     fn test_fake_codex_binary() -> String {
@@ -6753,6 +7516,8 @@ mod tests {
                 throttled: false,
                 retry_at_ms: None,
                 throttle_reason: None,
+                failure_report: None,
+                budget: None,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),

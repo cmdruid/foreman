@@ -3,6 +3,56 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    RateLimit,
+    ValidationFailed,
+    MergeConflict,
+    Timeout,
+    ToolError,
+    CallbackError,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FailureReport {
+    pub class: FailureClass,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Option<String>,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerBudgetUsage {
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub estimated_cost_usd: f64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerBudgetLimits {
+    pub max_tokens: u64,
+    pub max_cost_usd: f64,
+    pub max_duration_ms: u64,
+    pub on_exceed: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerBudgetStatus {
+    pub usage: WorkerBudgetUsage,
+    pub limits: WorkerBudgetLimits,
+    #[serde(default)]
+    pub exceeded: bool,
+    #[serde(default)]
+    pub exceeded_reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkerWorktreeSpec {
     pub path: String,
@@ -225,6 +275,10 @@ pub struct AgentState {
     pub retry_at_ms: Option<u64>,
     #[serde(default)]
     pub throttle_reason: Option<String>,
+    #[serde(default)]
+    pub failure_report: Option<FailureReport>,
+    #[serde(default)]
+    pub budget: Option<WorkerBudgetStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -247,6 +301,10 @@ pub struct AgentResultResponse {
     pub retry_at_ms: Option<u64>,
     #[serde(default)]
     pub throttle_reason: Option<String>,
+    #[serde(default)]
+    pub failure_report: Option<FailureReport>,
+    #[serde(default)]
+    pub budget: Option<WorkerBudgetStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

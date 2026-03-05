@@ -7,7 +7,7 @@ use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::constants;
-use crate::models::{AgentEventDto, AgentResult};
+use crate::models::{AgentEventDto, AgentResult, FailureReport};
 use crate::project::ProjectConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +159,10 @@ pub struct PersistedAgentRecord {
     pub retry_at_ms: Option<u64>,
     #[serde(default)]
     pub throttle_reason: Option<String>,
+    #[serde(default)]
+    pub failure_report: Option<FailureReport>,
+    #[serde(default)]
+    pub budget: Option<PersistedWorkerBudget>,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,
@@ -172,6 +176,26 @@ pub struct PersistedAgentRecord {
     pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<AgentEventDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkerBudget {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub estimated_cost_usd: f64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub exceeded: bool,
+    #[serde(default)]
+    pub exceeded_reason: Option<String>,
+    #[serde(default)]
+    pub paused_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
