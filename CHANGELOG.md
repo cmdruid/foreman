@@ -4,6 +4,13 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.2.1]
+
+- Fixed a deadlock in `restart_stalled_worker` by snapshotting worker results and dropping the `agents` write lock before job/project update calls that re-read agent state.
+- Reduced notification log noise by silently ignoring threadless `account/rateLimits/updated` notifications.
+- Hardened event-loop resiliency by increasing broadcast channel capacity to `1024` and continuing after broadcast lag events instead of terminating the loop.
+- Added startup PID lockfile protection (`.foreman/foreman.lock`) to prevent dual-instance socket collisions, with stale lock takeover and lockfile cleanup on graceful shutdown.
+
 ## v0.2.0
 
 - Hardened callback and lifecycle behavior in project orchestration, including clearer status handling for worker completion/abort paths.

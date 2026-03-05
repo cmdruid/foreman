@@ -8,6 +8,7 @@ mod state;
 
 use std::{
     env, fs,
+    fs::OpenOptions,
     path::{Path as StdPath, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
@@ -101,6 +102,24 @@ struct AppState {
 #[derive(Debug, serde::Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[derive(Debug)]
+struct PidLockGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl Drop for PidLockGuard {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid == self.pid)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[tokio::main]
@@ -226,6 +245,13 @@ async fn main() -> anyhow::Result<()> {
             PersistedState::default()
         });
     let socket_path = resolve_socket_path(&args.socket_path, &project_state_path)?;
+    let _pid_lock = match acquire_pid_lockfile(&socket_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     cleanup_socket_path(&socket_path)?;
 
     let (event_tx, event_rx) = broadcast::channel(consts::BROADCAST_CHANNEL_CAPACITY);
@@ -310,7 +336,12 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to bind unix socket '{}'", socket_path.display()))?;
         set_socket_permissions(&socket_path)?;
         tracing::info!(socket = ?socket_path, "foreman listening on Unix socket");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutdown signal received");
+            })
+            .await?;
     }
     Ok(())
 }
@@ -362,6 +393,72 @@ fn cleanup_socket_path(path: &StdPath) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn cleanup_socket_path(_path: &StdPath) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_pid_lockfile(socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
+    let lock_path = socket_path
+        .parent()
+        .unwrap_or_else(|| StdPath::new(consts::DEFAULT_WORKING_DIRECTORY))
+        .join(consts::FOREMAN_LOCK_FILENAME);
+
+    let pid = std::process::id();
+    let pid_contents = format!("{pid}\n");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(pid_contents.as_bytes())
+                .with_context(|| format!("write lockfile '{}'", lock_path.display()))?;
+            Ok(PidLockGuard {
+                path: lock_path,
+                pid,
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(&lock_path)
+                .with_context(|| format!("read lockfile '{}'", lock_path.display()))?;
+            if let Ok(existing_pid) = existing.trim().parse::<u32>()
+                && pid_is_alive(existing_pid)
+            {
+                return Err(anyhow!(
+                    "another foreman instance is running for socket '{}'; lockfile '{}' has active PID {}",
+                    socket_path.display(),
+                    lock_path.display(),
+                    existing_pid
+                ));
+            }
+
+            fs::write(&lock_path, pid_contents)
+                .with_context(|| format!("overwrite stale lockfile '{}'", lock_path.display()))?;
+            Ok(PidLockGuard {
+                path: lock_path,
+                pid,
+            })
+        }
+        Err(err) => Err(err).with_context(|| format!("create lockfile '{}'", lock_path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_pid_lockfile(_socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
+    Ok(PidLockGuard {
+        path: PathBuf::new(),
+        pid: std::process::id(),
+    })
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    StdPath::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]

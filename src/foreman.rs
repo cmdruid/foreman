@@ -40,6 +40,8 @@ use crate::{
     },
 };
 
+const SILENTLY_IGNORED_NOTIFICATIONS: &[&str] = &["account/rateLimits/updated"];
+
 #[derive(Debug, Clone)]
 struct WorkerWebhookCallback {
     url: String,
@@ -387,12 +389,13 @@ impl Foreman {
                 let _ = self.update_project_after_worker_event(project_id).await;
             }
             if let Some(job_id) = candidate.job_id {
-                let agents = self.agents.read().await;
-                if let Some(agent) = agents.get(&agent_id) {
-                    let _ = self
-                        .update_job_after_worker_event(job_id, agent.result.as_ref())
-                        .await;
-                }
+                let result_snapshot = {
+                    let agents = self.agents.read().await;
+                    agents.get(&agent_id).and_then(|agent| agent.result.clone())
+                };
+                let _ = self
+                    .update_job_after_worker_event(job_id, result_snapshot.as_ref())
+                    .await;
             }
             self.schedule_state_persist();
             return Ok(());
@@ -472,12 +475,15 @@ impl Foreman {
             }
         }
 
+        let result_snapshot = agent.result.clone();
+        drop(agents);
+
         if let Some(project_id) = candidate.project_id {
             let _ = self.update_project_after_worker_event(project_id).await;
         }
         if let Some(job_id) = candidate.job_id {
             let _ = self
-                .update_job_after_worker_event(job_id, agent.result.as_ref())
+                .update_job_after_worker_event(job_id, result_snapshot.as_ref())
                 .await;
         }
         Ok(())
@@ -488,8 +494,11 @@ impl Foreman {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => this.route_notification(event).await,
-                    Err(err) => {
-                        warn!(%err, "event channel closed");
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "event channel lagged; continuing");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("event channel closed");
                         break;
                     }
                 }
@@ -590,11 +599,16 @@ impl Foreman {
                     .await;
             }
         } else {
-            debug!(
-                method = %event.method,
-                normalized_method = %normalized_method,
-                "dropping notification without thread id"
-            );
+            if !SILENTLY_IGNORED_NOTIFICATIONS
+                .iter()
+                .any(|method| normalized_method.as_ref() == *method)
+            {
+                debug!(
+                    method = %event.method,
+                    normalized_method = %normalized_method,
+                    "dropping notification without thread id"
+                );
+            }
         }
     }
 
