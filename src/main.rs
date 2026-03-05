@@ -316,6 +316,7 @@ async fn run() -> anyhow::Result<()> {
             .route(consts::ROUTE_AGENT_WAIT, get(wait_agent_result))
             .route(consts::ROUTE_AGENT_EVENTS, get(get_agent_events))
             .route(consts::ROUTE_AGENT_LOGS, get(get_agent_logs))
+            .route(consts::ROUTE_AGENT_WATCH, get(get_agent_watch_stream))
             .route(consts::ROUTE_AGENT_SEND, post(send_turn))
             .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
             .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
@@ -1188,6 +1189,7 @@ struct StatusResponse {
     default_callback_profile: Option<String>,
     agent_count: usize,
     project_count: usize,
+    throttled_workers: Vec<models::ThrottledWorkerStatus>,
     started_at: u64,
     uptime_seconds: u64,
 }
@@ -1195,6 +1197,7 @@ struct StatusResponse {
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let (agent_count, project_count, started_at, uptime_seconds) =
         state.foreman.status_summary().await;
+    let throttled_workers = state.foreman.list_throttled_workers().await;
     let app_server_pid = state.foreman.app_server_pid().await;
 
     Json(StatusResponse {
@@ -1209,6 +1212,7 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         default_callback_profile: state.foreman.default_callback_profile(),
         agent_count,
         project_count,
+        throttled_workers,
         started_at,
         uptime_seconds,
     })
@@ -1467,6 +1471,51 @@ async fn get_job_events_stream(
                 }
                 _ => None,
             }
+        });
+
+    let stream = tokio_stream::iter(replay_events).chain(live);
+    Sse::new(stream).into_response()
+}
+
+async fn get_agent_watch_stream(
+    State(state): State<AppState>,
+    Path(agent_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(err) = state.foreman.get_agent(agent_id).await {
+        return error_response(StatusCode::NOT_FOUND, err);
+    }
+
+    let replay_from = parse_last_event_id(&headers);
+    let replay = match state
+        .foreman
+        .get_agent_progress_backlog(agent_id, replay_from)
+        .await
+    {
+        Ok(events) => events,
+        Err(err) => return error_response(StatusCode::NOT_FOUND, err),
+    };
+    let replay_events = replay
+        .into_iter()
+        .map(|event| {
+            Ok::<Event, Infallible>(sse_event(
+                "agent.progress",
+                event.ts,
+                serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({})),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let live = BroadcastStream::new(state.foreman.subscribe_agent_progress())
+        .filter_map(move |result| match result {
+            Ok(envelope) if envelope.agent_id == agent_id => Some(Ok::<Event, Infallible>(
+                sse_event(
+                    "agent.progress",
+                    envelope.ts,
+                    serde_json::to_value(envelope).unwrap_or_else(|_| serde_json::json!({})),
+                ),
+            )),
+            _ => None,
         });
 
     let stream = tokio_stream::iter(replay_events).chain(live);

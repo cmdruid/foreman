@@ -31,19 +31,20 @@ use crate::{
     constants,
     events::events_allowed,
     models::{
-        AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
+        AgentProgressEnvelope, AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
         CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse,
-        JobEventEnvelope, JobResult, JobState, ProjectCallbackStatusResponse, ProjectState,
-        SendAgentInput, SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest,
-        SpawnProjectWorkerRequest, SpawnProjectWorkerResponse, SteerAgentInput, ToolCallSummary,
+        JobEventEnvelope, JobResult, JobState, ProgressThrottleState, ProgressValidationState,
+        ProjectCallbackStatusResponse, ProjectState, SendAgentInput, SpawnAgentRequest,
+        SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
+        SpawnProjectWorkerResponse, SteerAgentInput, ThrottledWorkerStatus, ToolCallSummary,
         ToolFilterCallbackPayload, WorkerLogEntry, WorkerWorktreeSpec,
     },
     project::{
         CallbackSpec, JobDefaultsConfig, ProjectConfig, ProjectRuntimeFiles, ValidationConfig,
     },
     state::{
-        PersistedAgentRecord, PersistedJobRecord, PersistedProjectRecord, PersistedRuntimeFiles,
-        PersistedState, PersistedWorkerCallback,
+        PersistedAgentRecord, PersistedGovernorRecord, PersistedJobRecord, PersistedProjectRecord,
+        PersistedRuntimeFiles, PersistedState, PersistedWorkerCallback,
     },
 };
 
@@ -123,6 +124,13 @@ struct AgentRecord {
     last_validation_error: Option<String>,
     worktree_path: Option<String>,
     branch_name: Option<String>,
+    model: Option<String>,
+    model_provider: Option<String>,
+    governor_key: Option<String>,
+    governor_inflight: bool,
+    throttled: bool,
+    retry_at_ms: Option<u64>,
+    throttle_reason: Option<String>,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -134,6 +142,14 @@ struct AgentRecord {
     created_at: u64,
     updated_at: u64,
     events: VecDeque<crate::models::AgentEventDto>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GovernorState {
+    throttled_until_ms: u64,
+    backoff_ms: u64,
+    recent_errors: u32,
+    inflight_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -203,8 +219,10 @@ pub struct Foreman {
     thread_map: RwLock<HashMap<String, Uuid>>,
     projects: RwLock<HashMap<Uuid, ProjectRecord>>,
     jobs: RwLock<HashMap<Uuid, JobRecord>>,
+    governors: RwLock<HashMap<String, GovernorState>>,
     callback_filter_debounce: RwLock<HashMap<(Uuid, String), u64>>,
     job_event_tx: broadcast::Sender<JobEventEnvelope>,
+    agent_progress_tx: broadcast::Sender<AgentProgressEnvelope>,
     worktree_lock: Mutex<()>,
     started_at: u64,
     state_path: PathBuf,
@@ -228,8 +246,10 @@ impl Foreman {
             thread_map: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
+            governors: RwLock::new(HashMap::new()),
             callback_filter_debounce: RwLock::new(HashMap::new()),
             job_event_tx: broadcast::channel(constants::JOB_EVENT_CHANNEL_CAPACITY).0,
+            agent_progress_tx: broadcast::channel(constants::AGENT_PROGRESS_CHANNEL_CAPACITY).0,
             worktree_lock: Mutex::new(()),
             started_at: now_ts(),
             state_path,
@@ -265,6 +285,11 @@ impl Foreman {
                 restore_job_record(record).context("failed to restore job record from state")?;
             loaded_jobs.push(restored);
         }
+        let loaded_governors = snapshot
+            .governors
+            .into_iter()
+            .map(|(key, record)| (key, restore_governor_record(record)))
+            .collect::<HashMap<_, _>>();
 
         {
             let mut projects = self.projects.write().await;
@@ -287,6 +312,10 @@ impl Foreman {
             for job in loaded_jobs {
                 jobs.insert(job.id, job);
             }
+        }
+        {
+            let mut governors = self.governors.write().await;
+            governors.extend(loaded_governors);
         }
 
         self.schedule_state_persist();
@@ -631,13 +660,21 @@ impl Foreman {
             }
             snapshot
         };
+        let governors = {
+            let governors = self.governors.read().await;
+            governors
+                .iter()
+                .map(|(key, value)| (key.clone(), persisted_governor_record(value)))
+                .collect::<HashMap<_, _>>()
+        };
 
         let state = PersistedState {
-            version: 1,
+            version: constants::PERSISTED_STATE_VERSION,
             generated_at: now_ts(),
             agents,
             projects,
             jobs,
+            governors,
         };
 
         state.save(&self.state_path).await?;
@@ -721,6 +758,8 @@ impl Foreman {
         let mut callback_context: Option<CallbackEventContext> = None;
         let mut tool_filter_context: Option<ToolFilterDispatchContext> = None;
         let mut should_update_job = false;
+        let mut should_release_inflight = false;
+        let mut progress_event: Option<AgentProgressEnvelope> = None;
         {
             let mut agents = self.agents.write().await;
             if let Some(agent) = agents.get_mut(&agent_id) {
@@ -754,6 +793,9 @@ impl Foreman {
                         agent.turns_completed = agent.turns_completed.saturating_add(1);
                     }
                     agent.status = constants::AGENT_STATUS_IDLE.to_string();
+                    agent.throttled = false;
+                    agent.retry_at_ms = None;
+                    agent.throttle_reason = None;
                     agent.result = Some(build_completion_result(
                         agent.id,
                         &method,
@@ -763,6 +805,7 @@ impl Foreman {
                         event_id,
                     ));
                     should_update_job = true;
+                    should_release_inflight = true;
                 }
                 if method == constants::THREAD_EVENT_STARTED
                     && let Some(status) = params.get("status").and_then(|value| value.as_str())
@@ -787,6 +830,7 @@ impl Foreman {
                         }
                         agent.result = Some(result);
                         should_update_job = true;
+                        should_release_inflight = true;
                     }
                 }
                 if method == constants::EVENT_METHOD_TURN_STARTED
@@ -823,14 +867,24 @@ impl Foreman {
                     project_id: agent.project_id,
                     foreman_id: agent.foreman_id,
                     job_id: agent.job_id,
-                    method,
+                    method: method.clone(),
                     ts,
-                    params,
+                    params: params.clone(),
                     event_id,
                     result_snapshot,
                     callback: agent.callback.clone(),
                 });
+                let event = crate::models::AgentEventDto {
+                    ts,
+                    method: method.clone(),
+                    params: truncate_json_value(&params, 240),
+                };
+                progress_event = Some(progress_from_agent_event(agent, &event));
             }
+        }
+
+        if should_release_inflight {
+            self.release_governor_inflight(agent_id).await;
         }
 
         if let Some(context) = tool_filter_context
@@ -886,6 +940,10 @@ impl Foreman {
             if let Err(err) = self.execute_event(context).await {
                 warn!(%err, "callback execution failed");
             }
+        }
+
+        if let Some(progress) = progress_event {
+            let _ = self.agent_progress_tx.send(progress);
         }
     }
 
@@ -1224,6 +1282,9 @@ impl Foreman {
         if let Some(agent) = agents.get_mut(&agent_id) {
             agent.last_validation_error = None;
             agent.updated_at = now_ts();
+            let _ = self
+                .agent_progress_tx
+                .send(progress_validation_state(agent, "validation/ok"));
         }
     }
 
@@ -1240,6 +1301,9 @@ impl Foreman {
             };
             agent.last_validation_error = Some(error_text.clone());
             agent.updated_at = now_ts();
+            let _ = self
+                .agent_progress_tx
+                .send(progress_validation_state(agent, "validation/failed"));
             (agent.validation_retries, agent.active_turn_id.clone())
         };
 
@@ -3093,6 +3157,7 @@ impl Foreman {
 
     pub async fn list_jobs(&self) -> Vec<JobState> {
         let jobs = self.jobs.read().await;
+        let agents = self.agents.read().await;
         jobs.values()
             .map(|job| JobState {
                 id: job.id,
@@ -3103,6 +3168,17 @@ impl Foreman {
                 created_at: job.created_at,
                 completed_at: job.completed_at,
                 updated_at: job.updated_at,
+                throttled_workers: job
+                    .worker_ids
+                    .iter()
+                    .filter_map(|worker_id| agents.get(worker_id))
+                    .filter(|agent| agent.throttled)
+                    .map(|agent| ThrottledWorkerStatus {
+                        agent_id: agent.id,
+                        retry_at_ms: agent.retry_at_ms,
+                        reason: agent.throttle_reason.clone(),
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -3115,6 +3191,7 @@ impl Foreman {
             .get(&job_id)
             .context("job not found")?
             .clone();
+        let agents = self.agents.read().await;
 
         Ok(JobState {
             id: job.id,
@@ -3125,6 +3202,17 @@ impl Foreman {
             created_at: job.created_at,
             completed_at: job.completed_at,
             updated_at: job.updated_at,
+            throttled_workers: job
+                .worker_ids
+                .iter()
+                .filter_map(|worker_id| agents.get(worker_id))
+                .filter(|agent| agent.throttled)
+                .map(|agent| ThrottledWorkerStatus {
+                    agent_id: agent.id,
+                    retry_at_ms: agent.retry_at_ms,
+                    reason: agent.throttle_reason.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -3154,6 +3242,9 @@ impl Foreman {
                     event_id: None,
                     event_count: 0,
                     error: Some("worker disappeared".to_string()),
+                    throttled: false,
+                    retry_at_ms: None,
+                    throttle_reason: None,
                 }
             });
 
@@ -3568,24 +3659,10 @@ impl Foreman {
             }
         }
 
-        let thread_id = {
-            let agents = self.agents.read().await;
-            let agent = agents.get(&agent_id).context("agent not found")?;
-            agent.thread_id.clone()
-        };
-
         let turn_id = if has_turn_prompt {
-            let request = TurnStartRequest {
-                thread_id: thread_id.clone(),
-                input: vec![TextPayload::text(input.prompt.clone().unwrap_or_default())],
-            };
-            let response = self
-                .client
-                .turn_start(&request)
+            self.start_agent_turn(agent_id, input.prompt.clone().unwrap_or_default())
                 .await
-                .with_context(|| "turn/start failed")?;
-
-            Some(response.turn_id)
+                .with_context(|| "turn/start failed")?
         } else {
             None
         };
@@ -3598,10 +3675,6 @@ impl Foreman {
                     agent.restart_attempts = 0;
                 }
                 agent.updated_at = now_ts();
-                if has_turn_prompt {
-                    agent.status = constants::AGENT_STATUS_RUNNING.to_string();
-                }
-
                 if let Some(turn_id) = turn_id.clone() {
                     agent.active_turn_id = Some(turn_id);
                     agent.status = constants::AGENT_STATUS_RUNNING.to_string();
@@ -3622,7 +3695,7 @@ impl Foreman {
             turn_id,
             status: {
                 if has_turn_prompt {
-                    constants::AGENT_STATUS_RUNNING.to_string()
+                    updated_agent.status.clone()
                 } else {
                     updated_agent.status
                 }
@@ -3716,8 +3789,169 @@ impl Foreman {
         Ok(())
     }
 
+    async fn start_agent_turn(self: &Arc<Self>, agent_id: Uuid, prompt: String) -> Result<Option<String>> {
+        let (thread_id, role, governor_key) = {
+            let agents = self.agents.read().await;
+            let agent = agents.get(&agent_id).context("agent not found")?;
+            (
+                agent.thread_id.clone(),
+                agent.role.clone(),
+                agent.governor_key.clone(),
+            )
+        };
+
+        if role == AgentRole::Worker
+            && let Some(key) = governor_key.clone()
+            && let Some(retry_at_ms) = self.acquire_governor_permit(&key).await
+        {
+            self.mark_agent_throttled(agent_id, retry_at_ms, "provider rate limit").await;
+            self.schedule_throttled_retry(agent_id, retry_at_ms);
+            return Ok(None);
+        }
+
+        let request = TurnStartRequest {
+            thread_id: thread_id.clone(),
+            input: vec![TextPayload::text(prompt)],
+        };
+        match self.client.turn_start(&request).await {
+            Ok(response) => {
+                let turn_id = response.turn_id;
+                {
+                    let mut agents = self.agents.write().await;
+                    if let Some(agent) = agents.get_mut(&agent_id) {
+                        agent.active_turn_id = Some(turn_id.clone());
+                        agent.status = constants::AGENT_STATUS_RUNNING.to_string();
+                        agent.throttled = false;
+                        agent.retry_at_ms = None;
+                        agent.throttle_reason = None;
+                        if role == AgentRole::Worker && governor_key.is_some() {
+                            agent.governor_inflight = true;
+                        }
+                        agent.updated_at = now_ts();
+                    }
+                }
+                if role == AgentRole::Worker && let Some(key) = governor_key {
+                    self.governor_mark_success(&key).await;
+                }
+                Ok(Some(turn_id))
+            }
+            Err(err) => {
+                if role == AgentRole::Worker && let Some(key) = governor_key {
+                    if is_rate_limit_error(err.to_string().as_str()) {
+                        let retry_at_ms = self.governor_mark_rate_limited(&key).await;
+                        self.mark_agent_throttled(agent_id, retry_at_ms, err.to_string().as_str())
+                            .await;
+                        self.schedule_throttled_retry(agent_id, retry_at_ms);
+                        return Ok(None);
+                    }
+                    self.governor_release_permit(&key).await;
+                }
+                Err(err).context("turn/start failed")
+            }
+        }
+    }
+
+    fn schedule_throttled_retry(self: &Arc<Self>, agent_id: Uuid, retry_at_ms: u64) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let now = now_ms();
+            let delay_ms = retry_at_ms.saturating_sub(now);
+            if delay_ms > 0 {
+                time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let _ = this.retry_throttled_agent_turn(agent_id).await;
+        });
+    }
+
+    async fn retry_throttled_agent_turn(self: &Arc<Self>, agent_id: Uuid) -> Result<()> {
+        let prompt = {
+            let agents = self.agents.read().await;
+            let Some(agent) = agents.get(&agent_id) else {
+                return Ok(());
+            };
+            if !agent.throttled {
+                return Ok(());
+            }
+            if agent.active_turn_id.is_some() {
+                return Ok(());
+            }
+            agent.prompt.clone().unwrap_or_default()
+        };
+        if prompt.trim().is_empty() {
+            return Ok(());
+        }
+        let _ = self.start_agent_turn(agent_id, prompt).await?;
+        self.schedule_state_persist();
+        Ok(())
+    }
+
+    async fn acquire_governor_permit(&self, key: &str) -> Option<u64> {
+        let mut governors = self.governors.write().await;
+        let state = governors.entry(key.to_string()).or_default();
+        let now = now_ms();
+        if state.throttled_until_ms > now {
+            return Some(state.throttled_until_ms);
+        }
+        state.inflight_count = state.inflight_count.saturating_add(1);
+        None
+    }
+
+    async fn governor_release_permit(&self, key: &str) {
+        let mut governors = self.governors.write().await;
+        if let Some(state) = governors.get_mut(key) {
+            state.inflight_count = state.inflight_count.saturating_sub(1);
+        }
+    }
+
+    async fn release_governor_inflight(&self, agent_id: Uuid) {
+        let key = {
+            let mut agents = self.agents.write().await;
+            let Some(agent) = agents.get_mut(&agent_id) else {
+                return;
+            };
+            if !agent.governor_inflight {
+                return;
+            }
+            agent.governor_inflight = false;
+            agent.governor_key.clone()
+        };
+
+        if let Some(key) = key {
+            self.governor_release_permit(&key).await;
+        }
+    }
+
+    async fn governor_mark_rate_limited(&self, key: &str) -> u64 {
+        let mut governors = self.governors.write().await;
+        let state = governors.entry(key.to_string()).or_default();
+        governor_apply_rate_limit(state, now_ms())
+    }
+
+    async fn governor_mark_success(&self, key: &str) {
+        let mut governors = self.governors.write().await;
+        if let Some(state) = governors.get_mut(key) {
+            governor_apply_success(state, now_ms());
+        }
+    }
+
+    async fn mark_agent_throttled(&self, agent_id: Uuid, retry_at_ms: u64, reason: &str) {
+        let mut agents = self.agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id) {
+            agent.status = constants::AGENT_STATUS_THROTTLED.to_string();
+            agent.throttled = true;
+            agent.retry_at_ms = Some(retry_at_ms);
+            agent.throttle_reason = Some(truncate_text(reason, 240));
+            agent.active_turn_id = None;
+            agent.governor_inflight = false;
+            agent.updated_at = now_ts();
+            let _ = self
+                .agent_progress_tx
+                .send(progress_throttle_state(agent, "throttle/wait"));
+        }
+    }
+
     pub async fn close_agent(self: &Arc<Self>, agent_id: Uuid) -> Result<()> {
-        let (thread_id, project_id, role, _foreman_id, job_id) = {
+        let (thread_id, project_id, role, _foreman_id, job_id, governor_key, governor_inflight) = {
             let mut agents = self.agents.write().await;
             let agent = agents.remove(&agent_id).context("agent not found")?;
             (
@@ -3726,6 +3960,8 @@ impl Foreman {
                 agent.role,
                 agent.foreman_id,
                 agent.job_id,
+                agent.governor_key,
+                agent.governor_inflight,
             )
         };
 
@@ -3757,6 +3993,9 @@ impl Foreman {
                     job.completed_at = Some(now_ts());
                 }
             }
+        }
+        if governor_inflight && let Some(key) = governor_key {
+            self.governor_release_permit(&key).await;
         }
         self.schedule_state_persist();
 
@@ -3791,8 +4030,48 @@ impl Foreman {
         )
     }
 
+    pub async fn list_throttled_workers(&self) -> Vec<ThrottledWorkerStatus> {
+        let agents = self.agents.read().await;
+        agents
+            .values()
+            .filter(|agent| agent.throttled || agent.status == constants::AGENT_STATUS_THROTTLED)
+            .map(|agent| ThrottledWorkerStatus {
+                agent_id: agent.id,
+                retry_at_ms: agent.retry_at_ms,
+                reason: agent.throttle_reason.clone(),
+            })
+            .collect()
+    }
+
     pub fn subscribe_job_events(&self) -> broadcast::Receiver<JobEventEnvelope> {
         self.job_event_tx.subscribe()
+    }
+
+    pub fn subscribe_agent_progress(&self) -> broadcast::Receiver<AgentProgressEnvelope> {
+        self.agent_progress_tx.subscribe()
+    }
+
+    pub async fn get_agent_progress_backlog(
+        &self,
+        agent_id: Uuid,
+        since_ts: Option<u64>,
+    ) -> Result<Vec<AgentProgressEnvelope>> {
+        let agent = self
+            .agents
+            .read()
+            .await
+            .get(&agent_id)
+            .cloned()
+            .context("agent not found")?;
+        let min_ts = since_ts.unwrap_or(0);
+        let mut envelopes = agent
+            .events
+            .iter()
+            .filter(|event| event.ts >= min_ts)
+            .map(|event| progress_from_agent_event(&agent, event))
+            .collect::<Vec<_>>();
+        envelopes.sort_by_key(|event| event.ts);
+        Ok(envelopes)
     }
 
     pub async fn get_job_event_backlog(
@@ -3956,6 +4235,9 @@ impl Foreman {
                 .as_ref()
                 .and_then(|result| result.error.clone())
                 .or(agent.error),
+            throttled: agent.throttled,
+            retry_at_ms: agent.retry_at_ms,
+            throttle_reason: agent.throttle_reason.clone(),
         })
     }
 
@@ -4016,6 +4298,9 @@ impl Foreman {
                                     event_id: None,
                                     event_count: 0,
                                     error: Some("wait timeout".to_string()),
+                                    throttled: false,
+                                    retry_at_ms: None,
+                                    throttle_reason: None,
                                 }
                             })
                         },
@@ -4049,8 +4334,8 @@ impl Foreman {
     ) -> Result<SpawnAgentResponse> {
         let thread_id = {
             let request = ThreadStartRequest {
-                model: request.model,
-                model_provider: request.model_provider,
+                model: request.model.clone(),
+                model_provider: request.model_provider.clone(),
                 cwd: request.cwd.clone(),
                 sandbox: request.sandbox,
             };
@@ -4071,6 +4356,7 @@ impl Foreman {
             Some(request.prompt.clone())
         };
         let cwd = request.cwd.clone();
+        let governor_key = governor_key(request.model_provider.as_deref(), request.model.as_deref());
         {
             let agent = AgentRecord {
                 id,
@@ -4084,6 +4370,13 @@ impl Foreman {
                 last_validation_error: None,
                 worktree_path: None,
                 branch_name: None,
+                model: request.model.clone(),
+                model_provider: request.model_provider.clone(),
+                governor_key,
+                governor_inflight: false,
+                throttled: false,
+                retry_at_ms: None,
+                throttle_reason: None,
                 status: constants::AGENT_STATUS_IDLE.into(),
                 callback,
                 role: role.clone(),
@@ -4108,29 +4401,18 @@ impl Foreman {
 
         let mut turn_id: Option<String> = None;
         if !request.prompt.trim().is_empty() {
-            let turn_request = TurnStartRequest {
-                thread_id: thread_id.clone(),
-                input: vec![TextPayload::text(request.prompt)],
-            };
-            let response = self
-                .client
-                .turn_start(&turn_request)
+            turn_id = self
+                .start_agent_turn(id, request.prompt.clone())
                 .await
                 .with_context(|| "turn/start failed")?;
-            turn_id = Some(response.turn_id);
-
-            let mut agents = self.agents.write().await;
-            if let Some(agent) = agents.get_mut(&id) {
-                agent.active_turn_id = turn_id.clone();
-                agent.status = constants::AGENT_STATUS_RUNNING.into();
-                agent.updated_at = now_ts();
-            }
         }
 
-        let status = if turn_id.is_some() {
-            constants::AGENT_STATUS_RUNNING.to_string()
-        } else {
-            constants::AGENT_STATUS_IDLE.to_string()
+        let status = {
+            let agents = self.agents.read().await;
+            agents
+                .get(&id)
+                .map(resolve_agent_status)
+                .unwrap_or_else(|| constants::AGENT_STATUS_UNKNOWN.to_string())
         };
 
         {
@@ -4461,6 +4743,9 @@ fn build_agent_state(agent: &AgentRecord) -> AgentState {
                 .saturating_sub(agent.created_at)
                 .saturating_mul(constants::MILLISECONDS_PER_SECOND),
         ),
+        throttled: agent.throttled,
+        retry_at_ms: agent.retry_at_ms,
+        throttle_reason: agent.throttle_reason.clone(),
     }
 }
 
@@ -5449,6 +5734,12 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         record.turns_completed
     };
 
+    let model = record.model;
+    let model_provider = record.model_provider;
+    let governor_key = record
+        .governor_key
+        .or_else(|| governor_key(model_provider.as_deref(), model.as_deref()));
+
     Ok(AgentRecord {
         id,
         thread_id,
@@ -5461,6 +5752,13 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         last_validation_error: record.last_validation_error,
         worktree_path: record.worktree_path,
         branch_name: record.branch_name,
+        model,
+        model_provider,
+        governor_key,
+        governor_inflight: record.governor_inflight,
+        throttled: record.throttled,
+        retry_at_ms: record.retry_at_ms,
+        throttle_reason: record.throttle_reason,
         status,
         callback,
         role,
@@ -5577,6 +5875,13 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         last_validation_error: agent.last_validation_error.clone(),
         worktree_path: agent.worktree_path.clone(),
         branch_name: agent.branch_name.clone(),
+        model: agent.model.clone(),
+        model_provider: agent.model_provider.clone(),
+        governor_key: agent.governor_key.clone(),
+        governor_inflight: agent.governor_inflight,
+        throttled: agent.throttled,
+        retry_at_ms: agent.retry_at_ms,
+        throttle_reason: agent.throttle_reason.clone(),
         status: agent.status.clone(),
         callback,
         role,
@@ -5609,6 +5914,24 @@ fn persisted_job_record(job: &JobRecord) -> PersistedJobRecord {
         created_at: job.created_at,
         completed_at: job.completed_at,
         updated_at: job.updated_at,
+    }
+}
+
+fn restore_governor_record(record: PersistedGovernorRecord) -> GovernorState {
+    GovernorState {
+        throttled_until_ms: record.throttled_until_ms,
+        backoff_ms: record.backoff_ms,
+        recent_errors: record.recent_errors,
+        inflight_count: record.inflight_count,
+    }
+}
+
+fn persisted_governor_record(state: &GovernorState) -> PersistedGovernorRecord {
+    PersistedGovernorRecord {
+        throttled_until_ms: state.throttled_until_ms,
+        backoff_ms: state.backoff_ms,
+        recent_errors: state.recent_errors,
+        inflight_count: state.inflight_count,
     }
 }
 
@@ -5718,8 +6041,171 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn governor_key(provider: Option<&str>, model: Option<&str>) -> Option<String> {
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty())?;
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    Some(match model {
+        Some(model) => format!("{provider}/{model}"),
+        None => provider.to_string(),
+    })
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("rate limit")
+        || normalized.contains("429")
+        || normalized.contains("too many requests")
+        || normalized.contains("throttle")
+        || normalized.contains("quota")
+}
+
+fn governor_apply_rate_limit(state: &mut GovernorState, now_ms: u64) -> u64 {
+    state.inflight_count = state.inflight_count.saturating_sub(1);
+    state.recent_errors = state.recent_errors.saturating_add(1);
+    let base = if state.backoff_ms == 0 {
+        constants::GOVERNOR_BACKOFF_INITIAL_MS
+    } else {
+        state.backoff_ms.saturating_mul(2)
+    };
+    let capped = base.min(constants::GOVERNOR_BACKOFF_MAX_MS);
+    let jitter_window = (capped / 5).max(25);
+    let jitter = if jitter_window == 0 {
+        0
+    } else {
+        now_ms % (jitter_window + 1)
+    };
+    state.backoff_ms = capped;
+    state.throttled_until_ms = now_ms.saturating_add(capped.saturating_add(jitter));
+    state.throttled_until_ms
+}
+
+fn governor_apply_success(state: &mut GovernorState, now_ms: u64) {
+    state.recent_errors = state.recent_errors.saturating_sub(1);
+    state.backoff_ms /= 2;
+    if state.backoff_ms == 0 || state.recent_errors == 0 {
+        state.backoff_ms = 0;
+        if state.throttled_until_ms <= now_ms {
+            state.throttled_until_ms = 0;
+        }
+    }
+}
+
+fn truncate_text(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_len).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn truncate_json_value(value: &Value, max_len: usize) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut truncated = serde_json::Map::new();
+            for (key, value) in map {
+                truncated.insert(key.clone(), truncate_json_value(value, max_len));
+            }
+            Value::Object(truncated)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(20)
+                .map(|value| truncate_json_value(value, max_len))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(truncate_text(text, max_len)),
+        _ => value.clone(),
+    }
+}
+
+fn progress_from_agent_event(
+    agent: &AgentRecord,
+    event: &crate::models::AgentEventDto,
+) -> AgentProgressEnvelope {
+    let validation = if agent.last_validation_error.is_some() || agent.validation_retries > 0 {
+        Some(ProgressValidationState {
+            retries: agent.validation_retries,
+            last_error: agent.last_validation_error.clone(),
+        })
+    } else {
+        None
+    };
+    let throttle = Some(ProgressThrottleState {
+        throttled: agent.throttled,
+        retry_at_ms: agent.retry_at_ms,
+        reason: agent.throttle_reason.clone(),
+    });
+    AgentProgressEnvelope {
+        agent_id: agent.id,
+        ts: event.ts,
+        event: event.method.clone(),
+        status: agent.status.clone(),
+        turn_id: parse_turn_id(&event.params).or_else(|| agent.active_turn_id.clone()),
+        tool_call: parse_tool_call_summary(event),
+        validation,
+        throttle,
+        budget: Some(serde_json::json!({
+            "used": null,
+            "limit": null,
+            "unit": "tokens"
+        })),
+        payload: truncate_json_value(&event.params, 240),
+    }
+}
+
+fn progress_validation_state(agent: &AgentRecord, event: &str) -> AgentProgressEnvelope {
+    AgentProgressEnvelope {
+        agent_id: agent.id,
+        ts: now_ts(),
+        event: event.to_string(),
+        status: agent.status.clone(),
+        turn_id: agent.active_turn_id.clone(),
+        tool_call: None,
+        validation: Some(ProgressValidationState {
+            retries: agent.validation_retries,
+            last_error: agent.last_validation_error.clone(),
+        }),
+        throttle: Some(ProgressThrottleState {
+            throttled: agent.throttled,
+            retry_at_ms: agent.retry_at_ms,
+            reason: agent.throttle_reason.clone(),
+        }),
+        budget: Some(serde_json::json!({
+            "used": null,
+            "limit": null,
+            "unit": "tokens"
+        })),
+        payload: serde_json::json!({}),
+    }
+}
+
+fn progress_throttle_state(agent: &AgentRecord, event: &str) -> AgentProgressEnvelope {
+    AgentProgressEnvelope {
+        agent_id: agent.id,
+        ts: now_ts(),
+        event: event.to_string(),
+        status: agent.status.clone(),
+        turn_id: agent.active_turn_id.clone(),
+        tool_call: None,
+        validation: None,
+        throttle: Some(ProgressThrottleState {
+            throttled: agent.throttled,
+            retry_at_ms: agent.retry_at_ms,
+            reason: agent.throttle_reason.clone(),
+        }),
+        budget: Some(serde_json::json!({
+            "used": null,
+            "limit": null,
+            "unit": "tokens"
+        })),
+        payload: serde_json::json!({}),
+    }
 }
 
 fn is_job_terminal_status(status: &str) -> bool {
@@ -5734,9 +6220,10 @@ fn is_job_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRecord, AgentRole, Foreman, WorkerCallback, build_worker_branch_name,
+        AgentRecord, AgentRole, Foreman, GovernorState, WorkerCallback, build_worker_branch_name,
         build_worker_worktree_path, callback_timeout_ms, continuation_prompt_for_turn,
-        render_template, render_template_strict, resolve_agent_status, run_validation_commands,
+        governor_apply_rate_limit, governor_apply_success, render_template,
+        render_template_strict, resolve_agent_status, run_validation_commands,
         should_fire_tool_filter, unresolved_template_tokens, update_completed_turn_counter,
     };
     use crate::config::CallbackFilter;
@@ -5751,6 +6238,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::broadcast;
     use uuid::Uuid;
+    use crate::constants;
 
     #[test]
     fn compact_turn_counter_resets_on_threshold() {
@@ -6021,6 +6509,46 @@ mod tests {
     }
 
     #[test]
+    fn governor_rate_limit_backoff_is_shared_and_increases() {
+        let mut shared = GovernorState {
+            inflight_count: 2,
+            ..GovernorState::default()
+        };
+        let first_retry = governor_apply_rate_limit(&mut shared, 10_000);
+        let first_backoff = shared.backoff_ms;
+        assert!(
+            first_backoff >= constants::GOVERNOR_BACKOFF_INITIAL_MS,
+            "initial shared backoff should be set"
+        );
+        assert!(first_retry > 10_000);
+        assert_eq!(shared.inflight_count, 1, "inflight decremented on throttle");
+
+        let second_retry = governor_apply_rate_limit(&mut shared, 11_000);
+        assert!(
+            shared.backoff_ms >= first_backoff,
+            "shared backoff should grow across worker errors"
+        );
+        assert!(second_retry > first_retry.saturating_sub(200), "retry window should move forward");
+    }
+
+    #[test]
+    fn governor_success_decays_backoff() {
+        let mut shared = GovernorState {
+            throttled_until_ms: 50_000,
+            backoff_ms: 4_000,
+            recent_errors: 2,
+            inflight_count: 0,
+        };
+        governor_apply_success(&mut shared, 60_000);
+        assert_eq!(shared.backoff_ms, 2_000);
+        assert_eq!(shared.recent_errors, 1);
+        governor_apply_success(&mut shared, 60_000);
+        assert_eq!(shared.backoff_ms, 0);
+        assert_eq!(shared.recent_errors, 0);
+        assert_eq!(shared.throttled_until_ms, 0);
+    }
+
+    #[test]
     fn tool_filter_matching_honors_tool_command_and_debounce() {
         let filter = CallbackFilter {
             name: "on-commit".to_string(),
@@ -6140,6 +6668,13 @@ mod tests {
             last_validation_error: None,
             worktree_path: None,
             branch_name: None,
+            model: Some("gpt-5".to_string()),
+            model_provider: Some("openai".to_string()),
+            governor_key: Some("openai/gpt-5".to_string()),
+            governor_inflight: false,
+            throttled: false,
+            retry_at_ms: None,
+            throttle_reason: None,
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -6211,6 +6746,13 @@ mod tests {
                 last_validation_error: None,
                 worktree_path: None,
                 branch_name: None,
+                model: Some("gpt-5".to_string()),
+                model_provider: Some("openai".to_string()),
+                governor_key: Some("openai/gpt-5".to_string()),
+                governor_inflight: false,
+                throttled: false,
+                retry_at_ms: None,
+                throttle_reason: None,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),
@@ -6236,6 +6778,7 @@ mod tests {
             }],
             projects: Vec::new(),
             jobs: Vec::new(),
+            governors: HashMap::new(),
         }
     }
 }

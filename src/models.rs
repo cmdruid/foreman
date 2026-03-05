@@ -140,6 +140,42 @@ pub struct JobEventEnvelope {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentProgressEnvelope {
+    pub agent_id: Uuid,
+    pub ts: u64,
+    pub event: String,
+    pub status: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub tool_call: Option<ToolCallSummary>,
+    #[serde(default)]
+    pub validation: Option<ProgressValidationState>,
+    #[serde(default)]
+    pub throttle: Option<ProgressThrottleState>,
+    #[serde(default)]
+    pub budget: Option<serde_json::Value>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProgressValidationState {
+    pub retries: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProgressThrottleState {
+    pub throttled: bool,
+    #[serde(default)]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolCallSummary {
     pub tool: String,
     pub command: Option<String>,
@@ -183,6 +219,12 @@ pub struct AgentState {
     pub last_tool_call: Option<ToolCallSummary>,
     pub files_modified: Vec<String>,
     pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub throttled: bool,
+    #[serde(default)]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub throttle_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -199,6 +241,21 @@ pub struct AgentResultResponse {
     pub event_id: Option<Uuid>,
     pub error: Option<String>,
     pub event_count: usize,
+    #[serde(default)]
+    pub throttled: bool,
+    #[serde(default)]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub throttle_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ThrottledWorkerStatus {
+    pub agent_id: Uuid,
+    #[serde(default)]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -271,6 +328,8 @@ pub struct JobState {
     pub created_at: u64,
     pub completed_at: Option<u64>,
     pub updated_at: u64,
+    #[serde(default)]
+    pub throttled_workers: Vec<ThrottledWorkerStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -28,6 +28,7 @@ pub const ROUTE_AGENT_LOGS: &str = "/agents/{id}/logs";
 pub const ROUTE_AGENT_SEND: &str = "/agents/{id}/send";
 pub const ROUTE_AGENT_STEER: &str = "/agents/{id}/steer";
 pub const ROUTE_AGENT_INTERRUPT: &str = "/agents/{id}/interrupt";
+pub const ROUTE_AGENT_WATCH: &str = "/agents/{id}/watch";
 pub const ROUTE_PROJECTS: &str = "/projects";
 pub const ROUTE_PROJECT_ID: &str = "/projects/{id}";
 pub const ROUTE_PROJECT_WORKERS: &str = "/projects/{id}/workers";
@@ -97,6 +98,7 @@ pub const AGENT_STATUS_INTERRUPTED: &str = "interrupted";
 pub const AGENT_STATUS_COMPLETED: &str = "completed";
 pub const AGENT_STATUS_ORPHANED: &str = "orphaned";
 pub const AGENT_STATUS_UNKNOWN: &str = "unknown";
+pub const AGENT_STATUS_THROTTLED: &str = "throttled";
 
 pub const JOB_STATUS_EMPTY: &str = "empty";
 pub const JOB_STATUS_RUNNING: &str = "running";
@@ -105,6 +107,10 @@ pub const JOB_STATUS_QUEUED: &str = "queued";
 pub const JOB_STATUS_COMPLETED: &str = "completed";
 pub const JOB_STATUS_FAILED: &str = "failed";
 pub const JOB_STATUS_UNKNOWN: &str = "unknown";
+
+pub const AGENT_PROGRESS_CHANNEL_CAPACITY: usize = 512;
+pub const GOVERNOR_BACKOFF_INITIAL_MS: u64 = 500;
+pub const GOVERNOR_BACKOFF_MAX_MS: u64 = 60_000;
 
 pub const AGENT_ROLE_FOREMAN: &str = "foreman";
 pub const AGENT_ROLE_WORKER: &str = "worker";

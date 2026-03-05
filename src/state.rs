@@ -17,6 +17,8 @@ pub struct PersistedState {
     pub agents: Vec<PersistedAgentRecord>,
     pub projects: Vec<PersistedProjectRecord>,
     pub jobs: Vec<PersistedJobRecord>,
+    #[serde(default)]
+    pub governors: std::collections::HashMap<String, PersistedGovernorRecord>,
 }
 
 impl Default for PersistedState {
@@ -27,8 +29,21 @@ impl Default for PersistedState {
             agents: Vec::new(),
             projects: Vec::new(),
             jobs: Vec::new(),
+            governors: std::collections::HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedGovernorRecord {
+    #[serde(default)]
+    pub throttled_until_ms: u64,
+    #[serde(default)]
+    pub backoff_ms: u64,
+    #[serde(default)]
+    pub recent_errors: u32,
+    #[serde(default)]
+    pub inflight_count: u32,
 }
 
 impl PersistedState {
@@ -130,6 +145,20 @@ pub struct PersistedAgentRecord {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub branch_name: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub governor_key: Option<String>,
+    #[serde(default)]
+    pub governor_inflight: bool,
+    #[serde(default)]
+    pub throttled: bool,
+    #[serde(default)]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub throttle_reason: Option<String>,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,
