@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -93,6 +93,13 @@ pub enum PersistedWorkerCallback {
         events: Option<Vec<String>>,
         vars: std::collections::HashMap<String, String>,
     },
+    UnixSocket {
+        socket: PathBuf,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        events: Option<Vec<String>>,
+        vars: std::collections::HashMap<String, String>,
+    },
     Profile {
         profile: String,
         prompt_prefix: Option<String>,
@@ -120,6 +127,8 @@ pub struct PersistedAgentRecord {
     pub result: Option<AgentResult>,
     #[serde(default)]
     pub job_id: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<AgentEventDto>,
 }

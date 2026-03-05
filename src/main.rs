@@ -7,6 +7,7 @@ mod project;
 mod state;
 
 use std::{
+    convert::Infallible,
     env, fs,
     fs::OpenOptions,
     path::{Path as StdPath, PathBuf},
@@ -20,14 +21,15 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderName, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode},
     middleware::{Next, from_fn_with_state},
-    response::IntoResponse,
+    response::{IntoResponse, Sse, sse::Event},
     routing::{get, post},
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::warn;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -76,6 +78,8 @@ struct Args {
     config_show_resolved: bool,
     #[arg(long)]
     state_path: Option<PathBuf>,
+    #[arg(long)]
+    force: bool,
 }
 
 fn default_service_config_path() -> String {
@@ -123,7 +127,17 @@ impl Drop for PidLockGuard {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("foreman: error: {err}");
+        if let Some(hint) = error_hint(&err) {
+            eprintln!("foreman: hint: {hint}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
         consts::DEFAULT_LOG_FILTER
             .parse::<tracing_subscriber::filter::Directive>()
@@ -177,6 +191,14 @@ async fn main() -> anyhow::Result<()> {
                             format!("args:{:?}", command.args)
                         },
                         command.events
+                    );
+                }
+                CallbackProfile::UnixSocket(unix_socket) => {
+                    println!(
+                        " - {}: unix-socket -> {} (events: {:?})",
+                        name,
+                        unix_socket.socket.display(),
+                        unix_socket.events
                     );
                 }
             }
@@ -245,13 +267,7 @@ async fn main() -> anyhow::Result<()> {
             PersistedState::default()
         });
     let socket_path = resolve_socket_path(&args.socket_path, &project_state_path)?;
-    let _pid_lock = match acquire_pid_lockfile(&socket_path) {
-        Ok(lock) => lock,
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
-    };
+    let _pid_lock = acquire_pid_lockfile(&socket_path, args.force)?;
     cleanup_socket_path(&socket_path)?;
 
     let (event_tx, event_rx) = broadcast::channel(consts::BROADCAST_CHANNEL_CAPACITY);
@@ -298,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
             .route(consts::ROUTE_AGENT_RESULT, get(get_agent_result))
             .route(consts::ROUTE_AGENT_WAIT, get(wait_agent_result))
             .route(consts::ROUTE_AGENT_EVENTS, get(get_agent_events))
+            .route(consts::ROUTE_AGENT_LOGS, get(get_agent_logs))
             .route(consts::ROUTE_AGENT_SEND, post(send_turn))
             .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
             .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
@@ -328,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
             .route(consts::ROUTE_JOB_ID, get(get_job))
             .route(consts::ROUTE_JOB_RESULT, get(get_job_result))
             .route(consts::ROUTE_JOB_WAIT, get(wait_job_result))
+            .route(consts::ROUTE_JOB_EVENTS, get(get_job_events_stream))
             .route(consts::STATUS_ROUTE, get(get_status))
             .with_state(state.clone())
             .layer(from_fn_with_state(state.clone(), require_api_auth));
@@ -391,6 +409,20 @@ fn resolve_socket_path(
     Ok(state_dir.join(consts::FOREMAN_SOCKET_FILENAME))
 }
 
+fn error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    let text = format!("{err:#}").to_lowercase();
+    if text.contains("address already in use") {
+        return Some("socket is already in use; remove the stale socket file or choose a different --socket-path");
+    }
+    if text.contains("active pid") {
+        return Some("another foreman process is running; stop it first or retry with --force for crash recovery");
+    }
+    if text.contains("failed to bind") {
+        return Some("failed to bind socket; check parent directory permissions and whether the path is writable");
+    }
+    None
+}
+
 #[cfg(unix)]
 fn cleanup_socket_path(path: &StdPath) -> anyhow::Result<()> {
     use std::os::unix::fs::FileTypeExt;
@@ -418,11 +450,16 @@ fn cleanup_socket_path(_path: &StdPath) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn acquire_pid_lockfile(socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
+fn acquire_pid_lockfile(socket_path: &StdPath, force: bool) -> anyhow::Result<PidLockGuard> {
+    let lock_file_name = socket_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.lock"))
+        .unwrap_or_else(|| consts::FOREMAN_LOCK_FILENAME.to_string());
     let lock_path = socket_path
         .parent()
         .unwrap_or_else(|| StdPath::new(consts::DEFAULT_WORKING_DIRECTORY))
-        .join(consts::FOREMAN_LOCK_FILENAME);
+        .join(lock_file_name);
 
     let pid = std::process::id();
     let pid_contents = format!("{pid}\n");
@@ -445,6 +482,7 @@ fn acquire_pid_lockfile(socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
                 .with_context(|| format!("read lockfile '{}'", lock_path.display()))?;
             if let Ok(existing_pid) = existing.trim().parse::<u32>()
                 && pid_is_alive(existing_pid)
+                && !force
             {
                 let message = format!(
                     "another foreman instance is running for socket '{}'; lockfile '{}' has active PID {}",
@@ -468,7 +506,7 @@ fn acquire_pid_lockfile(socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
 }
 
 #[cfg(not(unix))]
-fn acquire_pid_lockfile(_socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
+fn acquire_pid_lockfile(_socket_path: &StdPath, _force: bool) -> anyhow::Result<PidLockGuard> {
     Ok(PidLockGuard {
         path: PathBuf::new(),
         pid: std::process::id(),
@@ -1107,6 +1145,27 @@ async fn get_agent_events(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentLogsQuery {
+    tail: Option<usize>,
+    turn: Option<u32>,
+}
+
+async fn get_agent_logs(
+    State(state): State<AppState>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<AgentLogsQuery>,
+) -> impl IntoResponse {
+    match state
+        .foreman
+        .get_agent_logs(agent_id, query.tail, query.turn)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(err) => error_response(StatusCode::NOT_FOUND, err),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct StatusResponse {
     status: &'static str,
@@ -1305,6 +1364,69 @@ async fn get_job(State(state): State<AppState>, Path(job_id): Path<Uuid>) -> imp
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response(StatusCode::NOT_FOUND, err),
     }
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn sse_event(method: &str, ts: u64, payload: serde_json::Value) -> Event {
+    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event(method).id(ts.to_string()).data(data)
+}
+
+async fn get_job_events_stream(
+    State(state): State<AppState>,
+    Path(job_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(err) = state.foreman.get_job(job_id).await {
+        return error_response(StatusCode::NOT_FOUND, err);
+    }
+
+    let replay_from = parse_last_event_id(&headers);
+    let replay = match state.foreman.get_job_event_backlog(job_id, replay_from).await {
+        Ok(events) => events,
+        Err(err) => return error_response(StatusCode::NOT_FOUND, err),
+    };
+    let replay_events = replay
+        .into_iter()
+        .map(|event| {
+            Ok::<Event, Infallible>(sse_event(
+                &event.method,
+                event.ts,
+                serde_json::json!({
+                    "job_id": event.job_id,
+                    "agent_id": event.agent_id,
+                    "ts": event.ts,
+                    "method": event.method,
+                    "params": event.params,
+                }),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let live = BroadcastStream::new(state.foreman.subscribe_job_events())
+        .filter_map(move |result| match result {
+            Ok(envelope) if envelope.job_id == job_id => Some(Ok::<Event, Infallible>(sse_event(
+                &envelope.method,
+                envelope.ts,
+                serde_json::json!({
+                    "job_id": envelope.job_id,
+                    "agent_id": envelope.agent_id,
+                    "ts": envelope.ts,
+                    "method": envelope.method,
+                    "params": envelope.params,
+                }),
+            ))),
+            _ => None,
+        });
+
+    let stream = tokio_stream::iter(replay_events).chain(live);
+    Sse::new(stream).into_response()
 }
 
 async fn get_job_result(

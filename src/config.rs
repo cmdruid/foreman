@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::constants;
 use anyhow::{Context, Result, anyhow};
@@ -131,6 +135,7 @@ pub struct CallbackRegistry {
 pub enum CallbackProfile {
     Webhook(WebhookCallbackProfile),
     Command(CommandCallbackProfile),
+    UnixSocket(UnixSocketCallbackProfile),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +164,15 @@ pub struct CommandCallbackProfile {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub event_prompt_variable: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnixSocketCallbackProfile {
+    pub socket: PathBuf,
+    #[serde(default)]
+    pub events: Option<Vec<String>>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl ServiceConfig {
@@ -257,6 +271,19 @@ impl ServiceConfig {
                         ));
                     }
                 }
+                CallbackProfile::UnixSocket(unix_socket) => {
+                    if unix_socket
+                        .socket
+                        .as_os_str()
+                        .to_string_lossy()
+                        .trim()
+                        .is_empty()
+                    {
+                        return Err(anyhow!(
+                            "callback profile '{name}' has an empty unix socket path"
+                        ));
+                    }
+                }
             }
         }
 
@@ -338,6 +365,7 @@ impl CallbackProfile {
         match self {
             Self::Webhook(profile) => profile.timeout_ms,
             Self::Command(profile) => profile.timeout_ms,
+            Self::UnixSocket(profile) => profile.timeout_ms,
         }
     }
 }

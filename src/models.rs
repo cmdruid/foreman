@@ -130,6 +130,23 @@ pub struct AgentEventDto {
     pub params: serde_json::Value,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JobEventEnvelope {
+    pub job_id: Uuid,
+    pub agent_id: Uuid,
+    pub ts: u64,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCallSummary {
+    pub tool: String,
+    pub command: Option<String>,
+    pub path: Option<String>,
+    pub at: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AgentResult {
     pub agent_id: Uuid,
@@ -158,6 +175,10 @@ pub struct AgentState {
     pub error: Option<String>,
     pub updated_at: u64,
     pub events: Vec<AgentEventDto>,
+    pub turns_completed: u32,
+    pub last_tool_call: Option<ToolCallSummary>,
+    pub files_modified: Vec<String>,
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -265,6 +286,18 @@ pub struct SpawnProjectWorkerResponse {
     pub project_id: Uuid,
     pub foreman_id: Uuid,
     pub role: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkerLogEntry {
+    pub turn: u32,
+    pub tool: String,
+    pub command: Option<String>,
+    pub path: Option<String>,
+    pub exit_code: Option<i32>,
+    pub stderr: Option<String>,
+    pub bytes: Option<usize>,
+    pub at: u64,
 }
 
 #[cfg(test)]

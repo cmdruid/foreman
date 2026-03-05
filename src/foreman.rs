@@ -23,15 +23,19 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{CallbackProfile, CommandCallbackProfile, ServiceConfig, WebhookCallbackProfile},
+    config::{
+        CallbackProfile, CommandCallbackProfile, ServiceConfig, UnixSocketCallbackProfile,
+        WebhookCallbackProfile,
+    },
     constants,
     events::events_allowed,
     models::{
         AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
         CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, JobResult,
-        JobState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput, SpawnAgentRequest,
-        SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
-        SpawnProjectWorkerResponse, SteerAgentInput, WorkerWorktreeSpec,
+        JobEventEnvelope, JobState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput,
+        SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
+        SpawnProjectWorkerResponse, SteerAgentInput, ToolCallSummary, WorkerLogEntry,
+        WorkerWorktreeSpec,
     },
     project::{CallbackSpec, ProjectConfig, ProjectRuntimeFiles},
     state::{
@@ -52,6 +56,14 @@ struct WorkerWebhookCallback {
 }
 
 #[derive(Debug, Clone)]
+struct WorkerUnixSocketCallback {
+    socket: PathBuf,
+    events: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
+    vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
 struct WorkerProfileCallback {
     profile: String,
     prompt_prefix: Option<String>,
@@ -64,6 +76,7 @@ struct WorkerProfileCallback {
 enum WorkerCallback {
     None,
     Webhook(WorkerWebhookCallback),
+    UnixSocket(WorkerUnixSocketCallback),
     Profile(WorkerProfileCallback),
 }
 
@@ -109,6 +122,7 @@ struct AgentRecord {
     error: Option<String>,
     result: Option<AgentResult>,
     job_id: Option<Uuid>,
+    created_at: u64,
     updated_at: u64,
     events: VecDeque<crate::models::AgentEventDto>,
 }
@@ -168,6 +182,7 @@ pub struct Foreman {
     thread_map: RwLock<HashMap<String, Uuid>>,
     projects: RwLock<HashMap<Uuid, ProjectRecord>>,
     jobs: RwLock<HashMap<Uuid, JobRecord>>,
+    job_event_tx: broadcast::Sender<JobEventEnvelope>,
     worktree_lock: Mutex<()>,
     started_at: u64,
     state_path: PathBuf,
@@ -191,6 +206,7 @@ impl Foreman {
             thread_map: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
+            job_event_tx: broadcast::channel(constants::JOB_EVENT_CHANNEL_CAPACITY).0,
             worktree_lock: Mutex::new(()),
             started_at: now_ts(),
             state_path,
@@ -772,15 +788,34 @@ impl Foreman {
         }
 
         if let Some(context) = callback_context {
+            if let Some(job_id) = context.job_id {
+                let _ = self.job_event_tx.send(JobEventEnvelope {
+                    job_id,
+                    agent_id: context.agent_id,
+                    ts: context.ts,
+                    method: context.method.clone(),
+                    params: context.params.clone(),
+                });
+            }
+
             if matches!(
                 context.method.as_str(),
                 constants::EVENT_METHOD_TURN_COMPLETED | constants::EVENT_METHOD_TURN_ABORTED
             ) || should_update_job
             {
                 if let Some(job_id) = context.job_id {
-                    let _ = self
+                    if let Ok(Some(status)) = self
                         .update_job_after_worker_event(job_id, context.result_snapshot.as_ref())
-                        .await;
+                        .await
+                    {
+                        let _ = self.job_event_tx.send(JobEventEnvelope {
+                            job_id,
+                            agent_id: context.agent_id,
+                            ts: now_ts(),
+                            method: "job.completed".to_string(),
+                            params: serde_json::json!({ "status": status }),
+                        });
+                    }
                 }
                 if let Some(project_id) = context.project_id {
                     let _ = self.update_project_after_worker_event(project_id).await;
@@ -809,7 +844,7 @@ impl Foreman {
         &self,
         job_id: Uuid,
         result_snapshot: Option<&AgentResult>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let workers = {
             let jobs = self.jobs.read().await;
             jobs.get(&job_id)
@@ -821,11 +856,17 @@ impl Foreman {
         if workers.is_empty() {
             let mut jobs = self.jobs.write().await;
             if let Some(job) = jobs.get_mut(&job_id) {
+                let prior_status = job.status.clone();
                 job.status = constants::JOB_STATUS_COMPLETED.to_string();
                 job.completed_at = Some(job.completed_at.unwrap_or_else(now_ts));
                 job.updated_at = now_ts();
+                if !is_job_terminal_status(&prior_status)
+                    && is_job_terminal_status(&job.status)
+                {
+                    return Ok(Some(job.status.clone()));
+                }
             }
-            return Ok(());
+            return Ok(None);
         }
 
         let worker_results = {
@@ -875,6 +916,7 @@ impl Foreman {
         {
             let mut jobs = self.jobs.write().await;
             if let Some(job) = jobs.get_mut(&job_id) {
+                let prior_status = job.status.clone();
                 if has_running {
                     job.status = constants::JOB_STATUS_RUNNING.to_string();
                 } else {
@@ -886,9 +928,14 @@ impl Foreman {
                     job.completed_at = Some(job.completed_at.unwrap_or_else(now_ts));
                 }
                 job.updated_at = now_ts();
+                if !is_job_terminal_status(&prior_status)
+                    && is_job_terminal_status(&job.status)
+                {
+                    return Ok(Some(job.status.clone()));
+                }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn update_project_after_worker_event(&self, project_id: Uuid) -> Result<()> {
@@ -916,6 +963,12 @@ impl Foreman {
                 }
                 self.dispatch_webhook_callback(&context, webhook).await
             }
+            WorkerCallback::UnixSocket(unix_socket) => {
+                if !events_allowed(context.method.as_str(), unix_socket.events.as_deref(), None) {
+                    return Ok(());
+                }
+                self.dispatch_unix_socket_callback(&context, unix_socket).await
+            }
             WorkerCallback::Profile(profile) => {
                 let profile_definition = self
                     .resolve_callback_profile(&profile.profile, context.project_id)
@@ -927,6 +980,7 @@ impl Foreman {
                 let profile_events = match &profile_definition {
                     CallbackProfile::Webhook(webhook) => webhook.events.as_deref(),
                     CallbackProfile::Command(command) => command.events.as_deref(),
+                    CallbackProfile::UnixSocket(unix_socket) => unix_socket.events.as_deref(),
                 };
 
                 if !events_allowed(
@@ -945,6 +999,14 @@ impl Foreman {
                     CallbackProfile::Webhook(webhook) => {
                         self.dispatch_webhook_callback_from_profile(&context, &profile, &webhook)
                             .await
+                    }
+                    CallbackProfile::UnixSocket(unix_socket) => {
+                        self.dispatch_unix_socket_callback_from_profile(
+                            &context,
+                            &profile,
+                            &unix_socket,
+                        )
+                        .await
                     }
                 }
             }
@@ -1141,6 +1203,9 @@ impl Foreman {
             WorkerCallback::Webhook(webhook) => {
                 Ok(events_allowed(method, webhook.events.as_deref(), None))
             }
+            WorkerCallback::UnixSocket(unix_socket) => {
+                Ok(events_allowed(method, unix_socket.events.as_deref(), None))
+            }
             WorkerCallback::Profile(profile) => {
                 let callback_profile = self
                     .resolve_callback_profile(&profile.profile, project_id)
@@ -1152,6 +1217,7 @@ impl Foreman {
                 let default_events = match &callback_profile {
                     CallbackProfile::Webhook(webhook) => webhook.events.clone(),
                     CallbackProfile::Command(command) => command.events.clone(),
+                    CallbackProfile::UnixSocket(unix_socket) => unix_socket.events.clone(),
                 };
 
                 Ok(events_allowed(
@@ -1223,6 +1289,16 @@ impl Foreman {
                 })?;
                 Ok(())
             }
+            WorkerCallback::UnixSocket(unix_socket) => {
+                let vars = self
+                    .project_callback_vars(context, project)
+                    .context("failed to build bubble callback vars")?;
+
+                let payload = self.build_base_payload(context, Some(vars));
+                self.dispatch_unix_payload(&payload, &unix_socket.socket, unix_socket.timeout_ms)
+                    .await?;
+                Ok(())
+            }
             WorkerCallback::Profile(invocation) => {
                 let profile = self
                     .config
@@ -1276,6 +1352,15 @@ impl Foreman {
                                 profile.url
                             )
                         })?;
+                        Ok(())
+                    }
+                    CallbackProfile::UnixSocket(profile) => {
+                        let vars = self
+                            .project_callback_vars(context, project)
+                            .context("failed to build bubble callback vars")?;
+                        let payload = self.build_base_payload(context, Some(vars));
+                        self.dispatch_unix_payload(&payload, &profile.socket, profile.timeout_ms)
+                            .await?;
                         Ok(())
                     }
                 }
@@ -1339,6 +1424,94 @@ impl Foreman {
         };
 
         self.dispatch_webhook_callback(context, webhook).await
+    }
+
+    async fn dispatch_unix_socket_callback(
+        &self,
+        context: &CallbackEventContext,
+        unix_socket: WorkerUnixSocketCallback,
+    ) -> Result<()> {
+        let vars = unix_socket
+            .vars
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        let payload = self.build_base_payload(context, Some(vars));
+        self.dispatch_unix_payload(&payload, &unix_socket.socket, unix_socket.timeout_ms)
+            .await
+    }
+
+    async fn dispatch_unix_socket_callback_from_profile(
+        &self,
+        context: &CallbackEventContext,
+        invocation: &WorkerProfileCallback,
+        profile: &UnixSocketCallbackProfile,
+    ) -> Result<()> {
+        let vars = self
+            .callback_vars(context, invocation.vars.clone())
+            .context("failed to build callback vars")?;
+        let callback = WorkerUnixSocketCallback {
+            socket: profile.socket.clone(),
+            events: profile.events.clone(),
+            timeout_ms: profile.timeout_ms,
+            vars,
+        };
+        self.dispatch_unix_socket_callback(context, callback).await
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_unix_payload(
+        &self,
+        payload: &Value,
+        socket: &Path,
+        timeout_ms: Option<u64>,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        let connect = UnixStream::connect(socket);
+        let mut stream = match callback_timeout_ms(timeout_ms) {
+            Some(ms) => match time::timeout(Duration::from_millis(ms), connect).await {
+                Ok(result) => match result {
+                    Ok(stream) => stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        warn!(socket = %socket.display(), "unix callback connection refused");
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err).context("unix callback connect failed"),
+                },
+                Err(_) => {
+                    warn!(socket = %socket.display(), "unix callback connect timed out");
+                    return Ok(());
+                }
+            },
+            None => connect.await.context("unix callback connect failed")?,
+        };
+
+        let mut line = json_compact_value(payload);
+        line.push('\n');
+        let write = stream.write_all(line.as_bytes());
+        match callback_timeout_ms(timeout_ms) {
+            Some(ms) => match time::timeout(Duration::from_millis(ms), write).await {
+                Ok(result) => result.context("unix callback write failed")?,
+                Err(_) => {
+                    warn!(socket = %socket.display(), "unix callback write timed out");
+                    return Ok(());
+                }
+            },
+            None => write.await.context("unix callback write failed")?,
+        };
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn dispatch_unix_payload(
+        &self,
+        _payload: &Value,
+        _socket: &Path,
+        _timeout_ms: Option<u64>,
+    ) -> Result<()> {
+        Err(anyhow!("unix socket callbacks are unsupported on this platform"))
     }
 
     async fn dispatch_command_callback(
@@ -2776,22 +2949,7 @@ impl Foreman {
 
     pub async fn list_agents(&self) -> Vec<crate::models::AgentState> {
         let agents = self.agents.read().await;
-        agents
-            .values()
-            .map(|agent| AgentState {
-                id: agent.id,
-                thread_id: agent.thread_id.clone(),
-                active_turn_id: agent.active_turn_id.clone(),
-                status: agent.status.clone(),
-                callback_profile: agent_callback_profile(&agent.callback),
-                role: agent.role.as_str().to_string(),
-                project_id: agent.project_id,
-                foreman_id: agent.foreman_id,
-                error: agent.error.clone(),
-                updated_at: agent.updated_at,
-                events: agent.events.iter().cloned().collect(),
-            })
-            .collect()
+        agents.values().map(build_agent_state).collect()
     }
 
     pub async fn app_server_pid(&self) -> Option<u32> {
@@ -2817,6 +2975,50 @@ impl Foreman {
         )
     }
 
+    pub fn subscribe_job_events(&self) -> broadcast::Receiver<JobEventEnvelope> {
+        self.job_event_tx.subscribe()
+    }
+
+    pub async fn get_job_event_backlog(
+        &self,
+        job_id: Uuid,
+        since_ts: Option<u64>,
+    ) -> Result<Vec<JobEventEnvelope>> {
+        let worker_ids = {
+            let jobs = self.jobs.read().await;
+            jobs.get(&job_id)
+                .context("job not found")?
+                .worker_ids
+                .clone()
+        };
+
+        let min_ts = since_ts.unwrap_or(0);
+        let mut events = Vec::new();
+        {
+            let agents = self.agents.read().await;
+            for worker_id in worker_ids {
+                let Some(agent) = agents.get(&worker_id) else {
+                    continue;
+                };
+                for event in &agent.events {
+                    if event.ts < min_ts {
+                        continue;
+                    }
+                    events.push(JobEventEnvelope {
+                        job_id,
+                        agent_id: worker_id,
+                        ts: event.ts,
+                        method: event.method.clone(),
+                        params: event.params.clone(),
+                    });
+                }
+            }
+        }
+
+        events.sort_by_key(|event| event.ts);
+        Ok(events)
+    }
+
     pub async fn get_agent(&self, agent_id: Uuid) -> Result<crate::models::AgentState> {
         let agent = self
             .agents
@@ -2826,19 +3028,7 @@ impl Foreman {
             .context("agent not found")?
             .clone();
 
-        Ok(crate::models::AgentState {
-            id: agent.id,
-            thread_id: agent.thread_id,
-            active_turn_id: agent.active_turn_id,
-            status: agent.status,
-            callback_profile: agent_callback_profile(&agent.callback),
-            role: agent.role.as_str().to_string(),
-            project_id: agent.project_id,
-            foreman_id: agent.foreman_id,
-            error: agent.error,
-            updated_at: agent.updated_at,
-            events: agent.events.iter().cloned().collect(),
-        })
+        Ok(build_agent_state(&agent))
     }
 
     pub async fn get_agent_events(
@@ -2862,6 +3052,46 @@ impl Foreman {
         }
 
         Ok(events)
+    }
+
+    pub async fn get_agent_logs(
+        &self,
+        agent_id: Uuid,
+        tail: Option<usize>,
+        turn_filter: Option<u32>,
+    ) -> Result<Vec<WorkerLogEntry>> {
+        let events = self
+            .agents
+            .read()
+            .await
+            .get(&agent_id)
+            .map(|agent| agent.events.iter().cloned().collect::<Vec<_>>())
+            .context("agent not found")?;
+
+        let mut turn = 0_u32;
+        let mut logs = Vec::new();
+        for event in events {
+            if event.method == constants::EVENT_METHOD_TURN_STARTED {
+                turn = turn.saturating_add(1);
+            }
+
+            if let Some(entry) = parse_worker_log_entry(&event, turn) {
+                logs.push(entry);
+            }
+        }
+
+        if let Some(turn) = turn_filter {
+            logs.retain(|entry| entry.turn == turn);
+        }
+
+        if let Some(limit) = tail {
+            let len = logs.len();
+            if len > limit {
+                logs.drain(0..(len - limit));
+            }
+        }
+
+        Ok(logs)
     }
 
     pub async fn get_agent_result(
@@ -3038,6 +3268,7 @@ impl Foreman {
                 job_id,
                 error: None,
                 result: None,
+                created_at: ts,
                 updated_at: ts,
                 events: VecDeque::new(),
             };
@@ -3140,6 +3371,15 @@ impl Foreman {
                     vars: params.callback_vars.unwrap_or_default(),
                 }))
             }
+            CallbackProfile::UnixSocket(profile) => {
+                let events = params.callback_events.or_else(|| profile.events.clone());
+                Ok(WorkerCallback::UnixSocket(WorkerUnixSocketCallback {
+                    socket: profile.socket.clone(),
+                    events,
+                    timeout_ms: profile.timeout_ms,
+                    vars: params.callback_vars.unwrap_or_default(),
+                }))
+            }
             CallbackProfile::Command(_) => Ok(WorkerCallback::Profile(WorkerProfileCallback {
                 profile: profile_name,
                 prompt_prefix: params.callback_prompt_prefix,
@@ -3172,7 +3412,8 @@ impl Foreman {
         let callback_events = overrides
             .callback_events
             .clone()
-            .or_else(|| spec.callback_events.clone());
+            .or_else(|| spec.callback_events.clone())
+            .or_else(|| spec.events.clone());
 
         let callback_vars = match (&spec.callback_vars, &overrides.callback_vars) {
             (Some(base), Some(override_vars)) => {
@@ -3186,6 +3427,17 @@ impl Foreman {
             (None, Some(override_vars)) => Some(override_vars.clone()),
             (None, None) => None,
         };
+
+        if callback_profile.is_none()
+            && let Some(socket) = spec.socket.clone()
+        {
+            return Ok(WorkerCallback::UnixSocket(WorkerUnixSocketCallback {
+                socket,
+                events: callback_events,
+                timeout_ms: spec.timeout_ms,
+                vars: callback_vars.unwrap_or_default(),
+            }));
+        }
 
         self.resolve_callback_with_project_profiles(
             CallbackResolutionParams {
@@ -3287,6 +3539,20 @@ impl Foreman {
                         ),
                     })
                 }
+                WorkerCallback::UnixSocket(existing_unix_socket) => {
+                    WorkerCallback::UnixSocket(WorkerUnixSocketCallback {
+                        socket: existing_unix_socket.socket.clone(),
+                        events: input
+                            .callback_events
+                            .clone()
+                            .or_else(|| existing_unix_socket.events.clone()),
+                        timeout_ms: existing_unix_socket.timeout_ms,
+                        vars: merge_vars(
+                            existing_unix_socket.vars.clone(),
+                            input.callback_vars.clone(),
+                        ),
+                    })
+                }
                 WorkerCallback::None => {
                     let profile_name = input
                         .callback_profile
@@ -3328,6 +3594,50 @@ fn resolve_agent_status(agent: &AgentRecord) -> String {
         return result.status.clone();
     }
     agent.status.clone()
+}
+
+fn build_agent_state(agent: &AgentRecord) -> AgentState {
+    let turns_completed = agent
+        .events
+        .iter()
+        .filter(|event| event.method == constants::EVENT_METHOD_TURN_COMPLETED)
+        .count() as u32;
+    let mut files_modified = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut last_tool_call = None;
+    for event in &agent.events {
+        if let Some(tool_call) = parse_tool_call_summary(event) {
+            if let Some(path) = tool_call.path.as_ref()
+                && is_file_modifying_tool(tool_call.tool.as_str())
+                && seen_paths.insert(path.clone())
+            {
+                files_modified.push(path.clone());
+            }
+            last_tool_call = Some(tool_call);
+        }
+    }
+
+    AgentState {
+        id: agent.id,
+        thread_id: agent.thread_id.clone(),
+        active_turn_id: agent.active_turn_id.clone(),
+        status: agent.status.clone(),
+        callback_profile: agent_callback_profile(&agent.callback),
+        role: agent.role.as_str().to_string(),
+        project_id: agent.project_id,
+        foreman_id: agent.foreman_id,
+        error: agent.error.clone(),
+        updated_at: agent.updated_at,
+        events: agent.events.iter().cloned().collect(),
+        turns_completed,
+        last_tool_call,
+        files_modified,
+        elapsed_ms: Some(
+            now_ts()
+                .saturating_sub(agent.created_at)
+                .saturating_mul(constants::MILLISECONDS_PER_SECOND),
+        ),
+    }
 }
 
 fn aggregate_worker_labels(
@@ -3753,6 +4063,100 @@ fn parse_references_value(value: Option<&Value>) -> Option<Vec<String>> {
     }
 }
 
+fn parse_tool_call_summary(event: &crate::models::AgentEventDto) -> Option<ToolCallSummary> {
+    let method = event.method.as_str();
+    let tool = normalize_tool_name(method)?;
+    Some(ToolCallSummary {
+        tool: tool.to_string(),
+        command: parse_command(&event.params),
+        path: parse_path(&event.params),
+        at: event.ts,
+    })
+}
+
+fn parse_worker_log_entry(
+    event: &crate::models::AgentEventDto,
+    turn: u32,
+) -> Option<WorkerLogEntry> {
+    let tool_call = parse_tool_call_summary(event)?;
+    Some(WorkerLogEntry {
+        turn,
+        tool: tool_call.tool,
+        command: tool_call.command,
+        path: tool_call.path,
+        exit_code: parse_exit_code(&event.params),
+        stderr: parse_stderr(&event.params),
+        bytes: parse_bytes(&event.params),
+        at: event.ts,
+    })
+}
+
+fn normalize_tool_name(method: &str) -> Option<&str> {
+    if method.contains("exec_command") {
+        return Some("exec_command");
+    }
+    if method.contains("apply_patch") {
+        return Some("apply_patch");
+    }
+    if method.contains("write_stdin") {
+        return Some("write_stdin");
+    }
+    if method.contains("read_file") {
+        return Some("read_file");
+    }
+    if method.contains("write_file") {
+        return Some("write_file");
+    }
+    None
+}
+
+fn parse_command(params: &Value) -> Option<String> {
+    params
+        .get("command")
+        .or_else(|| params.get("cmd"))
+        .or_else(|| params.get("program"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+fn parse_path(params: &Value) -> Option<String> {
+    params
+        .get("path")
+        .or_else(|| params.get("file"))
+        .or_else(|| params.get("target"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+fn parse_exit_code(params: &Value) -> Option<i32> {
+    params
+        .get("exit_code")
+        .or_else(|| params.get("exitCode"))
+        .or_else(|| params.get("code"))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn parse_stderr(params: &Value) -> Option<String> {
+    params
+        .get("stderr")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+fn parse_bytes(params: &Value) -> Option<usize> {
+    params
+        .get("bytes")
+        .or_else(|| params.get("size"))
+        .or_else(|| params.get("output_bytes"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn is_file_modifying_tool(tool: &str) -> bool {
+    matches!(tool, "apply_patch" | "write_file")
+}
+
 fn render_template(template: &str, vars: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in vars {
@@ -3850,6 +4254,11 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         error: record.error,
         result: record.result,
         job_id,
+        created_at: if record.created_at == 0 {
+            record.updated_at
+        } else {
+            record.created_at
+        },
         updated_at: record.updated_at,
         events: VecDeque::from(record.events),
     })
@@ -3905,6 +4314,17 @@ fn restore_persisted_callback(value: PersistedWorkerCallback) -> Result<WorkerCa
             events,
             vars,
         })),
+        PersistedWorkerCallback::UnixSocket {
+            socket,
+            timeout_ms,
+            events,
+            vars,
+        } => Ok(WorkerCallback::UnixSocket(WorkerUnixSocketCallback {
+            socket,
+            events,
+            timeout_ms,
+            vars,
+        })),
         PersistedWorkerCallback::Profile {
             profile,
             prompt_prefix,
@@ -3938,6 +4358,7 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         error: agent.error.clone(),
         result: agent.result.clone(),
         job_id: agent.job_id.map(|id| id.to_string()),
+        created_at: agent.created_at,
         updated_at: agent.updated_at,
         events: agent.events.iter().cloned().collect(),
     }
@@ -3969,6 +4390,12 @@ fn persist_worker_callback(callback: &WorkerCallback) -> PersistedWorkerCallback
             timeout_ms: webhook.timeout_ms,
             events: webhook.events.clone(),
             vars: webhook.vars.clone(),
+        },
+        WorkerCallback::UnixSocket(unix_socket) => PersistedWorkerCallback::UnixSocket {
+            socket: unix_socket.socket.clone(),
+            timeout_ms: unix_socket.timeout_ms,
+            events: unix_socket.events.clone(),
+            vars: unix_socket.vars.clone(),
         },
         WorkerCallback::Profile(profile) => PersistedWorkerCallback::Profile {
             profile: profile.profile.clone(),
@@ -4351,6 +4778,7 @@ mod tests {
                 error: None,
             }),
             job_id: None,
+            created_at: 0,
             updated_at: 0,
             events: VecDeque::new(),
         };
@@ -4415,6 +4843,7 @@ mod tests {
                     error: None,
                 }),
                 job_id: None,
+                created_at: 1_700_000_000,
                 updated_at: 1_700_000_001,
                 events: Vec::new(),
             }],

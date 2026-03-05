@@ -4,6 +4,14 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.3.0]
+
+- Added structured startup error UX with `run()` wrapping, hint suggestions, and `--force` lockfile override support for crash recovery.
+- Added turn-level observability on `GET /agents/:id` with lazily derived progress stats (`turns_completed`, `last_tool_call`, `files_modified`, `elapsed_ms`) from buffered events.
+- Added worker activity log extraction endpoint `GET /agents/:id/logs` with `tail`/`turn` filters and method+params parsing into structured log entries.
+- Added unix domain socket callback support (`type = "unix-socket"` profiles plus project `socket` callback specs), dispatching newline-delimited JSON with timeout handling.
+- Added live job event streaming endpoint `GET /jobs/:id/events` using SSE (`text/event-stream`) with `Last-Event-ID` replay and terminal `job.completed` event emission.
+
 ## [0.2.2]
 
 - Added graceful shutdown handling for both `SIGINT` (`ctrl_c`) and `SIGTERM` so process-manager termination follows the same shutdown path.

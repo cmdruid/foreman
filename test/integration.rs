@@ -241,6 +241,175 @@ async fn test_agent_result_and_wait_endpoints() {
 }
 
 #[tokio::test]
+async fn test_agent_progress_and_logs_endpoints() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let service_config_contents = service_config_template_simple();
+    common::write_service_config(&service_config, service_config_contents.as_str())
+        .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let create = client
+        .post(format!("{}/agents", harness.base_url))
+        .json(&json!({ "prompt": "progress + logs probe" }))
+        .send()
+        .await
+        .expect("create agent request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created = create.json::<Value>().await.expect("create response");
+    let agent_id = created["id"].as_str().expect("agent id");
+
+    let wait = client
+        .get(format!(
+            "{}/agents/{agent_id}/wait?timeout_ms=5000&poll_ms=25",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .expect("wait request");
+    assert_eq!(wait.status(), StatusCode::OK);
+
+    let agent = client
+        .get(format!("{}/agents/{agent_id}", harness.base_url))
+        .send()
+        .await
+        .expect("get agent");
+    assert_eq!(agent.status(), StatusCode::OK);
+    let agent_payload = agent.json::<Value>().await.expect("agent payload");
+    assert!(
+        agent_payload["turns_completed"].as_u64().unwrap_or(0) >= 1,
+        "turns_completed should be derived from events"
+    );
+    assert!(agent_payload["elapsed_ms"].as_u64().is_some());
+
+    let logs = client
+        .get(format!("{}/agents/{agent_id}/logs", harness.base_url))
+        .send()
+        .await
+        .expect("agent logs request");
+    assert_eq!(logs.status(), StatusCode::OK);
+    let logs_payload = logs.json::<Value>().await.expect("logs payload");
+    let logs = logs_payload.as_array().expect("logs array");
+    assert!(!logs.is_empty(), "logs endpoint should contain parsed entries");
+    assert!(
+        logs.iter()
+            .any(|entry| entry["tool"].as_str() == Some("exec_command")),
+        "expected at least one exec_command log entry"
+    );
+
+    let logs_tail = client
+        .get(format!("{}/agents/{agent_id}/logs?tail=1", harness.base_url))
+        .send()
+        .await
+        .expect("agent logs tail request");
+    assert_eq!(logs_tail.status(), StatusCode::OK);
+    let tail_payload = logs_tail.json::<Value>().await.expect("tail payload");
+    assert_eq!(tail_payload.as_array().map(Vec::len), Some(1));
+
+    let logs_turn = client
+        .get(format!("{}/agents/{agent_id}/logs?turn=1", harness.base_url))
+        .send()
+        .await
+        .expect("agent logs turn request");
+    assert_eq!(logs_turn.status(), StatusCode::OK);
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
+async fn test_job_events_stream_endpoint() {
+    let (_temp_project, project_path) =
+        common::temporary_project("project-generic-worktree").expect("fixture copy");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let state_path = temp.path().join("foreman-state.json");
+    let service_config = temp.path().join("service.toml");
+    let service_config_contents = service_config_template_simple();
+    common::write_service_config(&service_config, service_config_contents.as_str())
+        .expect("write service config");
+
+    let socket_path = format!("/tmp/foreman-test-{}.sock", common::random_port());
+    let fake_codex = common::binary_path("fake_codex");
+    let harness =
+        common::start_foreman(&socket_path, &service_config, &state_path, &fake_codex).await;
+    let client = common::unix_client(&harness.socket_path).expect("unix socket client");
+
+    let project = client
+        .post(format!("{}/projects", harness.base_url))
+        .json(&json!({
+            "path": project_path.to_string_lossy().to_string(),
+            "start_prompt": "job stream start"
+        }))
+        .send()
+        .await
+        .expect("create project");
+    assert_eq!(project.status(), StatusCode::CREATED);
+    let project_payload = project.json::<Value>().await.expect("project payload");
+    let project_id = project_payload["project_id"].as_str().expect("project id");
+
+    let create_job = client
+        .post(format!(
+            "{}/projects/{project_id}/jobs",
+            harness.base_url
+        ))
+        .json(&json!({
+            "workers": [
+                { "prompt": "run worker for stream endpoint test" }
+            ]
+        }))
+        .send()
+        .await
+        .expect("create job");
+    assert_eq!(create_job.status(), StatusCode::CREATED);
+    let create_job_payload = create_job.json::<Value>().await.expect("job payload");
+    let job_id = create_job_payload["job_id"].as_str().expect("job id");
+
+    let wait = client
+        .get(format!(
+            "{}/jobs/{job_id}/wait?timeout_ms=5000&poll_ms=25",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .expect("wait job");
+    assert_eq!(wait.status(), StatusCode::OK);
+
+    let mut stream = client
+        .get(format!("{}/jobs/{job_id}/events", harness.base_url))
+        .header("last-event-id", "0")
+        .send()
+        .await
+        .expect("job events stream");
+    assert_eq!(stream.status(), StatusCode::OK);
+    let content_type = stream
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "expected SSE content type, got {content_type}"
+    );
+
+    let first_chunk = tokio::time::timeout(Duration::from_secs(2), stream.chunk())
+        .await
+        .expect("chunk timeout")
+        .expect("stream chunk read");
+    let chunk = first_chunk.expect("expected first chunk from stream");
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(text.contains("event:"), "expected SSE event line, got: {text}");
+    assert!(text.contains("data:"), "expected SSE data line, got: {text}");
+
+    harness.terminate().await;
+}
+
+#[tokio::test]
 async fn test_callback_prompt_prefix_passes_rendered_event_payload_to_command() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state_path = temp.path().join("foreman-state.json");

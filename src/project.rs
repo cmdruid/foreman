@@ -56,11 +56,22 @@ pub struct ProjectCallbacks {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CallbackSpec {
+    #[serde(default)]
     pub callback_profile: Option<String>,
+    #[serde(default)]
     pub callback_prompt_prefix: Option<String>,
+    #[serde(default)]
     pub callback_args: Option<Vec<String>>,
+    #[serde(default)]
     pub callback_events: Option<Vec<String>>,
+    #[serde(default)]
+    pub events: Option<Vec<String>>,
+    #[serde(default)]
     pub callback_vars: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -302,7 +313,10 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
                         "callback_prompt_prefix",
                         "callback_args",
                         "callback_events",
+                        "events",
                         "callback_vars",
+                        "socket",
+                        "timeout_ms",
                     ],
                     report,
                 );
@@ -328,7 +342,10 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
                             "callback_prompt_prefix",
                             "callback_args",
                             "callback_events",
+                            "events",
                             "callback_vars",
+                            "socket",
+                            "timeout_ms",
                         ],
                         report,
                     );
