@@ -117,6 +117,12 @@ pub struct JobDefaultsConfig {
     pub min_turns: Option<u32>,
     #[serde(default)]
     pub strategy: Option<String>,
+    #[serde(default = "default_worktree_mode")]
+    pub worktree_mode: String,
+    #[serde(default = "default_merge_strategy")]
+    pub merge_strategy: String,
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +356,23 @@ impl JobDefaultsConfig {
         {
             anyhow::bail!("jobs.defaults.strategy must be 'single' or 'explore-plan-execute'");
         }
+
+        if self.worktree_mode != "auto"
+            && self.worktree_mode != "always"
+            && self.worktree_mode != "never"
+        {
+            anyhow::bail!("jobs.defaults.worktree_mode must be 'auto', 'always', or 'never'");
+        }
+
+        if self.merge_strategy != "sequential"
+            && self.merge_strategy != "rebase"
+            && self.merge_strategy != "manual"
+        {
+            anyhow::bail!(
+                "jobs.defaults.merge_strategy must be 'sequential', 'rebase', or 'manual'"
+            );
+        }
+
         Ok(())
     }
 }
@@ -484,7 +507,13 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
         let jobs_allowed = ["defaults"];
         push_unknown_table_keys(jobs, "jobs", &jobs_allowed, report);
         if let Some(defaults) = jobs.get("defaults").and_then(toml::Value::as_table) {
-            let defaults_allowed = ["min_turns", "strategy"];
+            let defaults_allowed = [
+                "min_turns",
+                "strategy",
+                "worktree_mode",
+                "merge_strategy",
+                "base_branch",
+            ];
             push_unknown_table_keys(defaults, "jobs.defaults", &defaults_allowed, report);
         }
     }
@@ -611,4 +640,12 @@ fn default_validation_fail_action() -> String {
 
 fn default_validation_max_retries() -> u32 {
     2
+}
+
+fn default_worktree_mode() -> String {
+    "never".to_string()
+}
+
+fn default_merge_strategy() -> String {
+    "manual".to_string()
 }

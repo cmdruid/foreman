@@ -121,6 +121,8 @@ struct AgentRecord {
     turns_completed: u32,
     validation_retries: u32,
     last_validation_error: Option<String>,
+    worktree_path: Option<String>,
+    branch_name: Option<String>,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -141,6 +143,10 @@ struct JobRecord {
     status: String,
     worker_ids: Vec<Uuid>,
     worker_labels: HashMap<Uuid, HashMap<String, String>>,
+    merged_branches: Vec<String>,
+    merge_conflicts: Vec<String>,
+    base_branch: String,
+    merge_strategy: String,
     created_at: u64,
     completed_at: Option<u64>,
     updated_at: u64,
@@ -418,6 +424,13 @@ impl Foreman {
         };
 
         if !candidate.should_restart {
+            if let Err(err) = self.cleanup_agent_worktree_if_any(agent_id, false).await {
+                warn!(
+                    %err,
+                    %agent_id,
+                    "failed to cleanup worker worktree after restart budget exhaustion"
+                );
+            }
             if let Some(project_id) = candidate.project_id {
                 let _ = self.update_project_after_worker_event(project_id).await;
             }
@@ -830,6 +843,13 @@ impl Foreman {
             if let Err(err) = self.handle_worker_post_turn(&context).await {
                 warn!(%err, agent_id = %context.agent_id, "post-turn worker policy failed");
             }
+            if let Err(err) = self.handle_worker_worktree_lifecycle(&context).await {
+                warn!(
+                    %err,
+                    agent_id = %context.agent_id,
+                    "worker worktree lifecycle handling failed"
+                );
+            }
 
             if let Some(job_id) = context.job_id {
                 let _ = self.job_event_tx.send(JobEventEnvelope {
@@ -961,6 +981,229 @@ impl Foreman {
         Ok(())
     }
 
+    async fn handle_worker_worktree_lifecycle(
+        self: &Arc<Self>,
+        context: &CallbackEventContext,
+    ) -> Result<()> {
+        if context.role != AgentRole::Worker {
+            return Ok(());
+        }
+
+        let Some(project_id) = context.project_id else {
+            return Ok(());
+        };
+
+        let Some(job_id) = context.job_id else {
+            return Ok(());
+        };
+
+        let is_completed = context.method == constants::EVENT_METHOD_TURN_COMPLETED;
+        let is_aborted = context.method == constants::EVENT_METHOD_TURN_ABORTED
+            || context
+                .result_snapshot
+                .as_ref()
+                .is_some_and(is_worker_failure);
+        if !is_completed && !is_aborted {
+            return Ok(());
+        }
+
+        let (worktree_path, branch_name) = {
+            let agents = self.agents.read().await;
+            let Some(agent) = agents.get(&context.agent_id) else {
+                return Ok(());
+            };
+            (agent.worktree_path.clone(), agent.branch_name.clone())
+        };
+
+        let Some(worktree_path) = worktree_path else {
+            return Ok(());
+        };
+
+        let (project_path, base_branch, merge_strategy) = {
+            let projects = self.projects.read().await;
+            let Some(project) = projects.get(&project_id) else {
+                return Ok(());
+            };
+            let jobs = self.jobs.read().await;
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(());
+            };
+            (
+                project.path.clone(),
+                job.base_branch.clone(),
+                job.merge_strategy.clone(),
+            )
+        };
+
+        if is_completed
+            && merge_strategy != "manual"
+            && let Some(branch_name_ref) = branch_name.as_deref()
+        {
+            match self
+                .merge_worker_branch(
+                    project_path.as_str(),
+                    base_branch.as_str(),
+                    branch_name_ref,
+                    merge_strategy.as_str(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    {
+                        let mut jobs = self.jobs.write().await;
+                        if let Some(job) = jobs.get_mut(&job_id)
+                            && !job
+                                .merged_branches
+                                .iter()
+                                .any(|value| value == branch_name_ref)
+                        {
+                            job.merged_branches.push(branch_name_ref.to_string());
+                            job.updated_at = now_ts();
+                        }
+                    }
+                    self.cleanup_worker_worktree(
+                        project_path.as_str(),
+                        worktree_path.as_str(),
+                        Some(branch_name_ref),
+                        true,
+                    )
+                    .await?;
+
+                    let mut agents = self.agents.write().await;
+                    if let Some(agent) = agents.get_mut(&context.agent_id) {
+                        agent.worktree_path = None;
+                        agent.branch_name = None;
+                        agent.updated_at = now_ts();
+                    }
+                }
+                Err(err) => {
+                    let mut jobs = self.jobs.write().await;
+                    if let Some(job) = jobs.get_mut(&job_id)
+                        && !job
+                            .merge_conflicts
+                            .iter()
+                            .any(|value| value == branch_name_ref)
+                    {
+                        job.merge_conflicts.push(branch_name_ref.to_string());
+                        job.updated_at = now_ts();
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if is_aborted {
+            self.cleanup_worker_worktree(
+                project_path.as_str(),
+                worktree_path.as_str(),
+                branch_name.as_deref(),
+                false,
+            )
+            .await?;
+
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&context.agent_id) {
+                agent.worktree_path = None;
+                agent.updated_at = now_ts();
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn cleanup_residual_worktrees(&self) {
+        let workers = {
+            let agents = self.agents.read().await;
+            let projects = self.projects.read().await;
+            let mut workers = Vec::new();
+            for agent in agents.values() {
+                let Some(worktree_path) = agent.worktree_path.clone() else {
+                    continue;
+                };
+                let Some(project_id) = agent.project_id else {
+                    continue;
+                };
+                let Some(project) = projects.get(&project_id) else {
+                    continue;
+                };
+                workers.push((
+                    agent.id,
+                    project.path.clone(),
+                    worktree_path,
+                    agent.branch_name.clone(),
+                ));
+            }
+            workers
+        };
+
+        for (agent_id, project_path, worktree_path, branch_name) in workers {
+            if let Err(err) = self
+                .cleanup_worker_worktree(
+                    project_path.as_str(),
+                    worktree_path.as_str(),
+                    branch_name.as_deref(),
+                    false,
+                )
+                .await
+            {
+                warn!(
+                    %err,
+                    %agent_id,
+                    worktree_path = %worktree_path,
+                    "failed to cleanup residual worker worktree during shutdown reconcile"
+                );
+                continue;
+            }
+
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.worktree_path = None;
+                agent.updated_at = now_ts();
+            }
+        }
+    }
+
+    async fn cleanup_agent_worktree_if_any(&self, agent_id: Uuid, was_merged: bool) -> Result<()> {
+        let (project_path, worktree_path, branch_name) = {
+            let agents = self.agents.read().await;
+            let Some(agent) = agents.get(&agent_id) else {
+                return Ok(());
+            };
+            let Some(worktree_path) = agent.worktree_path.clone() else {
+                return Ok(());
+            };
+            let Some(project_id) = agent.project_id else {
+                return Ok(());
+            };
+
+            let projects = self.projects.read().await;
+            let Some(project) = projects.get(&project_id) else {
+                return Ok(());
+            };
+
+            (project.path.clone(), worktree_path, agent.branch_name.clone())
+        };
+
+        self.cleanup_worker_worktree(
+            project_path.as_str(),
+            worktree_path.as_str(),
+            branch_name.as_deref(),
+            was_merged,
+        )
+        .await?;
+
+        let mut agents = self.agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id) {
+            agent.worktree_path = None;
+            if was_merged {
+                agent.branch_name = None;
+            }
+            agent.updated_at = now_ts();
+        }
+
+        Ok(())
+    }
+
     async fn is_agent_idle_or_completed(&self, agent_id: Uuid) -> bool {
         let agents = self.agents.read().await;
         let Some(agent) = agents.get(&agent_id) else {
@@ -1036,9 +1279,16 @@ impl Foreman {
             error_text
         };
 
-        let mut agents = self.agents.write().await;
-        if let Some(agent) = agents.get_mut(&agent_id) {
-            agent.status = constants::AGENT_STATUS_FAILED.to_string();
+        let cleanup = {
+            let mut agents = self.agents.write().await;
+            let mut cleanup: Option<(String, Option<String>, Option<Uuid>)> = None;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                cleanup = agent
+                    .worktree_path
+                    .clone()
+                    .map(|path| (path, agent.branch_name.clone(), agent.project_id));
+                agent.worktree_path = None;
+                agent.status = constants::AGENT_STATUS_FAILED.to_string();
             agent.error = Some(message.clone());
             if let Some(result) = agent.result.as_mut() {
                 result.status = constants::AGENT_STATUS_FAILED.to_string();
@@ -1046,6 +1296,28 @@ impl Foreman {
                 result.turn_id = result.turn_id.clone().or(last_turn_id.clone());
             }
             agent.updated_at = now_ts();
+            }
+            cleanup
+        };
+
+        if let Some((worktree_path, branch_name, Some(project_id))) = cleanup {
+            let project_path = {
+                let projects = self.projects.read().await;
+                projects
+                    .get(&project_id)
+                    .map(|project| project.path.clone())
+                    .unwrap_or_default()
+            };
+            if !project_path.is_empty() {
+                let _ = self
+                    .cleanup_worker_worktree(
+                        project_path.as_str(),
+                        worktree_path.as_str(),
+                        branch_name.as_deref(),
+                        false,
+                    )
+                    .await;
+            }
         }
         Ok(true)
     }
@@ -2116,6 +2388,7 @@ impl Foreman {
 
         let response = self
             .spawn_agent_record(
+                None,
                 spawn_request,
                 AgentRole::Foreman,
                 Some(project_id),
@@ -2290,9 +2563,21 @@ impl Foreman {
             request.prompt
         );
         let project_path = project.runtime.path.to_string_lossy().to_string();
-        let worker_cwd = self
-            .resolve_worker_cwd(&project_path, request.cwd, request.worktree.as_ref())
-            .await?;
+        let worker_id = Uuid::new_v4();
+        let mut worker_worktree: Option<(String, String)> = None;
+        let worker_cwd = if request.worktree.is_some() {
+            self.resolve_worker_cwd(&project_path, request.cwd, request.worktree.as_ref())
+                .await?
+        } else if should_use_native_worktree(&project.config.jobs.defaults, 1) {
+            let worktree =
+                self.create_worker_worktree(project_path.as_str(), project_id, worker_id)
+                    .await?;
+            let cwd = worktree.0.clone();
+            worker_worktree = Some(worktree);
+            cwd
+        } else {
+            request.cwd.unwrap_or(project_path.clone())
+        };
 
         let spawn_request = SpawnAgentRequest {
             prompt: worker_prompt,
@@ -2309,6 +2594,7 @@ impl Foreman {
 
         let response = self
             .spawn_agent_record(
+                Some(worker_id),
                 spawn_request,
                 AgentRole::Worker,
                 Some(project_id),
@@ -2318,6 +2604,14 @@ impl Foreman {
             )
             .await
             .context("failed to spawn project worker")?;
+
+        if let Some((worktree_path, branch_name)) = worker_worktree {
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&response.id) {
+                agent.worktree_path = Some(worktree_path);
+                agent.branch_name = Some(branch_name);
+            }
+        }
 
         {
             let mut projects = self.projects.write().await;
@@ -2358,6 +2652,14 @@ impl Foreman {
         let foreman_id = foreman_id.context("project has no foreman")?;
         let ts = now_ts();
         let job_id = Uuid::new_v4();
+        let worker_count = request.workers.len();
+        let project_path = project.runtime.path.to_string_lossy().to_string();
+        let merge_strategy = project.config.jobs.defaults.merge_strategy.clone();
+        let base_branch = if let Some(branch) = project.config.jobs.defaults.base_branch.clone() {
+            branch
+        } else {
+            detect_base_branch(project_path.as_str()).await?
+        };
         let mut worker_ids = Vec::new();
         let mut labels = HashMap::new();
 
@@ -2377,10 +2679,21 @@ impl Foreman {
                 constants::PROJECT_TASK_LABEL,
                 spec.prompt
             );
-            let project_path = project.runtime.path.to_string_lossy().to_string();
-            let worker_cwd = self
-                .resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
-                .await?;
+            let worker_id = Uuid::new_v4();
+            let mut worker_worktree: Option<(String, String)> = None;
+            let worker_cwd = if spec.worktree.is_some() {
+                self.resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
+                    .await?
+            } else if should_use_native_worktree(&project.config.jobs.defaults, worker_count) {
+                let worktree =
+                    self.create_worker_worktree(project_path.as_str(), job_id, worker_id)
+                        .await?;
+                let cwd = worktree.0.clone();
+                worker_worktree = Some(worktree);
+                cwd
+            } else {
+                spec.cwd.unwrap_or(project_path.clone())
+            };
 
             let spawn_request = SpawnAgentRequest {
                 prompt: worker_prompt,
@@ -2397,6 +2710,7 @@ impl Foreman {
 
             let response = self
                 .spawn_agent_record(
+                    Some(worker_id),
                     spawn_request,
                     AgentRole::Worker,
                     Some(project_id),
@@ -2406,6 +2720,14 @@ impl Foreman {
                 )
                 .await
                 .context("failed to spawn project worker")?;
+
+            if let Some((worktree_path, branch_name)) = worker_worktree {
+                let mut agents = self.agents.write().await;
+                if let Some(agent) = agents.get_mut(&response.id) {
+                    agent.worktree_path = Some(worktree_path);
+                    agent.branch_name = Some(branch_name);
+                }
+            }
 
             labels.insert(response.id, spec.labels);
             worker_ids.push(response.id);
@@ -2430,6 +2752,10 @@ impl Foreman {
                     status: constants::JOB_STATUS_RUNNING.to_string(),
                     worker_ids: worker_ids.clone(),
                     worker_labels: labels,
+                    merged_branches: Vec::new(),
+                    merge_conflicts: Vec::new(),
+                    base_branch,
+                    merge_strategy,
                     created_at: ts,
                     completed_at: None,
                     updated_at: ts,
@@ -2543,6 +2869,130 @@ impl Foreman {
             return Err(anyhow!(
                 "failed to create worker worktree at {worktree_path}: {stderr} {stdout}"
             ));
+        }
+
+        Ok(())
+    }
+
+    async fn create_worker_worktree(
+        &self,
+        project_path: &str,
+        job_id: Uuid,
+        worker_id: Uuid,
+    ) -> Result<(String, String)> {
+        let _lock = self.worktree_lock.lock().await;
+        let branch_name = build_worker_branch_name(job_id, worker_id);
+        let worktree_path = build_worker_worktree_path(project_path, worker_id);
+
+        if let Some(parent) = Path::new(&worktree_path).parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "failed to create worktree parent directory '{}'",
+                    parent.display()
+                )
+            })?;
+        }
+
+        run_git_command(
+            project_path,
+            &[
+                "worktree".to_string(),
+                "add".to_string(),
+                worktree_path.clone(),
+                "-b".to_string(),
+                branch_name.clone(),
+            ],
+            "create worker worktree",
+        )
+        .await?;
+
+        Ok((worktree_path, branch_name))
+    }
+
+    async fn merge_worker_branch(
+        &self,
+        project_path: &str,
+        base_branch: &str,
+        branch_name: &str,
+        strategy: &str,
+    ) -> Result<()> {
+        let _lock = self.worktree_lock.lock().await;
+        run_git_command(
+            project_path,
+            &["checkout".to_string(), base_branch.to_string()],
+            "checkout base branch before merge",
+        )
+        .await?;
+
+        match strategy {
+            "manual" => Ok(()),
+            "sequential" => {
+                run_git_command(
+                    project_path,
+                    &[
+                        "merge".to_string(),
+                        "--no-ff".to_string(),
+                        branch_name.to_string(),
+                    ],
+                    "merge worker branch",
+                )
+                .await?;
+                Ok(())
+            }
+            "rebase" => {
+                run_git_command(
+                    project_path,
+                    &[
+                        "rebase".to_string(),
+                        base_branch.to_string(),
+                        branch_name.to_string(),
+                    ],
+                    "rebase worker branch",
+                )
+                .await?;
+                run_git_command(
+                    project_path,
+                    &[
+                        "merge".to_string(),
+                        "--no-ff".to_string(),
+                        branch_name.to_string(),
+                    ],
+                    "merge rebased worker branch",
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Err(anyhow!("unsupported merge strategy '{strategy}'")),
+        }
+    }
+
+    async fn cleanup_worker_worktree(
+        &self,
+        project_path: &str,
+        worktree_path: &str,
+        branch_name: Option<&str>,
+        was_merged: bool,
+    ) -> Result<()> {
+        let _lock = self.worktree_lock.lock().await;
+        run_git_command(
+            project_path,
+            &[
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                worktree_path.to_string(),
+            ],
+            "remove worker worktree",
+        )
+        .await?;
+
+        if was_merged && let Some(branch_name) = branch_name {
+            run_git_command(
+                project_path,
+                &["branch".to_string(), "-d".to_string(), branch_name.to_string()],
+                "delete merged worker branch",
+            )
+            .await?;
         }
 
         Ok(())
@@ -2663,6 +3113,8 @@ impl Foreman {
             worker_count: total_workers,
             workers,
             labels: aggregate_worker_labels(&job.worker_labels),
+            merged_branches: job.merged_branches.clone(),
+            merge_conflicts: job.merge_conflicts.clone(),
         })
     }
 
@@ -2731,6 +3183,8 @@ impl Foreman {
                             worker_count: 0,
                             workers: Vec::new(),
                             labels: HashMap::new(),
+                            merged_branches: Vec::new(),
+                            merge_conflicts: Vec::new(),
                         },
                         timed_out: true,
                     });
@@ -2973,7 +3427,7 @@ impl Foreman {
             })
             .context("failed to configure worker callback")?;
 
-        self.spawn_agent_record(request, AgentRole::Standalone, None, None, None, callback)
+        self.spawn_agent_record(None, request, AgentRole::Standalone, None, None, None, callback)
             .await
     }
 
@@ -3484,6 +3938,7 @@ impl Foreman {
 
     async fn spawn_agent_record(
         self: &Arc<Self>,
+        agent_id: Option<Uuid>,
         request: SpawnAgentRequest,
         role: AgentRole,
         project_id: Option<Uuid>,
@@ -3506,7 +3961,7 @@ impl Foreman {
             response.thread_id
         };
 
-        let id = Uuid::new_v4();
+        let id = agent_id.unwrap_or_else(Uuid::new_v4);
         let ts = now_ts();
         let role_name = role.as_str().to_string();
         let prompt = if request.prompt.trim().is_empty() {
@@ -3526,6 +3981,8 @@ impl Foreman {
                 turns_completed: 0,
                 validation_retries: 0,
                 last_validation_error: None,
+                worktree_path: None,
+                branch_name: None,
                 status: constants::AGENT_STATUS_IDLE.into(),
                 callback,
                 role: role.clone(),
@@ -3894,6 +4351,8 @@ fn build_agent_state(agent: &AgentRecord) -> AgentState {
         turns_completed: agent.turns_completed,
         validation_retries: agent.validation_retries,
         last_validation_error: agent.last_validation_error.clone(),
+        worktree_path: agent.worktree_path.clone(),
+        branch: agent.branch_name.clone(),
         last_tool_call,
         files_modified,
         elapsed_ms: Some(
@@ -3974,6 +4433,78 @@ fn normalize_project_lifecycle_callback_status(
     let mut status = default_project_lifecycle_callback_status();
     status.extend(provided);
     status
+}
+
+fn should_use_native_worktree(defaults: &JobDefaultsConfig, worker_count: usize) -> bool {
+    match defaults.worktree_mode.as_str() {
+        "always" => true,
+        "auto" => worker_count > 1,
+        _ => false,
+    }
+}
+
+fn short_uuid(id: Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+fn build_worker_branch_name(job_id: Uuid, worker_id: Uuid) -> String {
+    format!("foreman/{}/{}", short_uuid(job_id), short_uuid(worker_id))
+}
+
+fn build_worker_worktree_path(project_path: &str, worker_id: Uuid) -> String {
+    Path::new(project_path)
+        .join(".foreman")
+        .join("worktrees")
+        .join(short_uuid(worker_id))
+        .to_string_lossy()
+        .to_string()
+}
+
+async fn run_git_command(project_path: &str, args: &[String], action: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to execute git command for {action}: git -C {project_path} {}",
+                args.join(" ")
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        return Err(anyhow!(
+            "{action} failed (exit {code}) for git -C {project_path} {}. stdout: {} stderr: {}",
+            args.join(" "),
+            if stdout.is_empty() { "<empty>" } else { &stdout },
+            if stderr.is_empty() { "<empty>" } else { &stderr },
+        ));
+    }
+
+    Ok(stdout)
+}
+
+async fn detect_base_branch(project_path: &str) -> Result<String> {
+    match run_git_command(
+        project_path,
+        &[
+            "symbolic-ref".to_string(),
+            "--short".to_string(),
+            "HEAD".to_string(),
+        ],
+        "detect base branch",
+    )
+    .await
+    {
+        Ok(branch) if !branch.trim().is_empty() => Ok(branch),
+        Ok(_) => Ok("main".to_string()),
+        Err(_) => Ok("main".to_string()),
+    }
 }
 
 async fn run_validation_commands(commands: &[String], cwd: &Path) -> Result<()> {
@@ -4819,6 +5350,8 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
         turns_completed,
         validation_retries: record.validation_retries,
         last_validation_error: record.last_validation_error,
+        worktree_path: record.worktree_path,
+        branch_name: record.branch_name,
         status,
         callback,
         role,
@@ -4865,6 +5398,10 @@ fn restore_job_record(record: PersistedJobRecord) -> Result<JobRecord> {
         status: record.status,
         worker_ids,
         worker_labels,
+        merged_branches: record.merged_branches,
+        merge_conflicts: record.merge_conflicts,
+        base_branch: record.base_branch.unwrap_or_else(|| "main".to_string()),
+        merge_strategy: record.merge_strategy.unwrap_or_else(|| "manual".to_string()),
         created_at: record.created_at,
         completed_at: record.completed_at,
         updated_at: record.updated_at,
@@ -4927,6 +5464,8 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         turns_completed: agent.turns_completed,
         validation_retries: agent.validation_retries,
         last_validation_error: agent.last_validation_error.clone(),
+        worktree_path: agent.worktree_path.clone(),
+        branch_name: agent.branch_name.clone(),
         status: agent.status.clone(),
         callback,
         role,
@@ -4952,6 +5491,10 @@ fn persisted_job_record(job: &JobRecord) -> PersistedJobRecord {
             .iter()
             .map(|(id, labels)| (id.to_string(), labels.clone()))
             .collect(),
+        merged_branches: job.merged_branches.clone(),
+        merge_conflicts: job.merge_conflicts.clone(),
+        base_branch: Some(job.base_branch.clone()),
+        merge_strategy: Some(job.merge_strategy.clone()),
         created_at: job.created_at,
         completed_at: job.completed_at,
         updated_at: job.updated_at,
@@ -5080,10 +5623,10 @@ fn is_job_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRecord, AgentRole, Foreman, WorkerCallback, callback_timeout_ms,
-        continuation_prompt_for_turn, render_template, render_template_strict,
-        resolve_agent_status, run_validation_commands, should_fire_tool_filter,
-        unresolved_template_tokens, update_completed_turn_counter,
+        AgentRecord, AgentRole, Foreman, WorkerCallback, build_worker_branch_name,
+        build_worker_worktree_path, callback_timeout_ms, continuation_prompt_for_turn,
+        render_template, render_template_strict, resolve_agent_status, run_validation_commands,
+        should_fire_tool_filter, unresolved_template_tokens, update_completed_turn_counter,
     };
     use crate::config::CallbackFilter;
     use crate::events::events_allowed;
@@ -5107,6 +5650,24 @@ mod tests {
         let (completed_turns, should_compact) = update_completed_turn_counter(3, Some(3));
         assert_eq!(completed_turns, 0);
         assert!(should_compact);
+    }
+
+    #[test]
+    fn worker_branch_name_uses_short_job_and_worker_ids() {
+        let job_id =
+            Uuid::parse_str("12345678-90ab-cdef-1234-567890abcdef").expect("parse job uuid");
+        let worker_id =
+            Uuid::parse_str("abcdef12-3456-7890-abcd-ef1234567890").expect("parse worker uuid");
+        let branch = build_worker_branch_name(job_id, worker_id);
+        assert_eq!(branch, "foreman/12345678/abcdef12");
+    }
+
+    #[test]
+    fn worker_worktree_path_uses_foreman_worktree_directory() {
+        let worker_id =
+            Uuid::parse_str("abcdef12-3456-7890-abcd-ef1234567890").expect("parse worker uuid");
+        let path = build_worker_worktree_path("/tmp/example-project", worker_id);
+        assert_eq!(path, "/tmp/example-project/.foreman/worktrees/abcdef12");
     }
 
     #[test]
@@ -5327,6 +5888,7 @@ mod tests {
         let explore_defaults = JobDefaultsConfig {
             min_turns: None,
             strategy: Some("explore-plan-execute".to_string()),
+            ..JobDefaultsConfig::default()
         };
         let first = continuation_prompt_for_turn(1, &explore_defaults).expect("turn 1 prompt");
         assert!(first.contains("Phase 1 complete"));
@@ -5340,6 +5902,7 @@ mod tests {
         let generic_defaults = JobDefaultsConfig {
             min_turns: Some(4),
             strategy: Some("single".to_string()),
+            ..JobDefaultsConfig::default()
         };
         let generic = continuation_prompt_for_turn(2, &generic_defaults).expect("generic prompt");
         assert!(generic.contains("turn 2 of at least 4"));
@@ -5437,6 +6000,8 @@ mod tests {
             turns_completed: 0,
             validation_retries: 0,
             last_validation_error: None,
+            worktree_path: None,
+            branch_name: None,
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -5506,6 +6071,8 @@ mod tests {
                 turns_completed: 0,
                 validation_retries: 0,
                 last_validation_error: None,
+                worktree_path: None,
+                branch_name: None,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),

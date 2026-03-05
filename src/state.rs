@@ -126,6 +126,10 @@ pub struct PersistedAgentRecord {
     pub validation_retries: u32,
     #[serde(default)]
     pub last_validation_error: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub branch_name: Option<String>,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,
@@ -173,6 +177,14 @@ pub struct PersistedJobRecord {
     pub status: String,
     pub worker_ids: Vec<String>,
     pub worker_labels: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub merged_branches: Vec<String>,
+    #[serde(default)]
+    pub merge_conflicts: Vec<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub merge_strategy: Option<String>,
     pub created_at: u64,
     pub completed_at: Option<u64>,
     pub updated_at: u64,

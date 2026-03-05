@@ -377,6 +377,7 @@ async fn run() -> anyhow::Result<()> {
             })
             .await?;
         state.foreman.reconcile_agent_statuses().await;
+        state.foreman.cleanup_residual_worktrees().await;
         state
             .foreman
             .persist_state_now()

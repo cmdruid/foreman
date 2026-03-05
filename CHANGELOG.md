@@ -4,6 +4,13 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.4.0]
+
+- A1: Added native per-worker git worktree lifecycle management for project jobs, including automatic worktree branch/path generation, merge strategies (`sequential`, `rebase`, `manual`), merge conflict reporting, and cleanup on completion/abort/shutdown reconcile.
+- A2: Added worker validation gates for `on_turn` and `on_complete` commands with configurable `fail_action` (`retry`, `abort`, `warn`) and retry budgeting.
+- A3: Added structured multi-turn guardrails with `jobs.defaults.min_turns` plus `explore-plan-execute` strategy continuation prompts.
+- B: Added tool-filtered callbacks (`callbacks.filters`) with tool + command pattern matching and optional debounce windows for scoped callback dispatch.
+
 ## [0.3.1]
 
 - Fixed worker log/progress tool parsing to consume `item/completed` payloads using `params.item.type`, including `commandExecution`, `fileChange`, and `dynamicToolCall`.

@@ -178,6 +178,8 @@ pub struct AgentState {
     pub turns_completed: u32,
     pub validation_retries: u32,
     pub last_validation_error: Option<String>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
     pub last_tool_call: Option<ToolCallSummary>,
     pub files_modified: Vec<String>,
     pub elapsed_ms: Option<u64>,
@@ -277,6 +279,8 @@ pub struct JobResult {
     pub worker_count: usize,
     pub workers: Vec<AgentResultResponse>,
     pub labels: std::collections::HashMap<String, Vec<String>>,
+    pub merged_branches: Vec<String>,
+    pub merge_conflicts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
