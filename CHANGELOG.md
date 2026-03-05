@@ -4,6 +4,13 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.5.0]
+
+- Added B2 retry-from-checkpoint support with persisted per-worker checkpoints (`last_successful_turn_id`, branch/worktree pointers, validation snapshot, retry count) and new `POST /agents/:id/retry` mode selection (`last-turn` or `checkpoint`).
+- Added C1 pre-flight overlap planning via `POST /projects/:id/jobs/plan`, including worker-pair low/medium/high risk matrix output, scope-path overlap boosting, and overlap policy enforcement (`warn`, `require_approve`, `block`) during job creation.
+- Added C2 DAG-lite dependency scheduling for project jobs with worker `depends_on` support, runnable-only launch behavior, automatic downstream blocking on dependency failure, and dependency graph + blocked reason exposure in job status/result APIs.
+- Added targeted tests for retry mode selection fallback, overlap matrix risk behavior, and dependency-failure downstream blocking behavior.
+
 ## [0.4.1]
 
 - Added `POST /projects/:id/reload` to hot-reload project config from `project.toml`, with in-place updates for callback configuration, validation, policy, and `jobs.defaults.{min_turns,strategy}`.

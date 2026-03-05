@@ -137,9 +137,15 @@ pub struct SpawnProjectWorkerRequest {
     pub sandbox: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectJobWorkerSpec {
+    #[serde(default)]
+    pub name: Option<String>,
     pub prompt: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub scope_paths: Vec<String>,
     #[serde(default)]
     pub labels: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -155,6 +161,8 @@ pub struct ProjectJobWorkerSpec {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateProjectJobsRequest {
     pub workers: Vec<ProjectJobWorkerSpec>,
+    #[serde(default)]
+    pub approve_overlap: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,6 +173,47 @@ pub struct CreateProjectJobsResponse {
     pub worker_ids: Vec<Uuid>,
     pub worker_count: usize,
     pub labels: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanProjectJobsRequest {
+    pub workers: Vec<ProjectJobWorkerSpec>,
+    #[serde(default)]
+    pub declared_scope_paths: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OverlapRiskEntry {
+    pub worker_a: String,
+    pub worker_b: String,
+    pub risk: String,
+    #[serde(default)]
+    pub score: u8,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanProjectJobsResponse {
+    pub project_id: Uuid,
+    pub overlap_policy: String,
+    pub blocked: bool,
+    pub requires_approval: bool,
+    pub high_risk_pairs: usize,
+    pub matrix: Vec<OverlapRiskEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetryAgentRequest {
+    pub mode: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetryAgentResponse {
+    pub agent_id: Uuid,
+    pub selected_mode: String,
+    pub restarted_turn_id: Option<String>,
+    pub checkpoint_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -388,6 +437,10 @@ pub struct JobState {
     pub updated_at: u64,
     #[serde(default)]
     pub throttled_workers: Vec<ThrottledWorkerStatus>,
+    #[serde(default)]
+    pub dependency_graph: std::collections::HashMap<Uuid, Vec<Uuid>>,
+    #[serde(default)]
+    pub blocked_reasons: std::collections::HashMap<Uuid, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -404,6 +457,10 @@ pub struct JobResult {
     pub labels: std::collections::HashMap<String, Vec<String>>,
     pub merged_branches: Vec<String>,
     pub merge_conflicts: Vec<String>,
+    #[serde(default)]
+    pub dependency_graph: std::collections::HashMap<Uuid, Vec<Uuid>>,
+    #[serde(default)]
+    pub blocked_reasons: std::collections::HashMap<Uuid, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

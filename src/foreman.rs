@@ -33,12 +33,14 @@ use crate::{
     models::{
         AgentProgressEnvelope, AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
         CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, FailureClass,
-        FailureReport, JobEventEnvelope, JobResult, JobState, ProgressThrottleState,
-        ProgressValidationState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput,
-        SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
-        SpawnProjectWorkerResponse, SteerAgentInput, ThrottledWorkerStatus, ToolCallSummary,
-        ToolFilterCallbackPayload, WorkerBudgetLimits, WorkerBudgetStatus, WorkerBudgetUsage,
-        WorkerLogEntry, WorkerWorktreeSpec,
+        FailureReport, JobEventEnvelope, JobResult, JobState, OverlapRiskEntry,
+        PlanProjectJobsRequest, PlanProjectJobsResponse, ProgressThrottleState,
+        ProgressValidationState, ProjectCallbackStatusResponse, ProjectState, RetryAgentRequest,
+        RetryAgentResponse, SendAgentInput, SpawnAgentRequest, SpawnAgentResponse,
+        SpawnProjectRequest, SpawnProjectWorkerRequest, SpawnProjectWorkerResponse,
+        SteerAgentInput, ThrottledWorkerStatus, ToolCallSummary, ToolFilterCallbackPayload,
+        WorkerBudgetLimits, WorkerBudgetStatus, WorkerBudgetUsage, WorkerLogEntry,
+        WorkerWorktreeSpec,
     },
     project::{
         CallbackSpec, JobDefaultsConfig, ProjectConfig, ProjectRuntimeFiles, ValidationConfig,
@@ -46,6 +48,7 @@ use crate::{
     state::{
         PersistedAgentRecord, PersistedGovernorRecord, PersistedJobRecord, PersistedProjectRecord,
         PersistedRuntimeFiles, PersistedState, PersistedWorkerBudget, PersistedWorkerCallback,
+        PersistedWorkerCheckpoint,
     },
 };
 
@@ -134,6 +137,7 @@ struct AgentRecord {
     throttle_reason: Option<String>,
     failure_report: Option<FailureReport>,
     budget: WorkerBudgetState,
+    checkpoint: WorkerCheckpoint,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -183,6 +187,16 @@ impl WorkerBudgetState {
 }
 
 #[derive(Debug, Clone, Default)]
+struct WorkerCheckpoint {
+    last_successful_turn_id: Option<String>,
+    worktree_path: Option<String>,
+    branch_name: Option<String>,
+    validation_retries: u32,
+    last_validation_error: Option<String>,
+    retry_count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
 struct GovernorState {
     throttled_until_ms: u64,
     backoff_ms: u64,
@@ -199,11 +213,37 @@ struct JobRecord {
     worker_labels: HashMap<Uuid, HashMap<String, String>>,
     merged_branches: Vec<String>,
     merge_conflicts: Vec<String>,
+    worker_names: HashMap<Uuid, String>,
+    dependency_graph: HashMap<Uuid, Vec<Uuid>>,
+    blocked_reasons: HashMap<Uuid, String>,
     base_branch: String,
     merge_strategy: String,
     created_at: u64,
     completed_at: Option<u64>,
     updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct JobWorkerSpecResolved {
+    worker_id: Uuid,
+    worker_name: String,
+    prompt: String,
+    labels: HashMap<String, String>,
+    callback: WorkerCallback,
+    model: Option<String>,
+    model_provider: Option<String>,
+    sandbox: Option<String>,
+    cwd: String,
+    worktree_path: Option<String>,
+    branch_name: Option<String>,
+    depends_on: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyStatus {
+    Satisfied,
+    Pending,
+    Failed(Uuid),
 }
 
 #[derive(Debug, Clone)]
@@ -867,8 +907,16 @@ impl Foreman {
                     method.as_str(),
                     constants::EVENT_METHOD_TURN_COMPLETED | constants::EVENT_METHOD_TURN_ABORTED
                 ) {
+                    let completed_turn_id =
+                        parse_turn_id(&params).or_else(|| agent.active_turn_id.clone());
                     if method == constants::EVENT_METHOD_TURN_COMPLETED {
                         agent.turns_completed = agent.turns_completed.saturating_add(1);
+                        agent.checkpoint.last_successful_turn_id = completed_turn_id.clone();
+                        agent.checkpoint.worktree_path = agent.worktree_path.clone();
+                        agent.checkpoint.branch_name = agent.branch_name.clone();
+                        agent.checkpoint.validation_retries = agent.validation_retries;
+                        agent.checkpoint.last_validation_error =
+                            agent.last_validation_error.clone();
                     }
                     agent.status = constants::AGENT_STATUS_IDLE.to_string();
                     agent.throttled = false;
@@ -877,7 +925,7 @@ impl Foreman {
                     agent.result = Some(build_completion_result(
                         agent.id,
                         &method,
-                        parse_turn_id(&params).or_else(|| agent.active_turn_id.clone()),
+                        completed_turn_id,
                         &params,
                         ts,
                         event_id,
@@ -1428,6 +1476,8 @@ impl Foreman {
         let mut agents = self.agents.write().await;
         if let Some(agent) = agents.get_mut(&agent_id) {
             agent.last_validation_error = None;
+            agent.checkpoint.last_validation_error = None;
+            agent.checkpoint.validation_retries = agent.validation_retries;
             agent.updated_at = now_ts();
             let _ = self
                 .agent_progress_tx
@@ -1447,6 +1497,8 @@ impl Foreman {
                 return Ok(true);
             };
             agent.last_validation_error = Some(error_text.clone());
+            agent.checkpoint.last_validation_error = Some(error_text.clone());
+            agent.checkpoint.validation_retries = agent.validation_retries;
             agent.updated_at = now_ts();
             let _ = self
                 .agent_progress_tx
@@ -1478,6 +1530,7 @@ impl Foreman {
             let mut agents = self.agents.write().await;
             if let Some(agent) = agents.get_mut(&agent_id) {
                 agent.validation_retries = agent.validation_retries.saturating_add(1);
+                agent.checkpoint.validation_retries = agent.validation_retries;
                 agent.updated_at = now_ts();
             }
             return Ok(true);
@@ -1645,10 +1698,11 @@ impl Foreman {
     }
 
     async fn update_job_after_worker_event(
-        &self,
+        self: &Arc<Self>,
         job_id: Uuid,
         result_snapshot: Option<&AgentResult>,
     ) -> Result<Option<String>> {
+        self.launch_runnable_workers(job_id).await?;
         let workers = {
             let jobs = self.jobs.read().await;
             jobs.get(&job_id)
@@ -2950,6 +3004,29 @@ impl Foreman {
             return Err(anyhow!("at least one worker spec is required"));
         }
 
+        let approve_overlap = request.approve_overlap;
+        let workers = request.workers;
+        let plan = self
+            .plan_project_jobs(
+                project_id,
+                PlanProjectJobsRequest {
+                    workers: workers.clone(),
+                    declared_scope_paths: HashMap::new(),
+                },
+            )
+            .await?;
+        if plan.blocked {
+            return Err(anyhow!(
+                "job blocked by overlap policy '{}' due to high-risk overlaps",
+                plan.overlap_policy
+            ));
+        }
+        if plan.requires_approval && !approve_overlap {
+            return Err(anyhow!(
+                "job requires overlap approval; retry with approve_overlap=true"
+            ));
+        }
+
         let (project, foreman_id) = {
             let projects = self.projects.read().await;
             let project = projects.get(&project_id).context("project not found")?;
@@ -2960,7 +3037,10 @@ impl Foreman {
         let foreman_id = foreman_id.context("project has no foreman")?;
         let ts = now_ts();
         let job_id = Uuid::new_v4();
-        let worker_count = request.workers.len();
+        let worker_specs = self
+            .resolve_job_worker_specs(job_id, &project, workers)
+            .await?;
+        let worker_count = worker_specs.len();
         let project_path = project.runtime.path.to_string_lossy().to_string();
         let merge_strategy = project.config.jobs.defaults.merge_strategy.clone();
         let base_branch = if let Some(branch) = project.config.jobs.defaults.base_branch.clone() {
@@ -2968,47 +3048,18 @@ impl Foreman {
         } else {
             detect_base_branch(project_path.as_str()).await?
         };
-        let mut worker_ids = Vec::new();
+        let mut worker_ids = Vec::with_capacity(worker_count);
         let mut labels = HashMap::new();
+        let mut worker_names = HashMap::new();
+        let mut dependency_graph = HashMap::new();
 
-        for spec in request.workers {
-            let callback = self
-                .resolve_project_callback_spec(
-                    &project.config.callbacks.worker,
-                    &project.config.callbacks.profiles,
-                    &spec.callback_overrides,
-                    false,
-                )
-                .context("failed to resolve worker callback")?;
-
-            let worker_prompt = format!(
-                "{}\n\n{}{}\n",
-                project.runtime.worker_prompt,
-                constants::PROJECT_TASK_LABEL,
-                spec.prompt
-            );
-            let worker_id = Uuid::new_v4();
-            let mut worker_worktree: Option<(String, String)> = None;
-            let worker_cwd = if spec.worktree.is_some() {
-                self.resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
-                    .await?
-            } else if should_use_native_worktree(&project.config.jobs.defaults, worker_count) {
-                let worktree = self
-                    .create_worker_worktree(project_path.as_str(), job_id, worker_id)
-                    .await?;
-                let cwd = worktree.0.clone();
-                worker_worktree = Some(worktree);
-                cwd
-            } else {
-                spec.cwd.unwrap_or(project_path.clone())
-            };
-
+        for spec in worker_specs {
             let spawn_request = SpawnAgentRequest {
-                prompt: worker_prompt,
-                model: spec.model,
-                model_provider: spec.model_provider,
-                cwd: Some(worker_cwd),
-                sandbox: spec.sandbox,
+                prompt: String::new(),
+                model: spec.model.clone(),
+                model_provider: spec.model_provider.clone(),
+                cwd: Some(spec.cwd.clone()),
+                sandbox: spec.sandbox.clone(),
                 callback_profile: None,
                 callback_prompt_prefix: None,
                 callback_args: None,
@@ -3018,25 +3069,35 @@ impl Foreman {
 
             let response = self
                 .spawn_agent_record(
-                    Some(worker_id),
+                    Some(spec.worker_id),
                     spawn_request,
                     AgentRole::Worker,
                     Some(project_id),
                     Some(foreman_id),
                     Some(job_id),
-                    callback,
+                    spec.callback.clone(),
                 )
                 .await
                 .context("failed to spawn project worker")?;
 
-            if let Some((worktree_path, branch_name)) = worker_worktree {
+            {
                 let mut agents = self.agents.write().await;
                 if let Some(agent) = agents.get_mut(&response.id) {
-                    agent.worktree_path = Some(worktree_path);
-                    agent.branch_name = Some(branch_name);
+                    agent.prompt = Some(spec.prompt.clone());
+                    if let Some(worktree_path) = spec.worktree_path.clone() {
+                        agent.worktree_path = Some(worktree_path.clone());
+                        agent.checkpoint.worktree_path = Some(worktree_path);
+                    }
+                    if let Some(branch_name) = spec.branch_name.clone() {
+                        agent.branch_name = Some(branch_name.clone());
+                        agent.checkpoint.branch_name = Some(branch_name);
+                    }
+                    agent.updated_at = now_ts();
                 }
             }
 
+            worker_names.insert(response.id, spec.worker_name);
+            dependency_graph.insert(response.id, spec.depends_on.clone());
             labels.insert(response.id, spec.labels);
             worker_ids.push(response.id);
         }
@@ -3062,6 +3123,9 @@ impl Foreman {
                     worker_labels: labels,
                     merged_branches: Vec::new(),
                     merge_conflicts: Vec::new(),
+                    worker_names,
+                    dependency_graph,
+                    blocked_reasons: HashMap::new(),
                     base_branch,
                     merge_strategy,
                     created_at: ts,
@@ -3071,15 +3135,281 @@ impl Foreman {
             );
         }
 
+        self.launch_runnable_workers(job_id).await?;
+        let _ = self.update_job_after_worker_event(job_id, None).await;
         self.schedule_state_persist();
+        let status = self
+            .jobs
+            .read()
+            .await
+            .get(&job_id)
+            .map(|job| job.status.clone())
+            .unwrap_or_else(|| constants::JOB_STATUS_RUNNING.to_string());
         Ok(CreateProjectJobsResponse {
             job_id,
             project_id,
-            status: constants::JOB_STATUS_RUNNING.to_string(),
+            status,
             worker_ids: worker_ids.clone(),
             worker_count: worker_ids.len(),
             labels: job_labels,
         })
+    }
+
+    pub async fn plan_project_jobs(
+        &self,
+        project_id: Uuid,
+        request: PlanProjectJobsRequest,
+    ) -> Result<PlanProjectJobsResponse> {
+        if request.workers.is_empty() {
+            return Err(anyhow!("at least one worker spec is required"));
+        }
+
+        let project = {
+            let projects = self.projects.read().await;
+            projects
+                .get(&project_id)
+                .cloned()
+                .context("project not found")?
+        };
+        let names = assign_worker_names(&request.workers)?;
+        let matrix = build_overlap_matrix(&names, &request.workers, &request.declared_scope_paths);
+        let high_risk_pairs = matrix.iter().filter(|entry| entry.risk == "high").count();
+        let overlap_policy = project.config.policy.overlap_policy.clone();
+        let blocked = overlap_policy == "block" && high_risk_pairs > 0;
+        let requires_approval = overlap_policy == "require_approve" && high_risk_pairs > 0;
+
+        Ok(PlanProjectJobsResponse {
+            project_id,
+            overlap_policy,
+            blocked,
+            requires_approval,
+            high_risk_pairs,
+            matrix,
+        })
+    }
+
+    async fn resolve_job_worker_specs(
+        &self,
+        job_id: Uuid,
+        project: &ProjectRecord,
+        workers: Vec<crate::models::ProjectJobWorkerSpec>,
+    ) -> Result<Vec<JobWorkerSpecResolved>> {
+        let names = assign_worker_names(&workers)?;
+        let name_to_id = names
+            .iter()
+            .map(|name| (name.clone(), Uuid::new_v4()))
+            .collect::<HashMap<_, _>>();
+        let project_path = project.runtime.path.to_string_lossy().to_string();
+        let worker_count = workers.len();
+        let mut resolved = Vec::with_capacity(workers.len());
+
+        for (index, spec) in workers.into_iter().enumerate() {
+            let worker_name = names
+                .get(index)
+                .cloned()
+                .context("missing worker name")?;
+            let worker_id = *name_to_id
+                .get(worker_name.as_str())
+                .context("missing worker id mapping")?;
+            let callback = self
+                .resolve_project_callback_spec(
+                    &project.config.callbacks.worker,
+                    &project.config.callbacks.profiles,
+                    &spec.callback_overrides,
+                    false,
+                )
+                .context("failed to resolve worker callback")?;
+
+            let worker_prompt = format!(
+                "{}\n\n{}{}\n",
+                project.runtime.worker_prompt,
+                constants::PROJECT_TASK_LABEL,
+                spec.prompt
+            );
+            let mut worker_worktree: Option<(String, String)> = None;
+            let worker_cwd = if spec.worktree.is_some() {
+                self.resolve_worker_cwd(&project_path, spec.cwd.clone(), spec.worktree.as_ref())
+                    .await?
+            } else if should_use_native_worktree(&project.config.jobs.defaults, worker_count) {
+                let worktree = self
+                    .create_worker_worktree(project_path.as_str(), job_id, worker_id)
+                    .await?;
+                let cwd = worktree.0.clone();
+                worker_worktree = Some(worktree);
+                cwd
+            } else {
+                spec.cwd.clone().unwrap_or(project_path.clone())
+            };
+
+            let depends_on = spec
+                .depends_on
+                .iter()
+                .map(|dep_name| {
+                    if dep_name == &worker_name {
+                        return Err(anyhow!("worker '{worker_name}' cannot depend on itself"));
+                    }
+                    name_to_id
+                        .get(dep_name)
+                        .copied()
+                        .ok_or_else(|| anyhow!("worker '{worker_name}' depends on unknown worker '{dep_name}'"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            resolved.push(JobWorkerSpecResolved {
+                worker_id,
+                worker_name,
+                prompt: worker_prompt,
+                labels: spec.labels,
+                callback,
+                model: spec.model,
+                model_provider: spec.model_provider,
+                sandbox: spec.sandbox,
+                cwd: worker_cwd,
+                worktree_path: worker_worktree.as_ref().map(|value| value.0.clone()),
+                branch_name: worker_worktree.as_ref().map(|value| value.1.clone()),
+                depends_on,
+            });
+        }
+
+        assert_dependency_graph_acyclic(
+            &resolved
+                .iter()
+                .map(|spec| (spec.worker_id, spec.depends_on.clone()))
+                .collect::<HashMap<_, _>>(),
+        )?;
+
+        Ok(resolved)
+    }
+
+    async fn launch_runnable_workers(self: &Arc<Self>, job_id: Uuid) -> Result<()> {
+        let (worker_ids, dependency_graph, worker_names, mut blocked_reasons) = {
+            let jobs = self.jobs.read().await;
+            let job = jobs.get(&job_id).context("job not found")?;
+            (
+                job.worker_ids.clone(),
+                job.dependency_graph.clone(),
+                job.worker_names.clone(),
+                job.blocked_reasons.clone(),
+            )
+        };
+
+        let mut to_start = Vec::new();
+        for worker_id in worker_ids {
+            let dependencies = dependency_graph
+                .get(&worker_id)
+                .cloned()
+                .unwrap_or_default();
+            let status = self
+                .dependency_status_for_worker(worker_id, dependencies.clone())
+                .await?;
+            match status {
+                DependencyStatus::Failed(failed_dep_id) => {
+                    let failed_name = worker_names
+                        .get(&failed_dep_id)
+                        .cloned()
+                        .unwrap_or_else(|| failed_dep_id.to_string());
+                    let reason = format!("blocked: dependency '{failed_name}' failed");
+                    blocked_reasons.insert(worker_id, reason.clone());
+                    let mut agents = self.agents.write().await;
+                    if let Some(agent) = agents.get_mut(&worker_id) {
+                        if agent.active_turn_id.is_none() && agent.result.is_none() {
+                            agent.status = constants::AGENT_STATUS_BLOCKED.to_string();
+                            agent.error = Some(reason.clone());
+                            agent.result = Some(AgentResult {
+                                agent_id: worker_id,
+                                status: constants::AGENT_STATUS_BLOCKED.to_string(),
+                                completion_method: Some("dependency_blocked".to_string()),
+                                turn_id: None,
+                                final_text: None,
+                                summary: Some(reason),
+                                references: None,
+                                completed_at: Some(now_ts()),
+                                event_id: None,
+                                error: None,
+                            });
+                            agent.updated_at = now_ts();
+                        }
+                    }
+                }
+                DependencyStatus::Satisfied => {
+                    blocked_reasons.remove(&worker_id);
+                    let should_start = {
+                        let agents = self.agents.read().await;
+                        match agents.get(&worker_id) {
+                            Some(agent) => {
+                                agent.active_turn_id.is_none()
+                                    && agent.result.is_none()
+                                    && !agent.prompt.as_deref().unwrap_or("").trim().is_empty()
+                            }
+                            None => false,
+                        }
+                    };
+                    if should_start {
+                        to_start.push(worker_id);
+                    }
+                }
+                DependencyStatus::Pending => {}
+            }
+        }
+
+        if !to_start.is_empty() || !blocked_reasons.is_empty() {
+            let mut jobs = self.jobs.write().await;
+            if let Some(job) = jobs.get_mut(&job_id) {
+                job.blocked_reasons = blocked_reasons;
+                job.updated_at = now_ts();
+            }
+        }
+
+        for worker_id in to_start {
+            let prompt = {
+                let agents = self.agents.read().await;
+                agents
+                    .get(&worker_id)
+                    .and_then(|agent| agent.prompt.clone())
+                    .unwrap_or_default()
+            };
+            if prompt.trim().is_empty() {
+                continue;
+            }
+            let _ = self.start_agent_turn(worker_id, prompt).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn dependency_status_for_worker(
+        &self,
+        worker_id: Uuid,
+        dependencies: Vec<Uuid>,
+    ) -> Result<DependencyStatus> {
+        if dependencies.is_empty() {
+            return Ok(DependencyStatus::Satisfied);
+        }
+        let agents = self.agents.read().await;
+        let _ = worker_id;
+        let mut all_satisfied = true;
+        for dependency in dependencies {
+            let Some(dep_agent) = agents.get(&dependency) else {
+                all_satisfied = false;
+                continue;
+            };
+            if let Some(result) = dep_agent.result.as_ref() {
+                if is_worker_failure(result) {
+                    return Ok(DependencyStatus::Failed(dependency));
+                }
+                if !is_worker_success(result) {
+                    all_satisfied = false;
+                }
+            } else {
+                all_satisfied = false;
+            }
+        }
+
+        if all_satisfied {
+            Ok(DependencyStatus::Satisfied)
+        } else {
+            Ok(DependencyStatus::Pending)
+        }
     }
 
     async fn resolve_worker_cwd(
@@ -3334,6 +3664,8 @@ impl Foreman {
                         reason: agent.throttle_reason.clone(),
                     })
                     .collect(),
+                dependency_graph: job.dependency_graph.clone(),
+                blocked_reasons: job.blocked_reasons.clone(),
             })
             .collect()
     }
@@ -3368,6 +3700,8 @@ impl Foreman {
                     reason: agent.throttle_reason.clone(),
                 })
                 .collect(),
+            dependency_graph: job.dependency_graph.clone(),
+            blocked_reasons: job.blocked_reasons.clone(),
         })
     }
 
@@ -3414,6 +3748,7 @@ impl Foreman {
             }
 
             if response.status == constants::AGENT_STATUS_FAILED
+                || response.status == constants::AGENT_STATUS_BLOCKED
                 || matches!(
                     response.completion_method.as_deref(),
                     Some(constants::EVENT_METHOD_TURN_ABORTED)
@@ -3456,6 +3791,8 @@ impl Foreman {
             labels: aggregate_worker_labels(&job.worker_labels),
             merged_branches: job.merged_branches.clone(),
             merge_conflicts: job.merge_conflicts.clone(),
+            dependency_graph: job.dependency_graph.clone(),
+            blocked_reasons: job.blocked_reasons.clone(),
         })
     }
 
@@ -3526,6 +3863,8 @@ impl Foreman {
                             labels: HashMap::new(),
                             merged_branches: Vec::new(),
                             merge_conflicts: Vec::new(),
+                            dependency_graph: HashMap::new(),
+                            blocked_reasons: HashMap::new(),
                         },
                         timed_out: true,
                     });
@@ -3860,6 +4199,87 @@ impl Foreman {
             project_id: updated_agent.project_id,
             role: updated_agent.role.as_str().to_string(),
             foreman_id: updated_agent.foreman_id,
+        })
+    }
+
+    pub async fn retry_agent(
+        self: &Arc<Self>,
+        agent_id: Uuid,
+        request: RetryAgentRequest,
+    ) -> Result<RetryAgentResponse> {
+        let requested_mode = request.mode.trim().to_lowercase();
+        if requested_mode != "last-turn" && requested_mode != "checkpoint" {
+            return Err(anyhow!("retry mode must be 'last-turn' or 'checkpoint'"));
+        }
+
+        let snapshot = {
+            let agents = self.agents.read().await;
+            let agent = agents.get(&agent_id).context("agent not found")?;
+            (agent.prompt.clone(), agent.checkpoint.clone())
+        };
+        let (last_prompt, checkpoint) = snapshot;
+        let checkpoint_available = checkpoint.last_successful_turn_id.is_some();
+        let selected_mode = if requested_mode == "checkpoint" && !checkpoint_available {
+            "last-turn".to_string()
+        } else {
+            requested_mode
+        };
+
+        let retry_prompt = if selected_mode == "checkpoint" {
+            format!(
+                "Resume from checkpoint. Last successful turn id: {}. Continue from current branch/worktree and finish pending work.",
+                checkpoint
+                    .last_successful_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        } else {
+            last_prompt.unwrap_or_default()
+        };
+
+        if retry_prompt.trim().is_empty() {
+            return Err(anyhow!(
+                "retry is unavailable because there is no prior prompt for this agent"
+            ));
+        }
+
+        {
+            let mut agents = self.agents.write().await;
+            let agent = agents.get_mut(&agent_id).context("agent not found")?;
+            agent.prompt = Some(retry_prompt.clone());
+            if selected_mode == "checkpoint" {
+                if agent.worktree_path.is_none() {
+                    agent.worktree_path = checkpoint.worktree_path.clone();
+                }
+                if agent.branch_name.is_none() {
+                    agent.branch_name = checkpoint.branch_name.clone();
+                }
+                agent.validation_retries = checkpoint.validation_retries;
+                agent.last_validation_error = checkpoint.last_validation_error.clone();
+            }
+            agent.checkpoint.retry_count = agent.checkpoint.retry_count.saturating_add(1);
+            agent.updated_at = now_ts();
+        }
+
+        let restarted_turn_id = self.start_agent_turn(agent_id, retry_prompt).await?;
+
+        {
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.active_turn_id = restarted_turn_id.clone();
+                if restarted_turn_id.is_some() {
+                    agent.status = constants::AGENT_STATUS_RUNNING.to_string();
+                }
+                agent.updated_at = now_ts();
+            }
+        }
+        self.schedule_state_persist();
+
+        Ok(RetryAgentResponse {
+            agent_id,
+            selected_mode,
+            restarted_turn_id,
+            checkpoint_available,
         })
     }
 
@@ -4655,6 +5075,7 @@ impl Foreman {
                 throttle_reason: None,
                 failure_report: None,
                 budget: WorkerBudgetState::new(),
+                checkpoint: WorkerCheckpoint::default(),
                 status: constants::AGENT_STATUS_IDLE.into(),
                 callback,
                 role: role.clone(),
@@ -5461,8 +5882,185 @@ fn is_worker_failure(result: &AgentResult) -> bool {
     result.completion_method.as_deref() == Some(constants::EVENT_METHOD_TURN_ABORTED)
         || matches!(
             result.status.as_str(),
-            constants::AGENT_STATUS_ABORTED | constants::AGENT_STATUS_FAILED
+            constants::AGENT_STATUS_ABORTED
+                | constants::AGENT_STATUS_FAILED
+                | constants::AGENT_STATUS_BLOCKED
         )
+}
+
+fn is_worker_success(result: &AgentResult) -> bool {
+    result.completed_at.is_some() && !is_worker_failure(result)
+}
+
+fn assign_worker_names(workers: &[crate::models::ProjectJobWorkerSpec]) -> Result<Vec<String>> {
+    let mut names = Vec::with_capacity(workers.len());
+    let mut seen = std::collections::HashSet::new();
+    for (index, worker) in workers.iter().enumerate() {
+        let default_name = format!("worker-{}", index + 1);
+        let name = worker
+            .name
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_name);
+        if !seen.insert(name.clone()) {
+            return Err(anyhow!("duplicate worker name '{name}'"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+fn build_overlap_matrix(
+    names: &[String],
+    workers: &[crate::models::ProjectJobWorkerSpec],
+    declared_scope_paths: &HashMap<String, Vec<String>>,
+) -> Vec<OverlapRiskEntry> {
+    let mut matrix = Vec::new();
+    for i in 0..workers.len() {
+        for j in (i + 1)..workers.len() {
+            let left_name = names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("worker-{}", i + 1));
+            let right_name = names
+                .get(j)
+                .cloned()
+                .unwrap_or_else(|| format!("worker-{}", j + 1));
+            let mut reasons = Vec::new();
+            let mut score = 0u8;
+
+            let left_scope = combined_scope_paths(
+                workers.get(i).cloned(),
+                declared_scope_paths.get(left_name.as_str()),
+            );
+            let right_scope = combined_scope_paths(
+                workers.get(j).cloned(),
+                declared_scope_paths.get(right_name.as_str()),
+            );
+            let exact_overlap = left_scope
+                .iter()
+                .filter(|path| right_scope.contains(*path))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !exact_overlap.is_empty() {
+                score = score.saturating_add(5);
+                reasons.push(format!(
+                    "declared path overlap: {}",
+                    exact_overlap.join(", ")
+                ));
+            } else if left_scope.iter().any(|left| {
+                right_scope
+                    .iter()
+                    .any(|right| left.starts_with(right) || right.starts_with(left))
+            }) {
+                score = score.saturating_add(3);
+                reasons.push("scope path prefix overlap".to_string());
+            }
+
+            let left_hints = extract_path_hints(&workers[i].prompt);
+            let right_hints = extract_path_hints(&workers[j].prompt);
+            let shared_hints = left_hints
+                .iter()
+                .filter(|hint| right_hints.contains(*hint))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !shared_hints.is_empty() {
+                score = score.saturating_add(2);
+                reasons.push(format!("shared prompt path hints: {}", shared_hints.join(", ")));
+            }
+
+            let risk = if score >= 5 {
+                "high".to_string()
+            } else if score >= 3 {
+                "medium".to_string()
+            } else {
+                "low".to_string()
+            };
+            matrix.push(OverlapRiskEntry {
+                worker_a: left_name,
+                worker_b: right_name,
+                risk,
+                score,
+                reasons,
+            });
+        }
+    }
+    matrix
+}
+
+fn combined_scope_paths(
+    worker: Option<crate::models::ProjectJobWorkerSpec>,
+    declared_scope_paths: Option<&Vec<String>>,
+) -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    if let Some(worker) = worker {
+        for path in worker.scope_paths {
+            let normalized = normalize_scope_path(path.as_str());
+            if !normalized.is_empty() {
+                paths.insert(normalized);
+            }
+        }
+    }
+    if let Some(extra) = declared_scope_paths {
+        for path in extra {
+            let normalized = normalize_scope_path(path.as_str());
+            if !normalized.is_empty() {
+                paths.insert(normalized);
+            }
+        }
+    }
+    paths
+}
+
+fn normalize_scope_path(path: &str) -> String {
+    path.trim_matches(|ch: char| ch.is_whitespace() || ch == '"' || ch == '\'')
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn extract_path_hints(prompt: &str) -> std::collections::HashSet<String> {
+    prompt
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| ",:;()[]{}\"'`".contains(ch)))
+        .filter(|token| token.contains('/') || token.ends_with(".rs") || token.ends_with(".md"))
+        .map(normalize_scope_path)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn assert_dependency_graph_acyclic(dependency_graph: &HashMap<Uuid, Vec<Uuid>>) -> Result<()> {
+    let mut marks = HashMap::<Uuid, u8>::new();
+    for worker in dependency_graph.keys().copied() {
+        if detect_cycle(worker, dependency_graph, &mut marks) {
+            return Err(anyhow!("dependency graph contains a cycle"));
+        }
+    }
+    Ok(())
+}
+
+fn detect_cycle(
+    worker: Uuid,
+    dependency_graph: &HashMap<Uuid, Vec<Uuid>>,
+    marks: &mut HashMap<Uuid, u8>,
+) -> bool {
+    if matches!(marks.get(&worker), Some(1)) {
+        return true;
+    }
+    if matches!(marks.get(&worker), Some(2)) {
+        return false;
+    }
+    marks.insert(worker, 1);
+    if let Some(deps) = dependency_graph.get(&worker) {
+        for dep in deps {
+            if detect_cycle(*dep, dependency_graph, marks) {
+                return true;
+            }
+        }
+    }
+    marks.insert(worker, 2);
+    false
 }
 
 fn build_completion_result(
@@ -6022,6 +6620,22 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
     let governor_key = record
         .governor_key
         .or_else(|| governor_key(model_provider.as_deref(), model.as_deref()));
+    let checkpoint = record
+        .checkpoint
+        .map(restore_worker_checkpoint)
+        .unwrap_or(WorkerCheckpoint {
+            last_successful_turn_id: record
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.method == constants::EVENT_METHOD_TURN_COMPLETED)
+                .and_then(|event| parse_turn_id(&event.params)),
+            worktree_path: record.worktree_path.clone(),
+            branch_name: record.branch_name.clone(),
+            validation_retries: record.validation_retries,
+            last_validation_error: record.last_validation_error.clone(),
+            retry_count: 0,
+        });
 
     Ok(AgentRecord {
         id,
@@ -6047,6 +6661,7 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
             .budget
             .map(restore_worker_budget)
             .unwrap_or_else(WorkerBudgetState::new),
+        checkpoint,
         status,
         callback,
         role,
@@ -6087,6 +6702,32 @@ fn restore_job_record(record: PersistedJobRecord) -> Result<JobRecord> {
         worker_labels.insert(worker_id, labels);
     }
 
+    let mut worker_names = HashMap::new();
+    for (worker_id, name) in record.worker_names {
+        let worker_id = Uuid::parse_str(&worker_id)
+            .context("invalid persisted job worker id in worker_names")?;
+        worker_names.insert(worker_id, name);
+    }
+
+    let mut dependency_graph = HashMap::new();
+    for (worker_id, deps) in record.dependency_graph {
+        let worker_id =
+            Uuid::parse_str(&worker_id).context("invalid persisted job worker id in deps")?;
+        let parsed_deps = deps
+            .into_iter()
+            .map(|dep| Uuid::parse_str(&dep))
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid persisted job dependency worker id")?;
+        dependency_graph.insert(worker_id, parsed_deps);
+    }
+
+    let mut blocked_reasons = HashMap::new();
+    for (worker_id, reason) in record.blocked_reasons {
+        let worker_id = Uuid::parse_str(&worker_id)
+            .context("invalid persisted job worker id in blocked_reasons")?;
+        blocked_reasons.insert(worker_id, reason);
+    }
+
     Ok(JobRecord {
         id,
         project_id,
@@ -6095,6 +6736,9 @@ fn restore_job_record(record: PersistedJobRecord) -> Result<JobRecord> {
         worker_labels,
         merged_branches: record.merged_branches,
         merge_conflicts: record.merge_conflicts,
+        worker_names,
+        dependency_graph,
+        blocked_reasons,
         base_branch: record.base_branch.unwrap_or_else(|| "main".to_string()),
         merge_strategy: record
             .merge_strategy
@@ -6172,6 +6816,7 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         throttle_reason: agent.throttle_reason.clone(),
         failure_report: agent.failure_report.clone(),
         budget: Some(persist_worker_budget(&agent.budget)),
+        checkpoint: Some(persist_worker_checkpoint(&agent.checkpoint)),
         status: agent.status.clone(),
         callback,
         role,
@@ -6201,6 +6846,26 @@ fn persisted_job_record(job: &JobRecord) -> PersistedJobRecord {
         merge_conflicts: job.merge_conflicts.clone(),
         base_branch: Some(job.base_branch.clone()),
         merge_strategy: Some(job.merge_strategy.clone()),
+        worker_names: job
+            .worker_names
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.clone()))
+            .collect(),
+        dependency_graph: job
+            .dependency_graph
+            .iter()
+            .map(|(id, deps)| {
+                (
+                    id.to_string(),
+                    deps.iter().map(|dep| dep.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect(),
+        blocked_reasons: job
+            .blocked_reasons
+            .iter()
+            .map(|(id, reason)| (id.to_string(), reason.clone()))
+            .collect(),
         created_at: job.created_at,
         completed_at: job.completed_at,
         updated_at: job.updated_at,
@@ -6275,6 +6940,28 @@ fn persist_worker_budget(value: &WorkerBudgetState) -> PersistedWorkerBudget {
         exceeded: value.exceeded,
         exceeded_reason: value.exceeded_reason.clone(),
         paused_reason: value.paused_reason.clone(),
+    }
+}
+
+fn restore_worker_checkpoint(value: PersistedWorkerCheckpoint) -> WorkerCheckpoint {
+    WorkerCheckpoint {
+        last_successful_turn_id: value.last_successful_turn_id,
+        worktree_path: value.worktree_path,
+        branch_name: value.branch_name,
+        validation_retries: value.validation_retries,
+        last_validation_error: value.last_validation_error,
+        retry_count: value.retry_count,
+    }
+}
+
+fn persist_worker_checkpoint(value: &WorkerCheckpoint) -> PersistedWorkerCheckpoint {
+    PersistedWorkerCheckpoint {
+        last_successful_turn_id: value.last_successful_turn_id.clone(),
+        worktree_path: value.worktree_path.clone(),
+        branch_name: value.branch_name.clone(),
+        validation_retries: value.validation_retries,
+        last_validation_error: value.last_validation_error.clone(),
+        retry_count: value.retry_count,
     }
 }
 
@@ -6870,7 +7557,8 @@ fn is_job_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRecord, AgentRole, Foreman, GovernorState, WorkerBudgetState, WorkerCallback,
+        AgentRecord, AgentRole, Foreman, GovernorState, JobRecord, WorkerBudgetState,
+        WorkerCallback, WorkerCheckpoint, assign_worker_names, build_overlap_matrix, now_ts,
         apply_budget_transition, build_worker_branch_name, build_worker_worktree_path,
         callback_timeout_ms, classify_failure_from_error, continuation_prompt_for_turn,
         evaluate_budget, governor_apply_rate_limit, governor_apply_success, render_template,
@@ -6884,7 +7572,9 @@ mod tests {
     use crate::state::{PersistedAgentRecord, PersistedState, PersistedWorkerCallback};
     use crate::{
         config::ServiceConfig,
-        models::{AgentResult, FailureClass},
+        models::{
+            AgentResult, FailureClass, ProjectJobWorkerSpec, RetryAgentRequest,
+        },
     };
     use codex_api::AppServerClient;
     use serde_json::json;
@@ -7378,6 +8068,211 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retry_mode_selects_last_turn_when_checkpoint_missing_and_checkpoint_when_present() {
+        let fake_codex = test_fake_codex_binary();
+        let state_dir = tempdir().expect("temp state directory");
+        let state_path = state_dir.path().join("foreman-state.json");
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let client = AppServerClient::connect(&fake_codex, &[], event_tx.clone())
+            .await
+            .expect("connect fake app-server");
+        let foreman = Foreman::new(
+            client,
+            event_rx,
+            ServiceConfig::default(),
+            PersistedState::default(),
+            state_path,
+        );
+
+        let spawned = foreman
+            .spawn_agent(crate::models::SpawnAgentRequest {
+                prompt: "implement changes".to_string(),
+                model: None,
+                model_provider: None,
+                cwd: None,
+                sandbox: None,
+                callback_profile: None,
+                callback_prompt_prefix: None,
+                callback_args: None,
+                callback_vars: None,
+                callback_events: None,
+            })
+            .await
+            .expect("spawn agent");
+
+        {
+            let mut agents = foreman.agents.write().await;
+            let agent = agents.get_mut(&spawned.id).expect("agent");
+            agent.checkpoint.last_successful_turn_id = None;
+            agent.checkpoint.worktree_path = None;
+            agent.checkpoint.branch_name = None;
+        }
+
+        let without_checkpoint = foreman
+            .retry_agent(
+                spawned.id,
+                RetryAgentRequest {
+                    mode: "checkpoint".to_string(),
+                },
+            )
+            .await
+            .expect("retry should fallback");
+        assert_eq!(without_checkpoint.selected_mode, "last-turn");
+        assert!(!without_checkpoint.checkpoint_available);
+
+        {
+            let mut agents = foreman.agents.write().await;
+            let agent = agents.get_mut(&spawned.id).expect("agent");
+            agent.checkpoint.last_successful_turn_id = Some("turn-checkpoint".to_string());
+        }
+
+        let with_checkpoint = foreman
+            .retry_agent(
+                spawned.id,
+                RetryAgentRequest {
+                    mode: "checkpoint".to_string(),
+                },
+            )
+            .await
+            .expect("retry with checkpoint");
+        assert_eq!(with_checkpoint.selected_mode, "checkpoint");
+        assert!(with_checkpoint.checkpoint_available);
+    }
+
+    #[test]
+    fn overlap_matrix_marks_scope_overlap_as_high_risk() {
+        let workers = vec![
+            ProjectJobWorkerSpec {
+                name: Some("worker-a".to_string()),
+                prompt: "Update src/core/lib.rs and docs/guide.md".to_string(),
+                depends_on: Vec::new(),
+                scope_paths: vec!["src/core".to_string()],
+                labels: HashMap::new(),
+                callback_overrides: crate::models::CallbackOverrides::default(),
+                model: None,
+                model_provider: None,
+                cwd: None,
+                worktree: None,
+                sandbox: None,
+            },
+            ProjectJobWorkerSpec {
+                name: Some("worker-b".to_string()),
+                prompt: "Refactor src/core/lib.rs API".to_string(),
+                depends_on: Vec::new(),
+                scope_paths: vec!["src/core/lib.rs".to_string()],
+                labels: HashMap::new(),
+                callback_overrides: crate::models::CallbackOverrides::default(),
+                model: None,
+                model_provider: None,
+                cwd: None,
+                worktree: None,
+                sandbox: None,
+            },
+        ];
+        let names = assign_worker_names(&workers).expect("assign names");
+        let matrix = build_overlap_matrix(&names, &workers, &HashMap::new());
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(matrix[0].risk, "high");
+        assert!(
+            matrix[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("overlap"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_failure_blocks_downstream_worker() {
+        let fake_codex = test_fake_codex_binary();
+        let state_dir = tempdir().expect("temp state directory");
+        let state_path = state_dir.path().join("foreman-state.json");
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let client = AppServerClient::connect(&fake_codex, &[], event_tx.clone())
+            .await
+            .expect("connect fake app-server");
+        let foreman = Foreman::new(
+            client,
+            event_rx,
+            ServiceConfig::default(),
+            PersistedState::default(),
+            state_path,
+        );
+
+        let upstream_id = Uuid::new_v4();
+        let downstream_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+
+        {
+            let mut agents = foreman.agents.write().await;
+            let mut upstream = sample_worker_agent();
+            upstream.id = upstream_id;
+            upstream.result = Some(AgentResult {
+                agent_id: upstream_id,
+                status: constants::AGENT_STATUS_FAILED.to_string(),
+                completion_method: Some(constants::EVENT_METHOD_TURN_ABORTED.to_string()),
+                turn_id: Some("turn-upstream".to_string()),
+                final_text: None,
+                summary: None,
+                references: None,
+                completed_at: Some(now_ts()),
+                event_id: None,
+                error: Some("failure".to_string()),
+            });
+
+            let mut downstream = sample_worker_agent();
+            downstream.id = downstream_id;
+            downstream.prompt = Some("downstream task".to_string());
+
+            agents.insert(upstream_id, upstream);
+            agents.insert(downstream_id, downstream);
+        }
+
+        {
+            let mut jobs = foreman.jobs.write().await;
+            jobs.insert(
+                job_id,
+                JobRecord {
+                    id: job_id,
+                    project_id: None,
+                    status: constants::JOB_STATUS_RUNNING.to_string(),
+                    worker_ids: vec![upstream_id, downstream_id],
+                    worker_labels: HashMap::new(),
+                    merged_branches: Vec::new(),
+                    merge_conflicts: Vec::new(),
+                    worker_names: HashMap::from([
+                        (upstream_id, "upstream".to_string()),
+                        (downstream_id, "downstream".to_string()),
+                    ]),
+                    dependency_graph: HashMap::from([(downstream_id, vec![upstream_id])]),
+                    blocked_reasons: HashMap::new(),
+                    base_branch: "main".to_string(),
+                    merge_strategy: "manual".to_string(),
+                    created_at: now_ts(),
+                    completed_at: None,
+                    updated_at: now_ts(),
+                },
+            );
+        }
+
+        foreman
+            .launch_runnable_workers(job_id)
+            .await
+            .expect("launch runnable");
+
+        let downstream = foreman
+            .agents
+            .read()
+            .await
+            .get(&downstream_id)
+            .cloned()
+            .expect("downstream");
+        assert_eq!(downstream.status, constants::AGENT_STATUS_BLOCKED);
+
+        let job = foreman.jobs.read().await.get(&job_id).cloned().expect("job");
+        assert!(job.blocked_reasons.contains_key(&downstream_id));
+    }
+
     #[test]
     fn resolve_agent_status_prefers_result_status_when_completed() {
         let agent_id = Uuid::new_v4();
@@ -7402,6 +8297,7 @@ mod tests {
             throttle_reason: None,
             failure_report: None,
             budget: WorkerBudgetState::new(),
+            checkpoint: WorkerCheckpoint::default(),
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -7451,6 +8347,7 @@ mod tests {
             throttle_reason: None,
             failure_report: None,
             budget: WorkerBudgetState::new(),
+            checkpoint: WorkerCheckpoint::default(),
             status: constants::AGENT_STATUS_IDLE.to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -7518,6 +8415,7 @@ mod tests {
                 throttle_reason: None,
                 failure_report: None,
                 budget: None,
+                checkpoint: None,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),

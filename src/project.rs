@@ -105,6 +105,8 @@ pub struct ProjectPolicy {
     pub bubble_up_events: Option<Vec<String>>,
     #[serde(default)]
     pub compact_after_turns: Option<u64>,
+    #[serde(default = "default_overlap_policy")]
+    pub overlap_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +162,7 @@ impl Default for ProjectPolicy {
                     .collect(),
             ),
             compact_after_turns: None,
+            overlap_policy: default_overlap_policy(),
         }
     }
 }
@@ -241,6 +244,15 @@ impl ProjectConfig {
                     constants::ERROR_CODE_CFG_PROJECT_VALIDATION
                 )
             })?;
+        }
+        if self.policy.overlap_policy != "warn"
+            && self.policy.overlap_policy != "require_approve"
+            && self.policy.overlap_policy != "block"
+        {
+            anyhow::bail!(
+                "{} policy.overlap_policy must be 'warn', 'require_approve', or 'block'",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            );
         }
         Ok(())
     }
@@ -502,7 +514,7 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
     }
 
     if let Some(policy) = root.get("policy").and_then(toml::Value::as_table) {
-        let policy_allowed = ["bubble_up_events", "compact_after_turns"];
+        let policy_allowed = ["bubble_up_events", "compact_after_turns", "overlap_policy"];
         push_unknown_table_keys(policy, "policy", &policy_allowed, report);
     }
 
@@ -651,4 +663,8 @@ fn default_worktree_mode() -> String {
 
 fn default_merge_strategy() -> String {
     "manual".to_string()
+}
+
+fn default_overlap_policy() -> String {
+    "warn".to_string()
 }

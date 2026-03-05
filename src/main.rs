@@ -39,9 +39,9 @@ use config::{CallbackProfile, RuntimeAuthConfig, ServiceConfig};
 use constants as consts;
 use foreman::Foreman;
 use models::{
-    CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, ReloadProjectResponse,
-    SendAgentInput, SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest,
-    SteerAgentInput,
+    CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, PlanProjectJobsRequest,
+    ReloadProjectResponse, RetryAgentRequest, SendAgentInput, SpawnAgentRequest,
+    SpawnProjectRequest, SpawnProjectWorkerRequest, SteerAgentInput,
 };
 use project::{ProjectConfig, ProjectLintIssue, lint_project_toml};
 use state::PersistedState;
@@ -320,6 +320,7 @@ async fn run() -> anyhow::Result<()> {
             .route(consts::ROUTE_AGENT_SEND, post(send_turn))
             .route(consts::ROUTE_AGENT_STEER, post(steer_agent))
             .route(consts::ROUTE_AGENT_INTERRUPT, post(interrupt_agent))
+            .route(consts::ROUTE_AGENT_RETRY, post(retry_agent))
             .route(
                 consts::ROUTE_PROJECTS,
                 post(create_project).get(list_projects),
@@ -344,6 +345,7 @@ async fn run() -> anyhow::Result<()> {
             )
             .route(consts::ROUTE_PROJECT_COMPACT, post(compact_project))
             .route(consts::ROUTE_PROJECT_JOBS, post(create_project_jobs))
+            .route(consts::ROUTE_PROJECT_JOBS_PLAN, post(plan_project_jobs))
             .route(consts::ROUTE_JOBS, get(list_jobs))
             .route(consts::ROUTE_JOB_ID, get(get_job))
             .route(consts::ROUTE_JOB_RESULT, get(get_job_result))
@@ -1253,6 +1255,17 @@ async fn interrupt_agent(
     .into_response()
 }
 
+async fn retry_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<Uuid>,
+    Json(req): Json<RetryAgentRequest>,
+) -> impl IntoResponse {
+    match state.foreman.retry_agent(agent_id, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
 async fn close_agent(
     State(state): State<AppState>,
     Path(agent_id): Path<Uuid>,
@@ -1391,6 +1404,17 @@ async fn create_project_jobs(
 ) -> impl IntoResponse {
     match state.foreman.create_project_jobs(project_id, request).await {
         Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn plan_project_jobs(
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<PlanProjectJobsRequest>,
+) -> impl IntoResponse {
+    match state.foreman.plan_project_jobs(project_id, request).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, err),
     }
 }

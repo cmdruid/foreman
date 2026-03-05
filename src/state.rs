@@ -163,6 +163,8 @@ pub struct PersistedAgentRecord {
     pub failure_report: Option<FailureReport>,
     #[serde(default)]
     pub budget: Option<PersistedWorkerBudget>,
+    #[serde(default)]
+    pub checkpoint: Option<PersistedWorkerCheckpoint>,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,
@@ -176,6 +178,22 @@ pub struct PersistedAgentRecord {
     pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<AgentEventDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedWorkerCheckpoint {
+    #[serde(default)]
+    pub last_successful_turn_id: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub branch_name: Option<String>,
+    #[serde(default)]
+    pub validation_retries: u32,
+    #[serde(default)]
+    pub last_validation_error: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +256,12 @@ pub struct PersistedJobRecord {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub merge_strategy: Option<String>,
+    #[serde(default)]
+    pub worker_names: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub dependency_graph: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub blocked_reasons: std::collections::HashMap<String, String>,
     pub created_at: u64,
     pub completed_at: Option<u64>,
     pub updated_at: u64,
