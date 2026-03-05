@@ -36,6 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "0.8"
 codex-api = { path = "crates/codex-api" }
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -302,6 +302,18 @@ pub struct WorkerLogEntry {
     pub at: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolFilterCallbackPayload {
+    pub worker_id: Uuid,
+    pub job_id: Option<Uuid>,
+    pub project_id: Uuid,
+    pub filter_name: String,
+    pub tool: String,
+    pub command: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output_tail: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

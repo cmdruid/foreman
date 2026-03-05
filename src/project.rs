@@ -3,7 +3,10 @@ use std::{collections::HashMap, fs, path::Path, path::PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::CallbackProfile, constants};
+use crate::{
+    config::{CallbackFilter, CallbackProfile},
+    constants,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
@@ -48,6 +51,8 @@ impl Default for ProjectPrompts {
 pub struct ProjectCallbacks {
     #[serde(default)]
     pub profiles: HashMap<String, CallbackProfile>,
+    #[serde(default)]
+    pub filters: Vec<CallbackFilter>,
     #[serde(default)]
     pub worker: CallbackSpec,
     #[serde(default)]
@@ -390,8 +395,34 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
     }
 
     if let Some(callbacks) = root.get("callbacks").and_then(toml::Value::as_table) {
-        let callbacks_allowed = ["profiles", "worker", "foreman", "bubble_up", "lifecycle"];
+        let callbacks_allowed = [
+            "profiles",
+            "filters",
+            "worker",
+            "foreman",
+            "bubble_up",
+            "lifecycle",
+        ];
         push_unknown_table_keys(callbacks, "callbacks", &callbacks_allowed, report);
+
+        if let Some(filters) = callbacks.get("filters").and_then(toml::Value::as_array) {
+            for (index, filter) in filters.iter().enumerate() {
+                if let Some(filter) = filter.as_table() {
+                    push_unknown_table_keys(
+                        filter,
+                        &format!("callbacks.filters[{index}]"),
+                        &[
+                            "name",
+                            "callback_profile",
+                            "tool",
+                            "command_pattern",
+                            "debounce_ms",
+                        ],
+                        report,
+                    );
+                }
+            }
+        }
 
         for spec_name in ["worker", "foreman", "bubble_up"] {
             if let Some(spec) = callbacks.get(spec_name).and_then(toml::Value::as_table) {
@@ -526,6 +557,21 @@ fn validate_callback_profile_references(
                 code: constants::ERROR_CODE_CFG_CALLBACK_PROFILE_MISSING,
                 path: format!("{spec_path}.callback_profile"),
                 message: format!("unknown callback profile '{profile_name}'"),
+            });
+        }
+    }
+
+    for (index, filter) in config.callbacks.filters.iter().enumerate() {
+        if !config
+            .callbacks
+            .profiles
+            .contains_key(filter.callback_profile.as_str())
+            && !service_callback_profiles.contains_key(filter.callback_profile.as_str())
+        {
+            report.issues.push(ProjectLintIssue {
+                code: constants::ERROR_CODE_CFG_CALLBACK_PROFILE_MISSING,
+                path: format!("callbacks.filters[{index}].callback_profile"),
+                message: format!("unknown callback profile '{}'", filter.callback_profile),
             });
         }
     }

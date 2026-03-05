@@ -131,6 +131,16 @@ pub struct CallbackRegistry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallbackFilter {
+    pub name: String,
+    pub callback_profile: String,
+    pub tool: String,
+    pub command_pattern: String,
+    #[serde(default)]
+    pub debounce_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum CallbackProfile {
     Webhook(WebhookCallbackProfile),

@@ -12,6 +12,7 @@ use codex_api::{
     AppServerClient, EmptyResponse, RawNotification, TextPayload, ThreadStartRequest,
     TurnInterruptRequest, TurnStartRequest, TurnSteerRequest, parse_thread_id, parse_turn_id,
 };
+use regex::RegexBuilder;
 use reqwest::Client as HttpClient;
 use serde_json::Value;
 use tokio::{
@@ -24,8 +25,8 @@ use uuid::Uuid;
 
 use crate::{
     config::{
-        CallbackProfile, CommandCallbackProfile, ServiceConfig, UnixSocketCallbackProfile,
-        WebhookCallbackProfile,
+        CallbackFilter, CallbackProfile, CommandCallbackProfile, ServiceConfig,
+        UnixSocketCallbackProfile, WebhookCallbackProfile,
     },
     constants,
     events::events_allowed,
@@ -35,7 +36,7 @@ use crate::{
         JobEventEnvelope, JobResult, JobState, ProjectCallbackStatusResponse, ProjectState,
         SendAgentInput, SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest,
         SpawnProjectWorkerRequest, SpawnProjectWorkerResponse, SteerAgentInput, ToolCallSummary,
-        WorkerLogEntry, WorkerWorktreeSpec,
+        ToolFilterCallbackPayload, WorkerLogEntry, WorkerWorktreeSpec,
     },
     project::{
         CallbackSpec, JobDefaultsConfig, ProjectConfig, ProjectRuntimeFiles, ValidationConfig,
@@ -163,6 +164,14 @@ struct CallbackEventContext {
 }
 
 #[derive(Debug, Clone)]
+struct ToolFilterDispatchContext {
+    agent_id: Uuid,
+    job_id: Option<Uuid>,
+    project_id: Uuid,
+    params: Value,
+}
+
+#[derive(Debug, Clone)]
 struct ProjectRecord {
     id: Uuid,
     path: String,
@@ -188,6 +197,7 @@ pub struct Foreman {
     thread_map: RwLock<HashMap<String, Uuid>>,
     projects: RwLock<HashMap<Uuid, ProjectRecord>>,
     jobs: RwLock<HashMap<Uuid, JobRecord>>,
+    callback_filter_debounce: RwLock<HashMap<(Uuid, String), u64>>,
     job_event_tx: broadcast::Sender<JobEventEnvelope>,
     worktree_lock: Mutex<()>,
     started_at: u64,
@@ -212,6 +222,7 @@ impl Foreman {
             thread_map: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
+            callback_filter_debounce: RwLock::new(HashMap::new()),
             job_event_tx: broadcast::channel(constants::JOB_EVENT_CHANNEL_CAPACITY).0,
             worktree_lock: Mutex::new(()),
             started_at: now_ts(),
@@ -695,6 +706,7 @@ impl Foreman {
         let ts = now_ts();
         let event_id = Uuid::new_v4();
         let mut callback_context: Option<CallbackEventContext> = None;
+        let mut tool_filter_context: Option<ToolFilterDispatchContext> = None;
         let mut should_update_job = false;
         {
             let mut agents = self.agents.write().await;
@@ -707,6 +719,18 @@ impl Foreman {
                 });
                 while agent.events.len() > constants::EVENT_BUFFER_MAX {
                     agent.events.pop_front();
+                }
+
+                if method == constants::EVENT_METHOD_ITEM_COMPLETED
+                    && is_command_execution_item_completed(&method, &params)
+                    && let Some(project_id) = agent.project_id
+                {
+                    tool_filter_context = Some(ToolFilterDispatchContext {
+                        agent_id,
+                        job_id: agent.job_id,
+                        project_id,
+                        params: params.clone(),
+                    });
                 }
 
                 if matches!(
@@ -794,6 +818,12 @@ impl Foreman {
                     callback: agent.callback.clone(),
                 });
             }
+        }
+
+        if let Some(context) = tool_filter_context
+            && let Err(err) = self.dispatch_tool_filtered_callbacks(context).await
+        {
+            warn!(%err, agent_id = %agent_id, "tool-filtered callback execution failed");
         }
 
         if let Some(context) = callback_context {
@@ -1029,6 +1059,93 @@ impl Foreman {
             self.execute_project_worker_callback(project_id, context)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn dispatch_tool_filtered_callbacks(
+        self: &Arc<Self>,
+        context: ToolFilterDispatchContext,
+    ) -> Result<()> {
+        let tool = normalize_tool_name(constants::EVENT_METHOD_ITEM_COMPLETED, &context.params)
+            .context("missing tool name for command execution event")?;
+        let command = parse_command(&context.params);
+        let filters = {
+            let projects = self.projects.read().await;
+            projects
+                .get(&context.project_id)
+                .map(|project| project.config.callbacks.filters.clone())
+                .unwrap_or_default()
+        };
+        if filters.is_empty() {
+            return Ok(());
+        }
+
+        let now_ms = now_ms();
+        let mut debounce_map = self.callback_filter_debounce.write().await;
+        for filter in filters {
+            if !should_fire_tool_filter(
+                &mut debounce_map,
+                context.agent_id,
+                tool.as_str(),
+                command.as_deref(),
+                &filter,
+                now_ms,
+            ) {
+                continue;
+            }
+
+            let payload = ToolFilterCallbackPayload {
+                worker_id: context.agent_id,
+                job_id: context.job_id,
+                project_id: context.project_id,
+                filter_name: filter.name.clone(),
+                tool: tool.clone(),
+                command: command.clone(),
+                exit_code: parse_exit_code(&context.params),
+                output_tail: parse_output_tail(&context.params, 20),
+            };
+
+            let _profile = self
+                .resolve_callback_profile(
+                    filter.callback_profile.as_str(),
+                    Some(context.project_id),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "tool-filter callback profile '{}' is not configured",
+                        filter.callback_profile
+                    )
+                })?;
+
+            let callback = WorkerCallback::Profile(WorkerProfileCallback {
+                profile: filter.callback_profile.clone(),
+                prompt_prefix: None,
+                command_args: None,
+                events: None,
+                vars: HashMap::new(),
+            });
+
+            let callback_context = CallbackEventContext {
+                agent_id: context.agent_id,
+                thread_id: String::new(),
+                turn_id: parse_turn_id(&context.params),
+                role: AgentRole::Worker,
+                project_id: Some(context.project_id),
+                foreman_id: None,
+                job_id: context.job_id,
+                method: constants::EVENT_METHOD_ITEM_COMPLETED.to_string(),
+                ts: now_ts(),
+                params: serde_json::to_value(payload).context("failed to encode filter payload")?,
+                event_id: Uuid::new_v4(),
+                result_snapshot: None,
+                callback: callback.clone(),
+            };
+
+            self.dispatch_callback(callback_context, callback, true)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -4331,6 +4448,93 @@ fn normalize_tool_name(method: &str, params: &Value) -> Option<String> {
     }
 }
 
+fn is_command_execution_item_completed(method: &str, params: &Value) -> bool {
+    if method != constants::EVENT_METHOD_ITEM_COMPLETED {
+        return false;
+    }
+
+    extract_item_payload(params)
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("commandExecution")
+}
+
+fn tool_matches_filter(normalized_tool: &str, filter: &CallbackFilter) -> bool {
+    normalized_tool.eq_ignore_ascii_case(filter.tool.as_str())
+}
+
+fn should_fire_tool_filter(
+    debounce_map: &mut HashMap<(Uuid, String), u64>,
+    agent_id: Uuid,
+    normalized_tool: &str,
+    command: Option<&str>,
+    filter: &CallbackFilter,
+    now_ms: u64,
+) -> bool {
+    if !tool_matches_filter(normalized_tool, filter) {
+        return false;
+    }
+    if !command_matches_pattern(command, filter.command_pattern.as_str()) {
+        return false;
+    }
+
+    let key = (agent_id, filter.name.clone());
+    if let Some(window_ms) = filter.debounce_ms.filter(|window| *window > 0)
+        && let Some(last_fired_ms) = debounce_map.get(&key)
+        && now_ms.saturating_sub(*last_fired_ms) < window_ms
+    {
+        return false;
+    }
+    debounce_map.insert(key, now_ms);
+    true
+}
+
+fn command_matches_pattern(command: Option<&str>, pattern: &str) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    if pattern.trim().is_empty() {
+        return true;
+    }
+
+    if pattern_looks_like_regex(pattern) {
+        return RegexBuilder::new(strip_regex_delimiters(pattern))
+            .case_insensitive(true)
+            .build()
+            .map(|regex| regex.is_match(command))
+            .unwrap_or(false);
+    }
+
+    command
+        .to_ascii_lowercase()
+        .contains(&pattern.to_ascii_lowercase())
+}
+
+fn pattern_looks_like_regex(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.starts_with('^') {
+        return true;
+    }
+    if trimmed.starts_with('/') && trimmed.ends_with('/') && trimmed.len() > 1 {
+        return true;
+    }
+    trimmed.chars().any(|ch| {
+        matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        )
+    })
+}
+
+fn strip_regex_delimiters(pattern: &str) -> &str {
+    let trimmed = pattern.trim();
+    if trimmed.starts_with('/') && trimmed.ends_with('/') && trimmed.len() > 1 {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
 fn parse_command(params: &Value) -> Option<String> {
     if let Some(item) = extract_item_payload(params) {
         let command = item.get("command").and_then(Value::as_str);
@@ -4449,6 +4653,24 @@ fn parse_bytes(params: &Value) -> Option<usize> {
         .or_else(|| params.get("output_bytes"))
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
+}
+
+fn parse_output_tail(params: &Value, max_lines: usize) -> Option<String> {
+    let output = extract_item_payload(params)
+        .and_then(|item| item.get("output"))
+        .and_then(Value::as_str)?;
+
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    let tail = lines[start..].join("\n");
+    if tail.trim().is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
 }
 
 fn is_file_modifying_tool(tool: &str) -> bool {
@@ -4838,6 +5060,14 @@ fn now_ts() -> u64 {
         .unwrap_or_default()
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or_default()
+}
+
 fn is_job_terminal_status(status: &str) -> bool {
     matches!(
         status,
@@ -4852,16 +5082,17 @@ mod tests {
     use super::{
         AgentRecord, AgentRole, Foreman, WorkerCallback, callback_timeout_ms,
         continuation_prompt_for_turn, render_template, render_template_strict,
-        resolve_agent_status, run_validation_commands, unresolved_template_tokens,
-        update_completed_turn_counter,
+        resolve_agent_status, run_validation_commands, should_fire_tool_filter,
+        unresolved_template_tokens, update_completed_turn_counter,
     };
+    use crate::config::CallbackFilter;
     use crate::events::events_allowed;
     use crate::project::JobDefaultsConfig;
     use crate::state::{PersistedAgentRecord, PersistedState, PersistedWorkerCallback};
     use crate::{config::ServiceConfig, models::AgentResult};
     use codex_api::AppServerClient;
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
     use tempfile::tempdir;
     use tokio::sync::broadcast;
@@ -5113,6 +5344,52 @@ mod tests {
         let generic = continuation_prompt_for_turn(2, &generic_defaults).expect("generic prompt");
         assert!(generic.contains("turn 2 of at least 4"));
         assert!(continuation_prompt_for_turn(4, &generic_defaults).is_none());
+    }
+
+    #[test]
+    fn tool_filter_matching_honors_tool_command_and_debounce() {
+        let filter = CallbackFilter {
+            name: "on-commit".to_string(),
+            callback_profile: "wake-openclaw".to_string(),
+            tool: "exec_command".to_string(),
+            command_pattern: "git commit".to_string(),
+            debounce_ms: Some(5_000),
+        };
+        let agent_id = Uuid::new_v4();
+        let mut debounce_map: HashMap<(Uuid, String), u64> = HashMap::new();
+
+        assert!(should_fire_tool_filter(
+            &mut debounce_map,
+            agent_id,
+            "exec_command",
+            Some("git commit -m 'msg'"),
+            &filter,
+            10_000,
+        ));
+        assert!(!should_fire_tool_filter(
+            &mut debounce_map,
+            agent_id,
+            "exec_command",
+            Some("git commit -m 'msg 2'"),
+            &filter,
+            12_000,
+        ));
+        assert!(should_fire_tool_filter(
+            &mut debounce_map,
+            agent_id,
+            "exec_command",
+            Some("git commit -m 'msg 3'"),
+            &filter,
+            16_000,
+        ));
+        assert!(!should_fire_tool_filter(
+            &mut debounce_map,
+            agent_id,
+            "apply_patch",
+            Some("git commit -m 'msg 4'"),
+            &filter,
+            20_000,
+        ));
     }
 
     #[tokio::test]
