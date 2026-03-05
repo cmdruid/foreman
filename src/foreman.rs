@@ -947,24 +947,29 @@ impl Foreman {
 
     async fn execute_agent_callback(self: &Arc<Self>, context: CallbackEventContext) -> Result<()> {
         let callback = context.callback.clone();
-        self.dispatch_callback(context, callback).await
+        self.dispatch_callback(context, callback, false).await
     }
 
     async fn dispatch_callback(
         &self,
         context: CallbackEventContext,
         callback: WorkerCallback,
+        skip_event_filter: bool,
     ) -> Result<()> {
         match callback {
             WorkerCallback::None => Ok(()),
             WorkerCallback::Webhook(webhook) => {
-                if !events_allowed(context.method.as_str(), webhook.events.as_deref(), None) {
+                if !skip_event_filter
+                    && !events_allowed(context.method.as_str(), webhook.events.as_deref(), None)
+                {
                     return Ok(());
                 }
                 self.dispatch_webhook_callback(&context, webhook).await
             }
             WorkerCallback::UnixSocket(unix_socket) => {
-                if !events_allowed(context.method.as_str(), unix_socket.events.as_deref(), None) {
+                if !skip_event_filter
+                    && !events_allowed(context.method.as_str(), unix_socket.events.as_deref(), None)
+                {
                     return Ok(());
                 }
                 self.dispatch_unix_socket_callback(&context, unix_socket).await
@@ -983,11 +988,13 @@ impl Foreman {
                     CallbackProfile::UnixSocket(unix_socket) => unix_socket.events.as_deref(),
                 };
 
-                if !events_allowed(
-                    context.method.as_str(),
-                    profile.events.as_deref(),
-                    profile_events,
-                ) {
+                if !skip_event_filter
+                    && !events_allowed(
+                        context.method.as_str(),
+                        profile.events.as_deref(),
+                        profile_events,
+                    )
+                {
                     return Ok(());
                 }
 
@@ -1150,25 +1157,8 @@ impl Foreman {
                 .await;
         }
 
-        if !self
-            .should_execute_callback_for_method(
-                &context.method,
-                &context.callback,
-                context.project_id,
-            )
-            .await?
-        {
-            return self
-                .set_project_lifecycle_callback_status(
-                    project.id,
-                    lifecycle_key,
-                    constants::PROJECT_CALLBACK_STATUS_SKIPPED,
-                )
-                .await;
-        }
-
         match self
-            .dispatch_callback(context.clone(), context.callback.clone())
+            .dispatch_callback(context.clone(), context.callback.clone(), true)
             .await
         {
             Ok(()) => {
@@ -1188,43 +1178,6 @@ impl Foreman {
                     )
                     .await;
                 Err(err)
-            }
-        }
-    }
-
-    async fn should_execute_callback_for_method(
-        &self,
-        method: &str,
-        callback: &WorkerCallback,
-        project_id: Option<Uuid>,
-    ) -> Result<bool> {
-        match callback {
-            WorkerCallback::None => Ok(false),
-            WorkerCallback::Webhook(webhook) => {
-                Ok(events_allowed(method, webhook.events.as_deref(), None))
-            }
-            WorkerCallback::UnixSocket(unix_socket) => {
-                Ok(events_allowed(method, unix_socket.events.as_deref(), None))
-            }
-            WorkerCallback::Profile(profile) => {
-                let callback_profile = self
-                    .resolve_callback_profile(&profile.profile, project_id)
-                    .await
-                    .with_context(|| {
-                        format!("callback profile '{}' is not configured", profile.profile)
-                    })?;
-
-                let default_events = match &callback_profile {
-                    CallbackProfile::Webhook(webhook) => webhook.events.clone(),
-                    CallbackProfile::Command(command) => command.events.clone(),
-                    CallbackProfile::UnixSocket(unix_socket) => unix_socket.events.clone(),
-                };
-
-                Ok(events_allowed(
-                    method,
-                    profile.events.as_deref(),
-                    default_events.as_deref(),
-                ))
             }
         }
     }
@@ -3607,11 +3560,12 @@ fn build_agent_state(agent: &AgentRecord) -> AgentState {
     let mut last_tool_call = None;
     for event in &agent.events {
         if let Some(tool_call) = parse_tool_call_summary(event) {
-            if let Some(path) = tool_call.path.as_ref()
-                && is_file_modifying_tool(tool_call.tool.as_str())
-                && seen_paths.insert(path.clone())
-            {
-                files_modified.push(path.clone());
+            if is_file_modifying_tool(tool_call.tool.as_str()) {
+                for path in parse_modified_paths(&event.params, tool_call.tool.as_str()) {
+                    if seen_paths.insert(path.clone()) {
+                        files_modified.push(path);
+                    }
+                }
             }
             last_tool_call = Some(tool_call);
         }
@@ -4064,10 +4018,13 @@ fn parse_references_value(value: Option<&Value>) -> Option<Vec<String>> {
 }
 
 fn parse_tool_call_summary(event: &crate::models::AgentEventDto) -> Option<ToolCallSummary> {
-    let method = event.method.as_str();
-    let tool = normalize_tool_name(method)?;
+    if event.method != constants::EVENT_METHOD_ITEM_COMPLETED {
+        return None;
+    }
+
+    let tool = normalize_tool_name(event.method.as_str(), &event.params)?;
     Some(ToolCallSummary {
-        tool: tool.to_string(),
+        tool,
         command: parse_command(&event.params),
         path: parse_path(&event.params),
         at: event.ts,
@@ -4091,26 +4048,50 @@ fn parse_worker_log_entry(
     })
 }
 
-fn normalize_tool_name(method: &str) -> Option<&str> {
-    if method.contains("exec_command") {
-        return Some("exec_command");
+fn normalize_tool_name(method: &str, params: &Value) -> Option<String> {
+    if !matches!(
+        method,
+        constants::EVENT_METHOD_ITEM_STARTED | constants::EVENT_METHOD_ITEM_COMPLETED
+    ) {
+        return None;
     }
-    if method.contains("apply_patch") {
-        return Some("apply_patch");
+
+    let item = extract_item_payload(params)?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+
+    match item_type {
+        "commandExecution" => Some("exec_command".to_string()),
+        "fileChange" => Some("apply_patch".to_string()),
+        "dynamicToolCall" => item
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(std::string::ToString::to_string),
+        "agentMessage" | "contextCompaction" => None,
+        _ => None,
     }
-    if method.contains("write_stdin") {
-        return Some("write_stdin");
-    }
-    if method.contains("read_file") {
-        return Some("read_file");
-    }
-    if method.contains("write_file") {
-        return Some("write_file");
-    }
-    None
 }
 
 fn parse_command(params: &Value) -> Option<String> {
+    if let Some(item) = extract_item_payload(params) {
+        let command = item.get("command").and_then(Value::as_str);
+        let arguments = parse_string_array(item.get("arguments"));
+
+        if let Some(command) = command {
+            if let Some(arguments) = arguments
+                && !arguments.is_empty()
+            {
+                return Some(format!("{command} {}", arguments.join(" ")));
+            }
+            return Some(command.to_string());
+        }
+
+        if let Some(arguments) = arguments
+            && !arguments.is_empty()
+        {
+            return Some(arguments.join(" "));
+        }
+    }
+
     params
         .get("command")
         .or_else(|| params.get("cmd"))
@@ -4120,15 +4101,39 @@ fn parse_command(params: &Value) -> Option<String> {
 }
 
 fn parse_path(params: &Value) -> Option<String> {
+    if let Some(path) = parse_change_paths(params).into_iter().next() {
+        return Some(path);
+    }
+
     params
         .get("path")
         .or_else(|| params.get("file"))
         .or_else(|| params.get("target"))
+        .or_else(|| {
+            extract_item_payload(params)
+                .and_then(|item| item.get("path"))
+                .or_else(|| extract_item_payload(params).and_then(|item| item.get("file")))
+                .or_else(|| extract_item_payload(params).and_then(|item| item.get("target")))
+        })
         .and_then(Value::as_str)
         .map(std::string::ToString::to_string)
 }
 
 fn parse_exit_code(params: &Value) -> Option<i32> {
+    if let Some(exit_code) = extract_item_payload(params)
+        .and_then(|item| item.get("exit_code").or_else(|| item.get("exitCode")))
+        .or_else(|| {
+            extract_item_payload(params).and_then(|item| {
+                item.get("result")
+                    .and_then(|result| result.get("exit_code").or_else(|| result.get("exitCode")))
+            })
+        })
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+    {
+        return Some(exit_code);
+    }
+
     params
         .get("exit_code")
         .or_else(|| params.get("exitCode"))
@@ -4138,6 +4143,14 @@ fn parse_exit_code(params: &Value) -> Option<i32> {
 }
 
 fn parse_stderr(params: &Value) -> Option<String> {
+    if let Some(stderr) = extract_item_payload(params)
+        .and_then(|item| item.get("stderr").or_else(|| item.get("error")))
+        .or_else(|| extract_item_payload(params).and_then(|item| item.get("result").and_then(|result| result.get("stderr"))))
+        .and_then(Value::as_str)
+    {
+        return Some(stderr.to_string());
+    }
+
     params
         .get("stderr")
         .and_then(Value::as_str)
@@ -4145,6 +4158,28 @@ fn parse_stderr(params: &Value) -> Option<String> {
 }
 
 fn parse_bytes(params: &Value) -> Option<usize> {
+    if let Some(bytes) = extract_item_payload(params)
+        .and_then(|item| {
+            item.get("bytes")
+                .or_else(|| item.get("size"))
+                .or_else(|| item.get("output_bytes"))
+        })
+        .or_else(|| {
+            extract_item_payload(params).and_then(|item| {
+                item.get("result").and_then(|result| {
+                    result
+                        .get("bytes")
+                        .or_else(|| result.get("size"))
+                        .or_else(|| result.get("output_bytes"))
+                })
+            })
+        })
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    {
+        return Some(bytes);
+    }
+
     params
         .get("bytes")
         .or_else(|| params.get("size"))
@@ -4155,6 +4190,45 @@ fn parse_bytes(params: &Value) -> Option<usize> {
 
 fn is_file_modifying_tool(tool: &str) -> bool {
     matches!(tool, "apply_patch" | "write_file")
+}
+
+fn parse_modified_paths(params: &Value, tool: &str) -> Vec<String> {
+    if tool == "apply_patch" {
+        let paths = parse_change_paths(params);
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+
+    parse_path(params).into_iter().collect()
+}
+
+fn parse_change_paths(params: &Value) -> Vec<String> {
+    extract_item_payload(params)
+        .and_then(|item| item.get("changes"))
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .map(std::string::ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    let collected: Vec<String> = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(std::string::ToString::to_string)
+        .collect();
+    if collected.is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
 }
 
 fn render_template(template: &str, vars: &HashMap<String, String>) -> String {

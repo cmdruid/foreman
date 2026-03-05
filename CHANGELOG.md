@@ -4,6 +4,13 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.3.1]
+
+- Fixed worker log/progress tool parsing to consume `item/completed` payloads using `params.item.type`, including `commandExecution`, `fileChange`, and `dynamicToolCall`.
+- Fixed empty/partial worker log field extraction by reading command/path/exit-code/stderr/bytes from nested `params.item` values, including `fileChange` `changes[].path` handling.
+- Fixed `files_modified` progress stats for `fileChange` items by collecting all changed paths from `params.item.changes`.
+- Fixed project lifecycle callback dispatch to bypass generic event-filter matching during lifecycle dispatch, so configured lifecycle callbacks execute for their selected lifecycle key.
+
 ## [0.3.0]
 
 - Added structured startup error UX with `run()` wrapping, hint suggestions, and `--force` lockfile override support for crash recovery.

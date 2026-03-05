@@ -76,6 +76,7 @@ pub const EVENT_METHOD_TURN_STARTED: &str = "turn/started";
 pub const THREAD_EVENT_STARTED: &str = "thread/status/changed";
 pub const EVENT_METHOD_ITEM_AGENT_MESSAGE: &str = "item/agentMessage";
 pub const EVENT_METHOD_ITEM_AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
+pub const EVENT_METHOD_ITEM_STARTED: &str = "item/started";
 pub const EVENT_METHOD_ITEM_COMPLETED: &str = "item/completed";
 pub const EVENT_STATUS_COMPLETED: &str = "completed";
 pub const EVENT_STATUS_ABORTED: &str = "aborted";
@@ -157,7 +158,6 @@ pub const PROJECT_HOMEDOWN_TEXT: &str = "---\n";
 
 pub const PROJECT_CALLBACK_STATUS_NEVER_RUN: &str = "never_run";
 pub const PROJECT_CALLBACK_STATUS_DISABLED: &str = "disabled";
-pub const PROJECT_CALLBACK_STATUS_SKIPPED: &str = "skipped";
 pub const PROJECT_CALLBACK_STATUS_SUCCESS: &str = "success";
 pub const PROJECT_CALLBACK_STATUS_FAILED: &str = "failed";
 
