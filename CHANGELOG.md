@@ -4,6 +4,14 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.4.1]
+
+- Added `POST /projects/:id/reload` to hot-reload project config from `project.toml`, with in-place updates for callback configuration, validation, policy, and `jobs.defaults.{min_turns,strategy}`.
+- Added `Foreman::reload_project_config` with explicit safe/unsafe hot-reload boundaries and a regression test for missing-project error handling.
+- Added command callback shell execution mode (`shell = true`) and automatic shell fallback for non-absolute command programs using `bash -lc`.
+- Added project-level callback environment support via `callbacks.env`, merged below profile env and below system env precedence during command dispatch.
+- Relaxed command callback profile validation to permit non-absolute programs when shell execution is used.
+
 ## [0.4.0]
 
 - A1: Added native per-worker git worktree lifecycle management for project jobs, including automatic worktree branch/path generation, merge strategies (`sequential`, `rebase`, `manual`), merge conflict reporting, and cleanup on completion/abort/shutdown reconcile.

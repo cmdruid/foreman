@@ -50,6 +50,8 @@ impl Default for ProjectPrompts {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectCallbacks {
     #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
     pub profiles: HashMap<String, CallbackProfile>,
     #[serde(default)]
     pub filters: Vec<CallbackFilter>,
@@ -419,6 +421,7 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
 
     if let Some(callbacks) = root.get("callbacks").and_then(toml::Value::as_table) {
         let callbacks_allowed = [
+            "env",
             "profiles",
             "filters",
             "worker",

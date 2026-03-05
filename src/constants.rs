@@ -34,6 +34,7 @@ pub const ROUTE_PROJECT_WORKERS: &str = "/projects/{id}/workers";
 pub const ROUTE_PROJECT_FOREMAN_SEND: &str = "/projects/{id}/foreman/send";
 pub const ROUTE_PROJECT_FOREMAN_STEER: &str = "/projects/{id}/foreman/steer";
 pub const ROUTE_PROJECT_COMPACT: &str = "/projects/{id}/compact";
+pub const ROUTE_PROJECT_RELOAD: &str = "/projects/{id}/reload";
 pub const ROUTE_PROJECT_CALLBACK_STATUS: &str = "/projects/{id}/callback-status";
 pub const ROUTE_PROJECT_JOBS: &str = "/projects/{id}/jobs";
 pub const ROUTE_JOBS: &str = "/jobs";

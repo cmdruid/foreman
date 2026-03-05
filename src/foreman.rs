@@ -1181,7 +1181,11 @@ impl Foreman {
                 return Ok(());
             };
 
-            (project.path.clone(), worktree_path, agent.branch_name.clone())
+            (
+                project.path.clone(),
+                worktree_path,
+                agent.branch_name.clone(),
+            )
         };
 
         self.cleanup_worker_worktree(
@@ -1289,13 +1293,13 @@ impl Foreman {
                     .map(|path| (path, agent.branch_name.clone(), agent.project_id));
                 agent.worktree_path = None;
                 agent.status = constants::AGENT_STATUS_FAILED.to_string();
-            agent.error = Some(message.clone());
-            if let Some(result) = agent.result.as_mut() {
-                result.status = constants::AGENT_STATUS_FAILED.to_string();
-                result.error = Some(message.clone());
-                result.turn_id = result.turn_id.clone().or(last_turn_id.clone());
-            }
-            agent.updated_at = now_ts();
+                agent.error = Some(message.clone());
+                if let Some(result) = agent.result.as_mut() {
+                    result.status = constants::AGENT_STATUS_FAILED.to_string();
+                    result.error = Some(message.clone());
+                    result.turn_id = result.turn_id.clone().or(last_turn_id.clone());
+                }
+                agent.updated_at = now_ts();
             }
             cleanup
         };
@@ -2090,13 +2094,8 @@ impl Foreman {
         );
         vars.insert(event_prompt_variable.to_string(), event_prompt);
 
-        let command = render_template_strict(&profile.program, &vars)
+        let rendered_command = render_template_strict(&profile.program, &vars)
             .context("failed to render callback command program")?;
-        if !Path::new(&command).is_absolute() {
-            return Err(anyhow!(
-                "callback command program must resolve to an absolute path"
-            ));
-        }
         let args = if let Some(custom_args) = invocation.command_args {
             custom_args
         } else {
@@ -2114,17 +2113,55 @@ impl Foreman {
             .collect::<Result<Vec<_>, _>>()
             .context("failed to render callback command args")?;
 
-        let mut command = Command::new(command);
-        command.args(&rendered_args);
+        let project_callback_env = if let Some(project_id) = context.project_id {
+            self.projects
+                .read()
+                .await
+                .get(&project_id)
+                .map(|project| project.config.callbacks.env.clone())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let use_shell =
+            profile.shell.unwrap_or(false) || !Path::new(&rendered_command).is_absolute();
+
+        // PATH behavior:
+        // - shell=true (or a non-absolute program) runs through `bash -lc`, loading login shell
+        //   profile state so PATH-managed tools (e.g. nvm shims) are available.
+        // - shell=false with an absolute program uses direct execution.
+        // - callbacks.env can provide extra environment variables without shell mode.
+        let mut command = if use_shell {
+            let shell_command = if rendered_args.is_empty() {
+                rendered_command.clone()
+            } else {
+                format!("{} {}", rendered_command, rendered_args.join(" "))
+            };
+            let mut command = Command::new("bash");
+            command.args(["-lc", &shell_command]);
+            command
+        } else {
+            let mut command = Command::new(&rendered_command);
+            command.args(&rendered_args);
+            command
+        };
+
+        let mut merged_env = project_callback_env;
         for (key, value) in profile.env.iter() {
             let rendered_value = render_template_strict(value, &vars)
                 .with_context(|| format!("failed to render callback env value for '{key}'"))?;
-            command.env(key, rendered_value);
+            merged_env.insert(key.clone(), rendered_value);
+        }
+
+        for (key, value) in merged_env {
+            if std::env::var_os(&key).is_none() {
+                command.env(key, value);
+            }
         }
 
         let mut child = command
             .spawn()
-            .with_context(|| format!("failed to run callback command '{}'", profile.program))?;
+            .with_context(|| format!("failed to run callback command '{}'", rendered_command))?;
 
         let status = if let Some(timeout_ms) = callback_timeout_ms(profile.timeout_ms) {
             match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
@@ -2140,7 +2177,7 @@ impl Foreman {
 
         if !status.success() {
             warn!(
-                command = %profile.program,
+                command = %rendered_command,
                 status = status.code().unwrap_or_default(),
                 "callback command exited with non-zero status"
             );
@@ -2532,6 +2569,58 @@ impl Foreman {
         })
     }
 
+    pub async fn reload_project_config(self: &Arc<Self>, project_id: Uuid) -> Result<()> {
+        let project_path = {
+            let projects = self.projects.read().await;
+            let project = projects.get(&project_id).context("project not found")?;
+            PathBuf::from(&project.path)
+        };
+
+        let config = ProjectConfig::load(&project_path)?;
+        config.validate()?;
+
+        let _ = self
+            .resolve_project_callback_spec(
+                &config.callbacks.foreman,
+                &config.callbacks.profiles,
+                &CallbackOverrides::default(),
+                false,
+            )
+            .context("invalid foreman callback config")?;
+        let _ = self
+            .resolve_project_callback_spec(
+                &config.callbacks.worker,
+                &config.callbacks.profiles,
+                &CallbackOverrides::default(),
+                false,
+            )
+            .context("invalid worker callback config")?;
+        let _ = self
+            .resolve_project_callback_spec(
+                &config.callbacks.bubble_up,
+                &config.callbacks.profiles,
+                &CallbackOverrides::default(),
+                false,
+            )
+            .context("invalid bubble-up callback config")?;
+
+        {
+            let mut projects = self.projects.write().await;
+            let project = projects.get_mut(&project_id).context("project not found")?;
+            // Safe to hot-reload: callback config (profiles/filters/lifecycle/worker), validation,
+            // policy, and jobs.defaults.{min_turns,strategy}. Not reloaded: project path, runtime
+            // prompts (including worker_prompt), or model choices already baked into spawned agents.
+            project.config.callbacks = config.callbacks;
+            project.config.validation = config.validation;
+            project.config.policy = config.policy;
+            project.config.jobs.defaults.min_turns = config.jobs.defaults.min_turns;
+            project.config.jobs.defaults.strategy = config.jobs.defaults.strategy;
+            project.updated_at = now_ts();
+        }
+        self.schedule_state_persist();
+        Ok(())
+    }
+
     pub async fn spawn_project_worker(
         self: &Arc<Self>,
         project_id: Uuid,
@@ -2569,9 +2658,9 @@ impl Foreman {
             self.resolve_worker_cwd(&project_path, request.cwd, request.worktree.as_ref())
                 .await?
         } else if should_use_native_worktree(&project.config.jobs.defaults, 1) {
-            let worktree =
-                self.create_worker_worktree(project_path.as_str(), project_id, worker_id)
-                    .await?;
+            let worktree = self
+                .create_worker_worktree(project_path.as_str(), project_id, worker_id)
+                .await?;
             let cwd = worktree.0.clone();
             worker_worktree = Some(worktree);
             cwd
@@ -2685,9 +2774,9 @@ impl Foreman {
                 self.resolve_worker_cwd(&project_path, spec.cwd, spec.worktree.as_ref())
                     .await?
             } else if should_use_native_worktree(&project.config.jobs.defaults, worker_count) {
-                let worktree =
-                    self.create_worker_worktree(project_path.as_str(), job_id, worker_id)
-                        .await?;
+                let worktree = self
+                    .create_worker_worktree(project_path.as_str(), job_id, worker_id)
+                    .await?;
                 let cwd = worktree.0.clone();
                 worker_worktree = Some(worktree);
                 cwd
@@ -2989,7 +3078,11 @@ impl Foreman {
         if was_merged && let Some(branch_name) = branch_name {
             run_git_command(
                 project_path,
-                &["branch".to_string(), "-d".to_string(), branch_name.to_string()],
+                &[
+                    "branch".to_string(),
+                    "-d".to_string(),
+                    branch_name.to_string(),
+                ],
                 "delete merged worker branch",
             )
             .await?;
@@ -3427,8 +3520,16 @@ impl Foreman {
             })
             .context("failed to configure worker callback")?;
 
-        self.spawn_agent_record(None, request, AgentRole::Standalone, None, None, None, callback)
-            .await
+        self.spawn_agent_record(
+            None,
+            request,
+            AgentRole::Standalone,
+            None,
+            None,
+            None,
+            callback,
+        )
+        .await
     }
 
     pub async fn send_turn(
@@ -4481,8 +4582,16 @@ async fn run_git_command(project_path: &str, args: &[String], action: &str) -> R
         return Err(anyhow!(
             "{action} failed (exit {code}) for git -C {project_path} {}. stdout: {} stderr: {}",
             args.join(" "),
-            if stdout.is_empty() { "<empty>" } else { &stdout },
-            if stderr.is_empty() { "<empty>" } else { &stderr },
+            if stdout.is_empty() {
+                "<empty>"
+            } else {
+                &stdout
+            },
+            if stderr.is_empty() {
+                "<empty>"
+            } else {
+                &stderr
+            },
         ));
     }
 
@@ -5401,7 +5510,9 @@ fn restore_job_record(record: PersistedJobRecord) -> Result<JobRecord> {
         merged_branches: record.merged_branches,
         merge_conflicts: record.merge_conflicts,
         base_branch: record.base_branch.unwrap_or_else(|| "main".to_string()),
-        merge_strategy: record.merge_strategy.unwrap_or_else(|| "manual".to_string()),
+        merge_strategy: record
+            .merge_strategy
+            .unwrap_or_else(|| "manual".to_string()),
         created_at: record.created_at,
         completed_at: record.completed_at,
         updated_at: record.updated_at,
@@ -5985,6 +6096,33 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.completion_method.as_deref(), Some("turn/completed"));
         assert!(result.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_project_config_returns_error_when_project_not_found() {
+        let fake_codex = test_fake_codex_binary();
+        let state_dir = tempdir().expect("temp state directory");
+        let state_path = state_dir.path().join("foreman-state.json");
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let client = AppServerClient::connect(&fake_codex, &[], event_tx.clone())
+            .await
+            .expect("connect fake app-server");
+        let foreman = Foreman::new(
+            client,
+            event_rx,
+            ServiceConfig::default(),
+            PersistedState::default(),
+            state_path,
+        );
+
+        let err = foreman
+            .reload_project_config(Uuid::new_v4())
+            .await
+            .expect_err("reload should fail for unknown project");
+        assert!(
+            err.to_string().contains("project not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

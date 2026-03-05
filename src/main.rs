@@ -39,8 +39,9 @@ use config::{CallbackProfile, RuntimeAuthConfig, ServiceConfig};
 use constants as consts;
 use foreman::Foreman;
 use models::{
-    CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, SendAgentInput,
-    SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest, SteerAgentInput,
+    CompactProjectRequest, CreateProjectJobsRequest, InterruptInput, ReloadProjectResponse,
+    SendAgentInput, SpawnAgentRequest, SpawnProjectRequest, SpawnProjectWorkerRequest,
+    SteerAgentInput,
 };
 use project::{ProjectConfig, ProjectLintIssue, lint_project_toml};
 use state::PersistedState;
@@ -326,6 +327,7 @@ async fn run() -> anyhow::Result<()> {
                 consts::ROUTE_PROJECT_ID,
                 get(get_project).delete(close_project),
             )
+            .route(consts::ROUTE_PROJECT_RELOAD, post(reload_project))
             .route(
                 consts::ROUTE_PROJECT_CALLBACK_STATUS,
                 get(get_project_callback_status),
@@ -413,13 +415,19 @@ fn resolve_socket_path(
 fn error_hint(err: &anyhow::Error) -> Option<&'static str> {
     let text = format!("{err:#}").to_lowercase();
     if text.contains("address already in use") {
-        return Some("socket is already in use; remove the stale socket file or choose a different --socket-path");
+        return Some(
+            "socket is already in use; remove the stale socket file or choose a different --socket-path",
+        );
     }
     if text.contains("active pid") {
-        return Some("another foreman process is running; stop it first or retry with --force for crash recovery");
+        return Some(
+            "another foreman process is running; stop it first or retry with --force for crash recovery",
+        );
     }
     if text.contains("failed to bind") {
-        return Some("failed to bind socket; check parent directory permissions and whether the path is writable");
+        return Some(
+            "failed to bind socket; check parent directory permissions and whether the path is writable",
+        );
     }
     None
 }
@@ -1286,6 +1294,33 @@ async fn get_project_callback_status(
     }
 }
 
+async fn reload_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(err) = state.foreman.get_project(project_id).await {
+        return error_response(StatusCode::NOT_FOUND, err);
+    }
+
+    match state.foreman.reload_project_config(project_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ReloadProjectResponse {
+                reloaded: true,
+                project_id,
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            if err.to_string().contains("project not found") {
+                error_response(StatusCode::NOT_FOUND, err)
+            } else {
+                error_response(StatusCode::BAD_REQUEST, err)
+            }
+        }
+    }
+}
+
 async fn spawn_project_worker(
     State(state): State<AppState>,
     Path(project_id): Path<Uuid>,
@@ -1389,7 +1424,11 @@ async fn get_job_events_stream(
     }
 
     let replay_from = parse_last_event_id(&headers);
-    let replay = match state.foreman.get_job_event_backlog(job_id, replay_from).await {
+    let replay = match state
+        .foreman
+        .get_job_event_backlog(job_id, replay_from)
+        .await
+    {
         Ok(events) => events,
         Err(err) => return error_response(StatusCode::NOT_FOUND, err),
     };
@@ -1410,20 +1449,24 @@ async fn get_job_events_stream(
         })
         .collect::<Vec<_>>();
 
-    let live = BroadcastStream::new(state.foreman.subscribe_job_events())
-        .filter_map(move |result| match result {
-            Ok(envelope) if envelope.job_id == job_id => Some(Ok::<Event, Infallible>(sse_event(
-                &envelope.method,
-                envelope.ts,
-                serde_json::json!({
-                    "job_id": envelope.job_id,
-                    "agent_id": envelope.agent_id,
-                    "ts": envelope.ts,
-                    "method": envelope.method,
-                    "params": envelope.params,
-                }),
-            ))),
-            _ => None,
+    let live =
+        BroadcastStream::new(state.foreman.subscribe_job_events()).filter_map(move |result| {
+            match result {
+                Ok(envelope) if envelope.job_id == job_id => {
+                    Some(Ok::<Event, Infallible>(sse_event(
+                        &envelope.method,
+                        envelope.ts,
+                        serde_json::json!({
+                            "job_id": envelope.job_id,
+                            "agent_id": envelope.agent_id,
+                            "ts": envelope.ts,
+                            "method": envelope.method,
+                            "params": envelope.params,
+                        }),
+                    )))
+                }
+                _ => None,
+            }
         });
 
     let stream = tokio_stream::iter(replay_events).chain(live);

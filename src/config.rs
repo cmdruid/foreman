@@ -163,6 +163,8 @@ pub struct WebhookCallbackProfile {
 pub struct CommandCallbackProfile {
     pub program: String,
     #[serde(default)]
+    pub shell: Option<bool>,
+    #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub prompt_prefix: Option<String>,
@@ -266,11 +268,6 @@ impl ServiceConfig {
                     if command.program.contains("{{") || command.program.contains("}}") {
                         return Err(anyhow!(
                             "callback profile '{name}' must use a static command program path (templates are not allowed)"
-                        ));
-                    }
-                    if !Path::new(command.program.trim()).is_absolute() {
-                        return Err(anyhow!(
-                            "callback profile '{name}' command program must be an absolute path"
                         ));
                     }
                 }

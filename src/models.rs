@@ -237,6 +237,12 @@ pub struct CreateProjectResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ReloadProjectResponse {
+    pub reloaded: bool,
+    pub project_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectState {
     pub id: Uuid,
     pub path: String,
