@@ -117,7 +117,15 @@ pub struct PersistedAgentRecord {
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub restart_attempts: u32,
+    #[serde(default)]
+    pub turns_completed: u32,
+    #[serde(default)]
+    pub validation_retries: u32,
+    #[serde(default)]
+    pub last_validation_error: Option<String>,
     pub status: String,
     pub callback: PersistedWorkerCallback,
     pub role: String,

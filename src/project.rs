@@ -15,6 +15,10 @@ pub struct ProjectConfig {
     pub callbacks: ProjectCallbacks,
     #[serde(default)]
     pub policy: ProjectPolicy,
+    #[serde(default)]
+    pub jobs: ProjectJobsConfig,
+    #[serde(default)]
+    pub validation: Option<ValidationConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +100,43 @@ pub struct ProjectPolicy {
     pub compact_after_turns: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectJobsConfig {
+    #[serde(default)]
+    pub defaults: JobDefaultsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JobDefaultsConfig {
+    #[serde(default)]
+    pub min_turns: Option<u32>,
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    #[serde(default)]
+    pub on_turn: Vec<String>,
+    #[serde(default)]
+    pub on_complete: Vec<String>,
+    #[serde(default = "default_validation_fail_action")]
+    pub fail_action: String,
+    #[serde(default = "default_validation_max_retries")]
+    pub max_retries: u32,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            on_turn: Vec::new(),
+            on_complete: Vec::new(),
+            fail_action: default_validation_fail_action(),
+            max_retries: default_validation_max_retries(),
+        }
+    }
+}
+
 impl Default for ProjectPolicy {
     fn default() -> Self {
         Self {
@@ -174,6 +215,20 @@ impl ProjectConfig {
                 constants::ERROR_CODE_CFG_PROJECT_VALIDATION
             )
         })?;
+        self.jobs.validate().with_context(|| {
+            format!(
+                "{} invalid project jobs configuration",
+                constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+            )
+        })?;
+        if let Some(validation) = &self.validation {
+            validation.validate().with_context(|| {
+                format!(
+                    "{} invalid project validation configuration",
+                    constants::ERROR_CODE_CFG_PROJECT_VALIDATION
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -276,6 +331,34 @@ impl ProjectPrompts {
     }
 }
 
+impl ProjectJobsConfig {
+    fn validate(&self) -> Result<()> {
+        self.defaults.validate()
+    }
+}
+
+impl JobDefaultsConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(strategy) = &self.strategy
+            && strategy != "single"
+            && strategy != "explore-plan-execute"
+        {
+            anyhow::bail!("jobs.defaults.strategy must be 'single' or 'explore-plan-execute'");
+        }
+        Ok(())
+    }
+}
+
+impl ValidationConfig {
+    fn validate(&self) -> Result<()> {
+        if self.fail_action != "retry" && self.fail_action != "abort" && self.fail_action != "warn"
+        {
+            anyhow::bail!("validation.fail_action must be 'retry', 'abort', or 'warn'");
+        }
+        Ok(())
+    }
+}
+
 fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport) {
     let Some(root) = manifest.as_table() else {
         report.issues.push(ProjectLintIssue {
@@ -286,7 +369,14 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
         return;
     };
 
-    let root_allowed = ["name", "prompts", "callbacks", "policy"];
+    let root_allowed = [
+        "name",
+        "prompts",
+        "callbacks",
+        "policy",
+        "jobs",
+        "validation",
+    ];
     push_unknown_table_keys(root, "", &root_allowed, report);
 
     if let Some(prompts) = root.get("prompts").and_then(toml::Value::as_table) {
@@ -357,6 +447,20 @@ fn validate_unknown_keys(manifest: &toml::Value, report: &mut ProjectLintReport)
     if let Some(policy) = root.get("policy").and_then(toml::Value::as_table) {
         let policy_allowed = ["bubble_up_events", "compact_after_turns"];
         push_unknown_table_keys(policy, "policy", &policy_allowed, report);
+    }
+
+    if let Some(jobs) = root.get("jobs").and_then(toml::Value::as_table) {
+        let jobs_allowed = ["defaults"];
+        push_unknown_table_keys(jobs, "jobs", &jobs_allowed, report);
+        if let Some(defaults) = jobs.get("defaults").and_then(toml::Value::as_table) {
+            let defaults_allowed = ["min_turns", "strategy"];
+            push_unknown_table_keys(defaults, "jobs.defaults", &defaults_allowed, report);
+        }
+    }
+
+    if let Some(validation) = root.get("validation").and_then(toml::Value::as_table) {
+        let validation_allowed = ["on_turn", "on_complete", "fail_action", "max_retries"];
+        push_unknown_table_keys(validation, "validation", &validation_allowed, report);
     }
 }
 
@@ -453,4 +557,12 @@ fn default_runbook_file() -> String {
 
 fn default_handoff_file() -> String {
     constants::DEFAULT_HANDOFF_FILE.to_string()
+}
+
+fn default_validation_fail_action() -> String {
+    "retry".to_string()
+}
+
+fn default_validation_max_retries() -> u32 {
+    2
 }

@@ -176,6 +176,8 @@ pub struct AgentState {
     pub updated_at: u64,
     pub events: Vec<AgentEventDto>,
     pub turns_completed: u32,
+    pub validation_retries: u32,
+    pub last_validation_error: Option<String>,
     pub last_tool_call: Option<ToolCallSummary>,
     pub files_modified: Vec<String>,
     pub elapsed_ms: Option<u64>,

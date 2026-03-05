@@ -31,13 +31,15 @@ use crate::{
     events::events_allowed,
     models::{
         AgentResult, AgentState, CallbackOverrides, CompactProjectRequest,
-        CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse, JobResult,
-        JobEventEnvelope, JobState, ProjectCallbackStatusResponse, ProjectState, SendAgentInput,
-        SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest, SpawnProjectWorkerRequest,
-        SpawnProjectWorkerResponse, SteerAgentInput, ToolCallSummary, WorkerLogEntry,
-        WorkerWorktreeSpec,
+        CreateProjectJobsRequest, CreateProjectJobsResponse, CreateProjectResponse,
+        JobEventEnvelope, JobResult, JobState, ProjectCallbackStatusResponse, ProjectState,
+        SendAgentInput, SpawnAgentRequest, SpawnAgentResponse, SpawnProjectRequest,
+        SpawnProjectWorkerRequest, SpawnProjectWorkerResponse, SteerAgentInput, ToolCallSummary,
+        WorkerLogEntry, WorkerWorktreeSpec,
     },
-    project::{CallbackSpec, ProjectConfig, ProjectRuntimeFiles},
+    project::{
+        CallbackSpec, JobDefaultsConfig, ProjectConfig, ProjectRuntimeFiles, ValidationConfig,
+    },
     state::{
         PersistedAgentRecord, PersistedJobRecord, PersistedProjectRecord, PersistedRuntimeFiles,
         PersistedState, PersistedWorkerCallback,
@@ -113,7 +115,11 @@ struct AgentRecord {
     thread_id: String,
     active_turn_id: Option<String>,
     prompt: Option<String>,
+    cwd: Option<String>,
     restart_attempts: u32,
+    turns_completed: u32,
+    validation_retries: u32,
+    last_validation_error: Option<String>,
     status: String,
     callback: WorkerCallback,
     role: AgentRole,
@@ -707,6 +713,9 @@ impl Foreman {
                     method.as_str(),
                     constants::EVENT_METHOD_TURN_COMPLETED | constants::EVENT_METHOD_TURN_ABORTED
                 ) {
+                    if method == constants::EVENT_METHOD_TURN_COMPLETED {
+                        agent.turns_completed = agent.turns_completed.saturating_add(1);
+                    }
                     agent.status = constants::AGENT_STATUS_IDLE.to_string();
                     agent.result = Some(build_completion_result(
                         agent.id,
@@ -788,6 +797,10 @@ impl Foreman {
         }
 
         if let Some(context) = callback_context {
+            if let Err(err) = self.handle_worker_post_turn(&context).await {
+                warn!(%err, agent_id = %context.agent_id, "post-turn worker policy failed");
+            }
+
             if let Some(job_id) = context.job_id {
                 let _ = self.job_event_tx.send(JobEventEnvelope {
                     job_id,
@@ -804,9 +817,7 @@ impl Foreman {
             ) || should_update_job
             {
                 if let Some(job_id) = context.job_id {
-                    if let Ok(Some(status)) = self
-                        .update_job_after_worker_event(job_id, context.result_snapshot.as_ref())
-                        .await
+                    if let Ok(Some(status)) = self.update_job_after_worker_event(job_id, None).await
                     {
                         let _ = self.job_event_tx.send(JobEventEnvelope {
                             job_id,
@@ -826,6 +837,187 @@ impl Foreman {
                 warn!(%err, "callback execution failed");
             }
         }
+    }
+
+    async fn handle_worker_post_turn(
+        self: &Arc<Self>,
+        context: &CallbackEventContext,
+    ) -> Result<()> {
+        if context.role != AgentRole::Worker
+            || context.method != constants::EVENT_METHOD_TURN_COMPLETED
+        {
+            return Ok(());
+        }
+        let Some(project_id) = context.project_id else {
+            return Ok(());
+        };
+
+        let (validation, job_defaults) = {
+            let projects = self.projects.read().await;
+            let Some(project) = projects.get(&project_id) else {
+                return Ok(());
+            };
+            (
+                project.config.validation.clone(),
+                project.config.jobs.defaults.clone(),
+            )
+        };
+
+        let (cwd, turns_completed) = {
+            let agents = self.agents.read().await;
+            let Some(agent) = agents.get(&context.agent_id) else {
+                return Ok(());
+            };
+            (agent.cwd.clone(), agent.turns_completed)
+        };
+
+        if let Some(validation) = &validation
+            && !validation.on_turn.is_empty()
+        {
+            let cwd = cwd
+                .as_deref()
+                .map(Path::new)
+                .context("worker has no cwd configured for validation.on_turn")?;
+            match run_validation_commands(&validation.on_turn, cwd).await {
+                Ok(()) => self.clear_validation_error(context.agent_id).await,
+                Err(err) => {
+                    if self
+                        .handle_validation_failure(context.agent_id, validation, err.to_string())
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if !self.is_agent_idle_or_completed(context.agent_id).await {
+            return Ok(());
+        }
+
+        if let Some(prompt) = continuation_prompt_for_turn(turns_completed, &job_defaults) {
+            self.send_turn(
+                context.agent_id,
+                SendAgentInput {
+                    prompt: Some(prompt),
+                    callback_profile: None,
+                    callback_prompt_prefix: None,
+                    callback_args: None,
+                    callback_vars: None,
+                    callback_events: None,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(validation) = &validation
+            && !validation.on_complete.is_empty()
+        {
+            let cwd = cwd
+                .as_deref()
+                .map(Path::new)
+                .context("worker has no cwd configured for validation.on_complete")?;
+            match run_validation_commands(&validation.on_complete, cwd).await {
+                Ok(()) => self.clear_validation_error(context.agent_id).await,
+                Err(err) => {
+                    let _ = self
+                        .handle_validation_failure(context.agent_id, validation, err.to_string())
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn is_agent_idle_or_completed(&self, agent_id: Uuid) -> bool {
+        let agents = self.agents.read().await;
+        let Some(agent) = agents.get(&agent_id) else {
+            return false;
+        };
+        matches!(
+            agent.status.as_str(),
+            constants::AGENT_STATUS_IDLE | constants::AGENT_STATUS_COMPLETED
+        )
+    }
+
+    async fn clear_validation_error(&self, agent_id: Uuid) {
+        let mut agents = self.agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id) {
+            agent.last_validation_error = None;
+            agent.updated_at = now_ts();
+        }
+    }
+
+    async fn handle_validation_failure(
+        self: &Arc<Self>,
+        agent_id: Uuid,
+        validation: &ValidationConfig,
+        error_text: String,
+    ) -> Result<bool> {
+        let (validation_retries, last_turn_id) = {
+            let mut agents = self.agents.write().await;
+            let Some(agent) = agents.get_mut(&agent_id) else {
+                return Ok(true);
+            };
+            agent.last_validation_error = Some(error_text.clone());
+            agent.updated_at = now_ts();
+            (agent.validation_retries, agent.active_turn_id.clone())
+        };
+
+        if validation.fail_action == "warn" {
+            warn!(agent_id = %agent_id, error = %error_text, "validation failed; continuing due to warn mode");
+            return Ok(false);
+        }
+
+        if validation.fail_action == "retry" && validation_retries < validation.max_retries {
+            let retry_prompt = format!("Validation failed: {error_text}\nFix and commit.");
+            self.send_turn(
+                agent_id,
+                SendAgentInput {
+                    prompt: Some(retry_prompt),
+                    callback_profile: None,
+                    callback_prompt_prefix: None,
+                    callback_args: None,
+                    callback_vars: None,
+                    callback_events: None,
+                },
+            )
+            .await
+            .context("failed to start retry turn after validation failure")?;
+
+            let mut agents = self.agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.validation_retries = agent.validation_retries.saturating_add(1);
+                agent.updated_at = now_ts();
+            }
+            return Ok(true);
+        }
+
+        let exceeded =
+            validation.fail_action == "retry" && validation_retries >= validation.max_retries;
+        let message = if exceeded {
+            format!(
+                "{error_text} (retry budget exhausted: {validation_retries}/{} retries)",
+                validation.max_retries
+            )
+        } else {
+            error_text
+        };
+
+        let mut agents = self.agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id) {
+            agent.status = constants::AGENT_STATUS_FAILED.to_string();
+            agent.error = Some(message.clone());
+            if let Some(result) = agent.result.as_mut() {
+                result.status = constants::AGENT_STATUS_FAILED.to_string();
+                result.error = Some(message.clone());
+                result.turn_id = result.turn_id.clone().or(last_turn_id.clone());
+            }
+            agent.updated_at = now_ts();
+        }
+        Ok(true)
     }
 
     async fn execute_event(self: &Arc<Self>, context: CallbackEventContext) -> Result<()> {
@@ -860,9 +1052,7 @@ impl Foreman {
                 job.status = constants::JOB_STATUS_COMPLETED.to_string();
                 job.completed_at = Some(job.completed_at.unwrap_or_else(now_ts));
                 job.updated_at = now_ts();
-                if !is_job_terminal_status(&prior_status)
-                    && is_job_terminal_status(&job.status)
-                {
+                if !is_job_terminal_status(&prior_status) && is_job_terminal_status(&job.status) {
                     return Ok(Some(job.status.clone()));
                 }
             }
@@ -928,9 +1118,7 @@ impl Foreman {
                     job.completed_at = Some(job.completed_at.unwrap_or_else(now_ts));
                 }
                 job.updated_at = now_ts();
-                if !is_job_terminal_status(&prior_status)
-                    && is_job_terminal_status(&job.status)
-                {
+                if !is_job_terminal_status(&prior_status) && is_job_terminal_status(&job.status) {
                     return Ok(Some(job.status.clone()));
                 }
             }
@@ -972,7 +1160,8 @@ impl Foreman {
                 {
                     return Ok(());
                 }
-                self.dispatch_unix_socket_callback(&context, unix_socket).await
+                self.dispatch_unix_socket_callback(&context, unix_socket)
+                    .await
             }
             WorkerCallback::Profile(profile) => {
                 let profile_definition = self
@@ -1464,7 +1653,9 @@ impl Foreman {
         _socket: &Path,
         _timeout_ms: Option<u64>,
     ) -> Result<()> {
-        Err(anyhow!("unix socket callbacks are unsupported on this platform"))
+        Err(anyhow!(
+            "unix socket callbacks are unsupported on this platform"
+        ))
     }
 
     async fn dispatch_command_callback(
@@ -3187,7 +3378,7 @@ impl Foreman {
             let request = ThreadStartRequest {
                 model: request.model,
                 model_provider: request.model_provider,
-                cwd: request.cwd,
+                cwd: request.cwd.clone(),
                 sandbox: request.sandbox,
             };
             let response = self
@@ -3206,13 +3397,18 @@ impl Foreman {
         } else {
             Some(request.prompt.clone())
         };
+        let cwd = request.cwd.clone();
         {
             let agent = AgentRecord {
                 id,
                 thread_id: thread_id.clone(),
                 active_turn_id: None,
                 prompt,
+                cwd,
                 restart_attempts: 0,
+                turns_completed: 0,
+                validation_retries: 0,
+                last_validation_error: None,
                 status: constants::AGENT_STATUS_IDLE.into(),
                 callback,
                 role: role.clone(),
@@ -3550,11 +3746,6 @@ fn resolve_agent_status(agent: &AgentRecord) -> String {
 }
 
 fn build_agent_state(agent: &AgentRecord) -> AgentState {
-    let turns_completed = agent
-        .events
-        .iter()
-        .filter(|event| event.method == constants::EVENT_METHOD_TURN_COMPLETED)
-        .count() as u32;
     let mut files_modified = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
     let mut last_tool_call = None;
@@ -3583,7 +3774,9 @@ fn build_agent_state(agent: &AgentRecord) -> AgentState {
         error: agent.error.clone(),
         updated_at: agent.updated_at,
         events: agent.events.iter().cloned().collect(),
-        turns_completed,
+        turns_completed: agent.turns_completed,
+        validation_retries: agent.validation_retries,
+        last_validation_error: agent.last_validation_error.clone(),
         last_tool_call,
         files_modified,
         elapsed_ms: Some(
@@ -3664,6 +3857,73 @@ fn normalize_project_lifecycle_callback_status(
     let mut status = default_project_lifecycle_callback_status();
     status.extend(provided);
     status
+}
+
+async fn run_validation_commands(commands: &[String], cwd: &Path) -> Result<()> {
+    for command in commands {
+        let output = Command::new("bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(cwd)
+            .output()
+            .await
+            .with_context(|| format!("failed to run validation command '{command}'"))?;
+
+        if output.status.success() {
+            continue;
+        }
+
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if stderr.is_empty() { stdout } else { stderr };
+        let details = if details.is_empty() {
+            "no stderr output".to_string()
+        } else {
+            details
+        };
+
+        return Err(anyhow!(
+            "command '{command}' exited {code}. stderr: {details}"
+        ));
+    }
+    Ok(())
+}
+
+fn effective_min_turns(defaults: &JobDefaultsConfig) -> u32 {
+    match defaults.strategy.as_deref() {
+        Some("explore-plan-execute") => 3,
+        _ => defaults.min_turns.unwrap_or(0),
+    }
+}
+
+fn continuation_prompt_for_turn(
+    turns_completed: u32,
+    defaults: &JobDefaultsConfig,
+) -> Option<String> {
+    let min_turns = effective_min_turns(defaults);
+    if min_turns == 0 || turns_completed >= min_turns {
+        return None;
+    }
+
+    if defaults.strategy.as_deref() == Some("explore-plan-execute") {
+        let prompt = match turns_completed {
+            1 => {
+                "Continue your work. Phase 1 complete. Now create a detailed plan: list every file you will change and what changes you will make. Do NOT make code changes yet."
+            }
+            2 => {
+                "Continue your work. Phase 2 complete. Execute your plan now: make the changes, verify they compile/run correctly, then commit."
+            }
+            _ => {
+                "Continue your work. Review your changes, ensure they are complete and correct, then commit if not already done."
+            }
+        };
+        return Some(prompt.to_string());
+    }
+
+    Some(format!(
+        "Continue your work. You have completed turn {turns_completed} of at least {min_turns} required."
+    ))
 }
 
 fn update_completed_turn_counter(
@@ -4145,7 +4405,10 @@ fn parse_exit_code(params: &Value) -> Option<i32> {
 fn parse_stderr(params: &Value) -> Option<String> {
     if let Some(stderr) = extract_item_payload(params)
         .and_then(|item| item.get("stderr").or_else(|| item.get("error")))
-        .or_else(|| extract_item_payload(params).and_then(|item| item.get("result").and_then(|result| result.get("stderr"))))
+        .or_else(|| {
+            extract_item_payload(params)
+                .and_then(|item| item.get("result").and_then(|result| result.get("stderr")))
+        })
         .and_then(Value::as_str)
     {
         return Some(stderr.to_string());
@@ -4294,6 +4557,7 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
     let active_turn_id = record.active_turn_id;
     let status = record.status;
     let prompt = record.prompt;
+    let cwd = record.cwd;
     let restart_attempts = record.restart_attempts;
     let project_id = if let Some(project_id) = record.project_id {
         Some(Uuid::parse_str(&project_id).context("invalid persisted project id")?)
@@ -4313,13 +4577,26 @@ fn restore_agent_record(record: PersistedAgentRecord) -> Result<AgentRecord> {
     } else {
         None
     };
+    let turns_completed = if record.turns_completed == 0 {
+        record
+            .events
+            .iter()
+            .filter(|event| event.method == constants::EVENT_METHOD_TURN_COMPLETED)
+            .count() as u32
+    } else {
+        record.turns_completed
+    };
 
     Ok(AgentRecord {
         id,
         thread_id,
         active_turn_id,
         prompt,
+        cwd,
         restart_attempts,
+        turns_completed,
+        validation_retries: record.validation_retries,
+        last_validation_error: record.last_validation_error,
         status,
         callback,
         role,
@@ -4423,7 +4700,11 @@ fn persisted_agent_record(agent: &AgentRecord) -> PersistedAgentRecord {
         thread_id: agent.thread_id.clone(),
         active_turn_id: agent.active_turn_id.clone(),
         prompt: agent.prompt.clone(),
+        cwd: agent.cwd.clone(),
         restart_attempts: agent.restart_attempts,
+        turns_completed: agent.turns_completed,
+        validation_retries: agent.validation_retries,
+        last_validation_error: agent.last_validation_error.clone(),
         status: agent.status.clone(),
         callback,
         role,
@@ -4569,11 +4850,13 @@ fn is_job_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRecord, AgentRole, Foreman, WorkerCallback, callback_timeout_ms, render_template,
-        render_template_strict, resolve_agent_status, unresolved_template_tokens,
+        AgentRecord, AgentRole, Foreman, WorkerCallback, callback_timeout_ms,
+        continuation_prompt_for_turn, render_template, render_template_strict,
+        resolve_agent_status, run_validation_commands, unresolved_template_tokens,
         update_completed_turn_counter,
     };
     use crate::events::events_allowed;
+    use crate::project::JobDefaultsConfig;
     use crate::state::{PersistedAgentRecord, PersistedState, PersistedWorkerCallback};
     use crate::{config::ServiceConfig, models::AgentResult};
     use codex_api::AppServerClient;
@@ -4793,6 +5076,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_commands_fail_on_first_non_zero_exit() {
+        let temp = tempdir().expect("tempdir");
+        let commands = vec![
+            "echo ok >/dev/null".to_string(),
+            "printf 'bad news' >&2; exit 7".to_string(),
+            "exit 0".to_string(),
+        ];
+        let err = run_validation_commands(&commands, temp.path())
+            .await
+            .expect_err("expected validation failure");
+        let message = err.to_string();
+        assert!(message.contains("exit"));
+        assert!(message.contains("bad news"));
+    }
+
+    #[test]
+    fn continuation_prompt_uses_strategy_and_min_turns() {
+        let explore_defaults = JobDefaultsConfig {
+            min_turns: None,
+            strategy: Some("explore-plan-execute".to_string()),
+        };
+        let first = continuation_prompt_for_turn(1, &explore_defaults).expect("turn 1 prompt");
+        assert!(first.contains("Phase 1 complete"));
+        let second = continuation_prompt_for_turn(2, &explore_defaults).expect("turn 2 prompt");
+        assert!(second.contains("Phase 2 complete"));
+        assert!(
+            continuation_prompt_for_turn(3, &explore_defaults).is_none(),
+            "strategy preset should allow completion at turn 3"
+        );
+
+        let generic_defaults = JobDefaultsConfig {
+            min_turns: Some(4),
+            strategy: Some("single".to_string()),
+        };
+        let generic = continuation_prompt_for_turn(2, &generic_defaults).expect("generic prompt");
+        assert!(generic.contains("turn 2 of at least 4"));
+        assert!(continuation_prompt_for_turn(4, &generic_defaults).is_none());
+    }
+
+    #[tokio::test]
     async fn get_agent_result_reflects_completed_status_from_persisted_record() {
         let fake_codex = test_fake_codex_binary();
         let state_dir = tempdir().expect("temp state directory");
@@ -4832,7 +5155,11 @@ mod tests {
             thread_id: "thread-1".to_string(),
             active_turn_id: None,
             prompt: None,
+            cwd: None,
             restart_attempts: 0,
+            turns_completed: 0,
+            validation_retries: 0,
+            last_validation_error: None,
             status: "running".to_string(),
             callback: WorkerCallback::None,
             role: AgentRole::Worker,
@@ -4897,7 +5224,11 @@ mod tests {
                 thread_id: "thread-recovery".to_string(),
                 active_turn_id: Some("turn-0".to_string()),
                 prompt: Some("recovery prompt".to_string()),
+                cwd: None,
                 restart_attempts: 0,
+                turns_completed: 0,
+                validation_retries: 0,
+                last_validation_error: None,
                 status: "running".to_string(),
                 callback: PersistedWorkerCallback::None,
                 role: "standalone".to_string(),
