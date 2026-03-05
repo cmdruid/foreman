@@ -542,6 +542,22 @@ impl Foreman {
         });
     }
 
+    pub async fn reconcile_agent_statuses(&self) {
+        let mut agents = self.agents.write().await;
+        for agent in agents.values_mut() {
+            if let Some(result) = &agent.result
+                && matches!(agent.status.as_str(), "running" | "restarting")
+            {
+                agent.status = result.status.clone();
+                agent.updated_at = now_ts();
+            }
+        }
+    }
+
+    pub async fn persist_state_now(self: &Arc<Self>) -> Result<()> {
+        self.persist_state().await
+    }
+
     async fn persist_state(self: &Arc<Self>) -> Result<()> {
         let agents = {
             let agents = self.agents.read().await;

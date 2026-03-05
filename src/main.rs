@@ -338,10 +338,32 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(socket = ?socket_path, "foreman listening on Unix socket");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+                let ctrl_c = async {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("failed to install ctrl_c handler");
+                };
+
+                let terminate = async {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler")
+                        .recv()
+                        .await;
+                };
+
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = terminate => {},
+                }
                 tracing::info!("shutdown signal received");
             })
             .await?;
+        state.foreman.reconcile_agent_statuses().await;
+        state
+            .foreman
+            .persist_state_now()
+            .await
+            .context("failed to persist reconciled foreman state during shutdown")?;
     }
     Ok(())
 }
@@ -424,12 +446,14 @@ fn acquire_pid_lockfile(socket_path: &StdPath) -> anyhow::Result<PidLockGuard> {
             if let Ok(existing_pid) = existing.trim().parse::<u32>()
                 && pid_is_alive(existing_pid)
             {
-                return Err(anyhow!(
+                let message = format!(
                     "another foreman instance is running for socket '{}'; lockfile '{}' has active PID {}",
                     socket_path.display(),
                     lock_path.display(),
                     existing_pid
-                ));
+                );
+                eprintln!("{message}");
+                return Err(anyhow!("{message}"));
             }
 
             fs::write(&lock_path, pid_contents)

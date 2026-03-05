@@ -4,6 +4,12 @@ All notable changes to `foreman` are documented here.
 
 ## Unreleased
 
+## [0.2.2]
+
+- Added graceful shutdown handling for both `SIGINT` (`ctrl_c`) and `SIGTERM` so process-manager termination follows the same shutdown path.
+- Reconciled agent statuses before final shutdown persist so completed agents are not left as `running`/`restarting` in saved state.
+- Improved live PID lockfile conflict visibility by printing the conflict to stderr and returning a clearer actionable error that includes the socket path.
+
 ## [0.2.1]
 
 - Fixed a deadlock in `restart_stalled_worker` by snapshotting worker results and dropping the `agents` write lock before job/project update calls that re-read agent state.
